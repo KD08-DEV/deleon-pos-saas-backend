@@ -260,11 +260,13 @@ const login = async (req, res, next) => {
 
         res.status(200).json({
             message: "User login successfully!",
+            token: accessToken,
             data: {
                 name: isUserPresent.name,
                 email: isUserPresent.email,
                 role: isUserPresent.role,
                 tenantId: isUserPresent.tenantId,
+
             },
         });
     } catch (error) {
@@ -277,7 +279,8 @@ const getUserData = async (req, res, next) => {
         // SUPERADMIN
         if (req.user.role === "SuperAdmin") {
             return res.status(200).json({
-                success: true,
+                message: "SuperAdmin login successfully!",
+                token: accessToken,
                 data: {
                     name: process.env.SUPERADMIN_NAME || "SuperAdmin",
                     email: process.env.SUPERADMIN_EMAIL,
