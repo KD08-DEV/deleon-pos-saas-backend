@@ -5,7 +5,12 @@ const User = require("../models/userModel");
 
 const verifyToken = async (req, res, next) => {
     try {
-        const { accessToken } = req.cookies;
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+            return next(createHttpError(401, "No token provided"));
+        }
+
+        const accessToken = authHeader.split(" ")[1];
         if (!accessToken) {
             return next(createHttpError(401, "Please provide token!"));
         }
