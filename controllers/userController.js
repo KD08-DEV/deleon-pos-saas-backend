@@ -219,6 +219,7 @@ const login = async (req, res, next) => {
 
             return res.status(200).json({
                 message: "SuperAdmin login successfully!",
+                token: accessToken,
                 data: {
                     name: process.env.SUPERADMIN_NAME || "SuperAdmin",
                     email: process.env.SUPERADMIN_EMAIL,

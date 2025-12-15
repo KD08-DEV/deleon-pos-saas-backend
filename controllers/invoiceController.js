@@ -8,19 +8,25 @@ const generateInvoicePDF = require("../utils/generateInvoicePDF");
 exports.createInvoice = async (req, res) => {
     try {
         const { orderId } = req.body;
+        const tenantId = req.user.tenantId;
 
         if (!orderId) {
-            return res.status(400).json({
-                message: "orderId is required"
-            });
+            return res.status(400).json({ message: "orderId is required" });
         }
 
-        // Llamamos la función que genera el PDF
-        const invoiceUrl = await generateInvoicePDF(orderId);
+        // 👇 AQUÍ se genera el PDF
+        const invoiceData = await generateInvoicePDF(orderId, tenantId);
+        // invoiceData = { path, url }
+
+        // 👇 AQUÍ MISMO se guarda en la orden (ESTA ES LA RESPUESTA A TU PREGUNTA)
+        await Order.findByIdAndUpdate(orderId, {
+            invoicePath: invoiceData.path,
+            invoiceUrl: invoiceData.url
+        });
 
         return res.status(200).json({
             message: "Invoice generated successfully",
-            invoiceUrl,
+            invoiceUrl: invoiceData.url
         });
 
     } catch (error) {

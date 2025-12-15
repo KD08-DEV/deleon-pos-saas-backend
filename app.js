@@ -19,9 +19,22 @@ connectDB();
 
 // Middlewares
 app.use(cors({
-    origin: process.env.CORS_ORIGIN || "*",
-    credentials: true
+    origin: [
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "https://deleon-pos-saas-frontend.vercel.app"
+    ],
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+        "Content-Type",
+        "Authorization",
+        "x-client-id",
+        "x-tenant-id"
+    ]
 }));
+
+app.options("*", cors());
 app.use(express.json());
 app.use(cookieParser());
 

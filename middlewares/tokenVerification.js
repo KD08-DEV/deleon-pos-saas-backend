@@ -5,12 +5,29 @@ const User = require("../models/userModel");
 
 const verifyToken = async (req, res, next) => {
     try {
+        console.log("➡️ VERIFY TOKEN HIT");
+        console.log("AUTH HEADER:", req.headers.authorization);
+        console.log("COOKIE TOKEN:", req.cookies?.accessToken);
+
         const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        const cookieToken = req.cookies?.accessToken;
+
+        let accessToken = null;
+
+            //  Header (localhost)
+        if (authHeader && authHeader.startsWith("Bearer ")) {
+            accessToken = authHeader.split(" ")[1];
+        }
+
+            //  Cookie (producción)
+        if (!accessToken && cookieToken) {
+            accessToken = cookieToken;
+        }
+
+        if (!accessToken) {
             return next(createHttpError(401, "No token provided"));
         }
 
-        const accessToken = authHeader.split(" ")[1];
         if (!accessToken) {
             return next(createHttpError(401, "Please provide token!"));
         }
@@ -41,8 +58,15 @@ const verifyToken = async (req, res, next) => {
 
         next();
     } catch (error) {
+        console.log("❌ VERIFY TOKEN ERROR");
+        console.log("AUTH HEADER:", req.headers.authorization);
+        console.log("COOKIE TOKEN:", req.cookies?.accessToken);
+        console.log("ERROR:", error.message);
+
         return next(createHttpError(401, "Invalid Token!"));
+
     }
+
 };
 
 module.exports = verifyToken;

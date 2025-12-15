@@ -13,12 +13,14 @@ function resolveTip(bills = {}, order = {}) {
 // FUNCION PRINCIPAL
 async function exportExcel(req, res) {
     try {
-        const orders = await Order.find({})
+        const orders = await Order.find({
+            tenantId: req.user.tenantId
+        })
             .populate("user")
             .lean();
 
         if (!orders || orders.length === 0) {
-            return res.status(404).json({ success: false, message: "No orders found" });
+            return res.status(200).send(Buffer.from([]));
         }
 
         const rows = [];
@@ -42,7 +44,7 @@ async function exportExcel(req, res) {
                 "Order ID": order._id.toString(),
                 "Date": new Date(order.createdAt).toLocaleDateString(),
                 "Item": itemsNames,
-                "name cx": order.customerDetails?.name || "Consumidor",
+                "cliente": order.customerDetails?.name || "Consumidor",
                 "sub total": subtotal,
                 "descuento": descuento,
                 "itbs": itbs,
@@ -57,7 +59,7 @@ async function exportExcel(req, res) {
             "Order ID": "",
             "Date": "",
             "Item": "",
-            "name cx": "",
+            "cliente": "",
             "sub total": "",
             "descuento": "",
             "itbs": "",
