@@ -77,33 +77,55 @@ const deleteTable = async (req, res, next) => {
 };
 
 const updateTable = async (req, res, next) => {
-  try {
-    const { status, orderId } = req.body;
+    try {
+        const { status, orderId } = req.body;
+        const { id } = req.params;
 
-    const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return next(createHttpError(400, "Invalid table id"));
+        }
 
-    if(!mongoose.Types.ObjectId.isValid(id)){
-        const error = createHttpError(404, "Invalid id!");
-        return next(error);
+        // 🔒 VALIDACIÓN CRÍTICA
+        if (status === "Booked" && !orderId) {
+            return next(
+                createHttpError(
+                    400,
+                    "Cannot mark table as Booked without an orderId"
+                )
+            );
+        }
+
+        if (status === "Available") {
+            // Liberar siempre
+            const table = await Table.findOneAndUpdate(
+                { _id: id, tenantId: req.user.tenantId },
+                { status: "Available", currentOrder: null },
+                { new: true }
+            );
+
+            return res.status(200).json({
+                success: true,
+                message: "Table released",
+                data: table,
+            });
+        }
+
+        // Booked + orderId válido
+        const table = await Table.findOneAndUpdate(
+            { _id: id, tenantId: req.user.tenantId },
+            { status: "Booked", currentOrder: orderId },
+            { new: true }
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Table updated",
+            data: table,
+        });
+    } catch (error) {
+        next(error);
     }
-
-    const table = await Table.findOneAndUpdate(
-        { _id: id, tenantId: req.user.tenantId },
-        { status, currentOrder: orderId },
-        { new: true }
-    );
-
-
-    if (!table) {
-      const error = createHttpError(404, "Table not found!");
-      return error;
-    }
-
-    res.status(200).json({success: true, message: "Table updated!", data: table});
-
-  } catch (error) {
-    next(error);
-  }
 };
+
 
 module.exports = { addTable, getTables, updateTable, deleteTable };

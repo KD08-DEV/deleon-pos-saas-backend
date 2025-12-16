@@ -223,11 +223,7 @@ const updateOrder = async (req, res, next) => {
             return next(createHttpError(404, "Order not found!"));
         }
 
-        console.log("📦 ORDEN ACTUAL EN DB (ANTES DE UPDATE):");
-        console.log("   bills:", current.bills);
-        console.log("   tipAmount DB:", current.bills?.tipAmount);
-        console.log("   taxEnabled DB:", current.bills?.taxEnabled);
-        console.log("   ---------------------------------------------");
+
 
         // Partir SIEMPRE de los bills que ya existen en la DB
         const existingBills = current.bills || {};
@@ -272,19 +268,6 @@ const updateOrder = async (req, res, next) => {
         // 2) Bills que llegan desde el frontend (Bill.jsx o OrderCard.jsx)
         const incomingBills = req.body.bills || {};
 
-        console.log("🔥 FRONTEND BILLS RECIBIDO:");
-        console.log("   incomingBills:", incomingBills);
-        console.log(
-            "   DESDE FRONT: tipAmount=",
-            incomingBills.tipAmount,
-            " tip=",
-            incomingBills.tip,
-            " tipEnabled=",
-            incomingBills.tipEnabled
-        );
-        console.log("   DESDE FRONT: taxEnabled=", incomingBills.taxEnabled);
-        console.log("   ---------------------------------------------");
-
         // ---- DESCUENTO ----
         const discount = Number(
             incomingBills.discount ??
@@ -321,14 +304,6 @@ const updateOrder = async (req, res, next) => {
         const effectiveTaxRate = taxEnabled ? TAX_RATE : 0;
         const tax = taxable * effectiveTaxRate;
 
-        console.log("🧮 CÁLCULO ITBIS:");
-        console.log("   subtotal:", subtotal);
-        console.log("   discount:", discount);
-        console.log("   taxable:", taxable);
-        console.log("   taxEnabled:", taxEnabled);
-        console.log("   effectiveTaxRate:", effectiveTaxRate);
-        console.log("   tax CALCULATED:", tax);
-        console.log("   ---------------------------------------------");
 
         // ---- TIP (Propina en monto) ----
         let tip = 0;
@@ -355,24 +330,7 @@ const updateOrder = async (req, res, next) => {
         // Total final
         const totalWithTax = taxable + tax + tip;
 
-        console.log("💰 CÁLCULO PROPINA:");
-        console.log("   incoming.tipEnabled:", incomingBills.tipEnabled);
-        console.log("   incoming.tipAmount:", incomingBills.tipAmount);
-        console.log("   incoming.tip:", incomingBills.tip);
-        console.log("   PREV TIP (DB):", safeUpdate.bills.tipAmount);
-        console.log("   FINAL TIP TO SAVE:", tip);
-        console.log("   ---------------------------------------------");
 
-        console.log("📤 BILLS QUE SE VAN A GUARDAR EN DB:");
-        console.log({
-            total: subtotal,
-            discount,
-            taxEnabled,
-            tax,
-            tipAmount: tip,
-            totalWithTax,
-        });
-        console.log("   ---------------------------------------------");
 
         // Guardamos bills actualizados (respetando compatibilidad con 'tip')
         safeUpdate.bills = {
@@ -391,14 +349,6 @@ const updateOrder = async (req, res, next) => {
         })
             .populate("table", "tableNo status")
             .populate("user", "name email role");
-
-        console.log("✅ ORDEN GUARDADA EN DB (DESPUÉS DEL UPDATE):");
-        console.log("   bills:", order.bills);
-        console.log("   tipAmount DB:", order.bills?.tipAmount);
-        console.log("   taxEnabled DB:", order.bills?.taxEnabled);
-        console.log("   tax DB:", order.bills?.tax);
-        console.log("   totalWithTax DB:", order.bills?.totalWithTax);
-        console.log("   ---------------------------------------------");
 
         // -------- AUTO-DELETE SOLO SI items: [] FUE ENVIADO DESDE EL FRONT --------
         const incomingItems = req.body.items;

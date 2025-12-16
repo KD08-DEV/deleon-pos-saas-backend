@@ -60,12 +60,11 @@ const webHookVerification = async (req, res, next) => {
       .digest("hex");
 
     if (expectedSignature === signature) {
-      console.log("✅ Webhook verified:", req.body);
+
 
       // ✅ Process payment (e.g., update DB, send confirmation email)
       if (req.body.event === "payment.captured") {
         const payment = req.body.payload.payment.entity;
-        console.log(`💰 Payment Captured: ${payment.amount / 100} INR`);
 
         // Add Payment Details in Database
         const newPayment = new Payment({

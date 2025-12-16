@@ -20,8 +20,7 @@ async function generateInvoicePDF(orderId, tenantId) {
 
 // OJO: tenantId es un UUID (tenantid), NO el _id de Mongo
     const tenantDoc = await Tenant.findOne({ tenantId }).lean();
-    console.log("[PDF] tenantId recibido:", tenantId);
-    console.log("[PDF] Tenant encontrado:", tenantDoc);
+
 
     const business = (tenantDoc && tenantDoc.business) || {};
 
@@ -40,10 +39,6 @@ async function generateInvoicePDF(orderId, tenantId) {
     const restaurantPhone =
         (business.phone && business.phone.trim()) || "";
 
-    console.log("[PDF] >>> RESTAURANT NAME:", restaurantName);
-    console.log("[PDF] >>> RNC:", restaurantRNC);
-    console.log("[PDF] >>> ADDRESS:", restaurantAddress);
-    console.log("[PDF] >>> PHONE:", restaurantPhone);
 
     // =======================
     // 2) CREAR PDF

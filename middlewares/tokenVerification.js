@@ -5,9 +5,7 @@ const User = require("../models/userModel");
 
 const verifyToken = async (req, res, next) => {
     try {
-        console.log("➡️ VERIFY TOKEN HIT");
-        console.log("AUTH HEADER:", req.headers.authorization);
-        console.log("COOKIE TOKEN:", req.cookies?.accessToken);
+
 
         const authHeader = req.headers.authorization;
         const cookieToken = req.cookies?.accessToken;
@@ -58,10 +56,6 @@ const verifyToken = async (req, res, next) => {
 
         next();
     } catch (error) {
-        console.log("❌ VERIFY TOKEN ERROR");
-        console.log("AUTH HEADER:", req.headers.authorization);
-        console.log("COOKIE TOKEN:", req.cookies?.accessToken);
-        console.log("ERROR:", error.message);
 
         return next(createHttpError(401, "Invalid Token!"));
 
