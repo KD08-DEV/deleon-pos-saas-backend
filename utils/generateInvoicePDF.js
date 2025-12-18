@@ -208,7 +208,7 @@ async function generateInvoicePDF(orderId, tenantId) {
         const name = item.name || "Producto";
         const quantity = Number(item.quantity || 0);
         const unit = Number(item.unitPrice || 0);
-        const lineTotal = Number(item.price || (unit * quantity));
+        const lineTotal = unit * quantity;
 
         page.drawText(name, { x: colDesc, y, size: 10, font: regularFont });
         page.drawText(String(quantity), { x: colCant, y, size: 10, font: regularFont });
@@ -224,7 +224,7 @@ async function generateInvoicePDF(orderId, tenantId) {
             });
         }
 
-        page.drawText(`RD$${lineTotal.toFixed(2)}`, { x: colValor, y, size: 10, font: regularFont });
+        page.drawText(`RD$${unit.toFixed(2)}`, { x: colValor, y, size: 10, font: regularFont });
         y -= 14;
     });
 
