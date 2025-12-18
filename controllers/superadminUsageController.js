@@ -12,7 +12,7 @@ exports.getTenantUsage = async (req, res) => {
         const results = await Promise.all(
             tenants.map(async (tenant) => {
                 const tenantId = tenant.tenantId;
-                const tier = TIERS[tenant.plan] || TIERS.basic;
+                const tier = TIERS[tenant.plan] || TIERS.emprendedor;
                 const limits = tier.limits || {};
 
                 // Contadores por tenant (solo memberships activas)

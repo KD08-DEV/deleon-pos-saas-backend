@@ -9,7 +9,7 @@ const Membership = require("../models/membershipModel");
 const TIERS = require("../config/planTiers");
 
 function getPlanLimits(plan) {
-    const tier = TIERS[plan] || TIERS.basic;
+    const tier = TIERS[plan] || TIERS.emprendedor;
     return {
         admins: tier.limits.maxAdmins,
         cashiers: tier.limits.maxCashiers,
@@ -40,10 +40,10 @@ const register = async (req, res, next) => {
 // 🔥 CASO 1: SUPERADMIN crea un Admin (nueva empresa)
         if (req.user && req.user.role === "SuperAdmin" && role === "Admin") {
             const companyName = tenantName || `${name}'s Business`;
-            const tenantPlan = (plan || "basic").toLowerCase();
+            const tenantPlan = (plan || "emprendedor").toLowerCase();
 
             // 1) Validar plan
-            const allowedPlans = ["basic", "pro", "enterprise"];
+            const allowedPlans = ["emprendedor", "pro", "vip"];
             if (!allowedPlans.includes(tenantPlan)) {
                 return next(createHttpError(400, "Invalid plan for tenant!"));
             }

@@ -60,7 +60,7 @@ exports.getReports = async (req, res) => {
                 .filter((o) => o.paymentMethod === "Cash")
                 .reduce((s, o) => s + o.totalAmount, 0),
             onlineSales: orders
-                .filter((o) => o.paymentMethod === "Online")
+                .filter((o) => o.paymentMethod === "Tarjeta")
                 .reduce((s, o) => s + o.totalAmount, 0),
         };
 
@@ -127,14 +127,14 @@ exports.getUsage = async (req, res) => {
             return res.status(404).json({ success: false, message: "Tenant not found" });
         }
 
-        const tier = TIERS[tenant.plan] || TIERS.basic;
+        const tier = TIERS[tenant.plan] || TIERS.emprendedor;
         const limits = tier.limits || {};
 
         // Cálculos en paralelo
         const [totalUsers, admins, cashiers, waiters, dishes, tables] = await Promise.all([
             Membership.countDocuments({ tenantId, status: "active" }),
             Membership.countDocuments({ tenantId, status: "active", role: { $in: ["Owner", "Admin"] } }),
-            Membership.countDocuments({ tenantId, status: "active", role: "Cashier" }),
+            Membership.countDocuments({ tenantId, status: "active", role: "Cajera" }),
             Membership.countDocuments({ tenantId, status: "active", role: "Waiter" }),
             Dish.countDocuments({ tenantId }),
             Table.countDocuments({ tenantId }),

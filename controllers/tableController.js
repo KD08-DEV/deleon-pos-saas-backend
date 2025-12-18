@@ -11,7 +11,7 @@ const addTable = async (req, res, next) => {
         return next(createHttpError(404, "Tenant not found!"));
     }
 
-    const tier = TIERS[tenant.plan] || TIERS.basic;
+    const tier = TIERS[tenant.plan] || TIERS.emprendedor;
     const maxTables = tier.limits.maxTables;
 
     if (maxTables !== null) {

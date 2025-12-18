@@ -48,7 +48,7 @@ const orderSchema = new mongoose.Schema(
             required: false,
             default: null,
         },
-        paymentMethod: { type: String, enum: ["Cash", "Online"], default: "Cash" },
+        paymentMethod: { type: String, enum: ["Cash", "Tarjeta"], default: "Cash" },
         user: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // quien creó la orden
     },
     { timestamps: true }

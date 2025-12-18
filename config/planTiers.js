@@ -1,7 +1,7 @@
 // pos-backend/config/planTiers.js
 
 const TIERS = {
-    basic: {
+    emprendedor: {
         limits: {
             maxUsers: 3,
             maxAdmins: 1,
@@ -35,12 +35,12 @@ const TIERS = {
         },
     },
 
-    enterprise: {
+    vip: {
         limits: {
-            maxUsers: 26,      // 5 admins + 8 cashiers + 12 waiters
-            maxAdmins: 6,
-            maxCashiers: 8,
-            maxWaiters: 12,
+            maxUsers: 36,      // 5 admins + 8 cashiers + 12 waiters
+            maxAdmins: 8,
+            maxCashiers: 12,
+            maxWaiters: 16,
             maxDishes: null,   // null = ilimitado
             maxTables: null,
             maxClients: null,
