@@ -7,7 +7,7 @@ const cors = require("cors");
 const app = express();
 const dishRoutes  = require("./routes/dishRoute");
 const path = require("path");
-
+const dgiiRoute = require("./routes/dgiiRoute");
 
 
 // ❌ ELIMINAR ESTO (ROMPE TODO): import orderRoute from "./routes/orderRoute.js";
@@ -57,6 +57,8 @@ app.use("/api/clients", require("./routes/clientRoute"));
 app.use("/api/superadmin", require("./routes/superAdminRoute"));
 app.use("/api/tenant", require("./routes/tenantRoute"));
 app.use("/api/invoice", require("./routes/invoiceRoute"));
+app.use("/api/dgii", dgiiRoute);
+app.use("/api/inventory", require("./routes/inventoryRoute"));
 // Global Error Handler
 app.use(globalErrorHandler);
 

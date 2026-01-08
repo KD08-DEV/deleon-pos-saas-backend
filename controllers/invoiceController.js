@@ -5,30 +5,63 @@ const fs = require("fs");
 const Order = require("../models/orderModel");
 const { generateInvoicePDF } = require("../utils/generateInvoicePDF");
 
+
 exports.createInvoice = async (req, res) => {
     try {
         const { orderId } = req.body;
-        const tenantId = req.user.tenantId;
+
+        // Usa SIEMPRE el tenantId/clientId resuelto por tu middleware multi-tenant
+        // (si aún no lo estás usando en la ruta, te lo digo más abajo)
+        const tenantId = req.tenantId || req.user?.tenantId;
+        const clientId = req.clientId;
 
         if (!orderId) {
             return res.status(400).json({ message: "orderId is required" });
         }
+        if (!tenantId) {
+            return res.status(400).json({ message: "tenantId missing (middleware not applied?)" });
+        }
 
-        // 👇 AQUÍ se genera el PDF
-        const invoiceData = await generateInvoicePDF(orderId, tenantId);
-        // invoiceData = { path, url }
+        // ✅ Query seguro (igual que getInvoice)
+        const query = { _id: orderId, tenantId };
+        query.$or = clientId
+            ? [
+                { clientId },                    // órdenes nuevas
+                { clientId: { $exists: false } }, // órdenes viejas
+                { clientId: "default" },         // compat
+            ]
+            : [
+                { clientId: { $exists: false } },
+                { clientId: "default" },
+            ];
 
-        // 👇 AQUÍ MISMO se guarda en la orden (ESTA ES LA RESPUESTA A TU PREGUNTA)
-        await Order.findByIdAndUpdate(orderId, {
+        // ✅ Verifica pertenencia ANTES de generar el PDF
+        const order = await Order.findOne(query).select("_id invoiceUrl").lean();
+        if (!order) {
+            return res.status(404).json({ message: "Order not found for this tenant/client" });
+        }
+
+        // Si ya existe invoice, devuelve la misma
+        if (order.invoiceUrl) {
+            return res.status(200).json({
+                message: "Invoice already generated",
+                invoiceUrl: order.invoiceUrl,
+            });
+        }
+
+        // Genera PDF (ya validaste pertenencia)
+        const invoiceData = await generateInvoicePDF(orderId, tenantId); // { path, url }
+
+        // ✅ Actualiza de forma segura (no por findByIdAndUpdate)
+        await Order.findOneAndUpdate(query, {
             invoicePath: invoiceData.path,
-            invoiceUrl: invoiceData.url
+            invoiceUrl: invoiceData.url,
         });
 
         return res.status(200).json({
             message: "Invoice generated successfully",
-            invoiceUrl: invoiceData.url
+            invoiceUrl: invoiceData.url,
         });
-
     } catch (error) {
         console.error("Invoice Create Error:", error);
         return res.status(500).json({
@@ -37,6 +70,7 @@ exports.createInvoice = async (req, res) => {
         });
     }
 };
+
 exports.getInvoice = async (req, res) => {
     try {
         const { orderId } = req.params;

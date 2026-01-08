@@ -90,7 +90,7 @@ const updateTable = async (req, res, next) => {
             return next(
                 createHttpError(
                     400,
-                    "Cannot mark table as Booked without an orderId"
+                    "No se puede marcar la mesa como reservada sin una orden"
                 )
             );
         }

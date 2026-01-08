@@ -12,6 +12,9 @@ const invoiceSchema = new mongoose.Schema(
         businessPhone: { type: String },
 
         // ----- FISCAL -----
+        invoiceNumber: { type: Number, required: true }, // correlativo por tenant
+        customerDocument: { type: String }, // RNC o Cédula
+        customerDocumentType: { type: String, enum: ["RNC", "CEDULA", null], default: null },
         ncfType: { type: String, default: "B02" },
         ncfNumber: { type: String },
         date: { type: Date, default: Date.now },

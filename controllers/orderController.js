@@ -2,6 +2,7 @@ const createHttpError = require("http-errors");
 const { default: mongoose } = require("mongoose");
 const Order = require("../models/orderModel");
 const Table = require("../models/tableModel");
+const Tenant = require("../models/tenantModel");
 
 // Impuesto por defecto (5.25% para coincidir con tu UI)
 const TAX_RATE = Number(process.env.TAX_RATE ?? 0.18);
@@ -34,6 +35,12 @@ function normalizeAndPriceItems(items = []) {
 
 const addOrder = async (req, res, next) => {
     try {
+        const tenantId = req.tenantId || req.user?.tenantId;
+        if (!tenantId) {
+            return next(createHttpError(401, "TENANT_NOT_FOUND"));
+        }
+
+        const clientId = req.clientId;
         const {
             customerDetails = {},
             orderStatus = "In Progress",
@@ -57,7 +64,7 @@ const addOrder = async (req, res, next) => {
 
             const sameTenantTable = await Table.findOne({
                 _id: tableRef,
-                tenantId: req.tenantId,
+                tenantId,
                 $or: [
                     { clientId: req.clientId },             // mesas nuevas
                     { clientId: { $exists: false } },       // mesas viejas sin clientId
@@ -75,6 +82,9 @@ const addOrder = async (req, res, next) => {
         const normItems = Array.isArray(items) && items.length
             ? normalizeAndPriceItems(items)
             : [];
+        const tenant = await Tenant.findOne({ tenantId }).lean();
+        const features = tenant?.features || {};
+
 
         // Calcular totales
         const subtotal = round2(normItems.reduce((s, i) => s + i.price, 0));
@@ -85,6 +95,7 @@ const addOrder = async (req, res, next) => {
         const taxable = round2(subtotal - discountAmt);
         const tax = round2(taxable * TAX_RATE);
         const totalWithTax = round2(taxable + tax);
+
 
         // Crear payload base
         const payload = {
@@ -203,6 +214,42 @@ const deleteOrder = async (req, res, next) => {
         next(error);
     }
 };
+function formatNCF(type, seq) {
+    // Formato típico: B02 + 8 dígitos => B0200000001 (11 chars)
+    return `${type}${String(seq).padStart(8, "0")}`;
+}
+
+async function allocateNCF({ tenantId, ncfType }) {
+    const type = ncfType || "B02";
+
+    const currentPath = `fiscal.ncfConfig.${type}.current`;
+    const maxPath = `fiscal.ncfConfig.${type}.max`;
+    const activePath = `fiscal.ncfConfig.${type}.active`;
+
+    // Incremento atómico por tenant y por tipo
+    const tenant = await Tenant.findOneAndUpdate(
+        {
+            tenantId,
+            "fiscal.enabled": true,
+            [activePath]: true,
+            $expr: { $lte: [`$${currentPath}`, `$${maxPath}`] },
+        },
+        { $inc: { [currentPath]: 1 } },
+        { new: true }
+    ).lean();
+
+    if (!tenant) {
+        const err = new Error(`NCF no disponible para ${type} (inactivo o rango agotado).`);
+        err.statusCode = 400;
+        throw err;
+    }
+
+    // Como retorna después del $inc, el asignado es current-1
+    const assignedSeq = tenant.fiscal.ncfConfig[type].current - 1;
+
+    return { type, ncfNumber: formatNCF(type, assignedSeq) };
+}
+
 
 const updateOrder = async (req, res, next) => {
     try {
@@ -212,18 +259,35 @@ const updateOrder = async (req, res, next) => {
             return next(createHttpError(404, "Invalid id!"));
         }
 
-        // Obtener orden actual
-        let current = await Order.findOne({
+// ✅ Unificar tenantId UNA VEZ
+        const tenantId = req.tenantId || req.user?.tenantId;
+        if (!tenantId) {
+            return next(createHttpError(401, "TENANT_NOT_FOUND"));
+        }
+
+// ✅ Traer settings/features del tenant ANTES de calcular totales
+        const tenant = await Tenant.findOne({ tenantId }).lean();
+        const features = tenant?.features || {};
+
+        const taxFeatureEnabled = features?.tax?.enabled !== false;         // default true
+        const discountFeatureEnabled = features?.discount?.enabled !== false; // default true
+        const fiscalFeatureEnabled = features?.fiscal?.enabled !== false;
+
+        const clientId = req.clientId;
+
+        // Helper: compatibilidad con datos viejos (por si existen docs sin clientId)
+        const orderScope = {
             _id: id,
-            tenantId: req.user.tenantId,
-            clientId: req.clientId
-        });
+            tenantId,
+            $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+        };
+
+        // Obtener orden actual
+        let current = await Order.findOne(orderScope);
 
         if (!current) {
             return next(createHttpError(404, "Order not found!"));
         }
-
-
 
         // Partir SIEMPRE de los bills que ya existen en la DB
         const existingBills = current.bills || {};
@@ -232,24 +296,57 @@ const updateOrder = async (req, res, next) => {
         const safeUpdate = {
             customerDetails: {
                 ...current.customerDetails,
-                ...req.body.customerDetails
+                ...(req.body.customerDetails || {}),
             },
             items: req.body.items ?? current.items,
             table: req.body.table ?? current.table,
             paymentMethod: req.body.paymentMethod ?? current.paymentMethod,
             orderStatus: req.body.orderStatus ?? current.orderStatus,
-            bills: { ...existingBills }, // <-- muy importante
+            bills: { ...existingBills },
+            fiscal: {
+                ...(current.fiscal || {}),
+                ...(req.body.fiscal || {}),
+            },
         };
 
         // Normalizar tipAmount previo (por compatibilidad con 'tip')
-        if (
-            safeUpdate.bills.tipAmount === undefined &&
-            safeUpdate.bills.tip !== undefined
-        ) {
+        if (safeUpdate.bills.tipAmount === undefined && safeUpdate.bills.tip !== undefined) {
             safeUpdate.bills.tipAmount = Number(safeUpdate.bills.tip);
         }
 
-        // Si vienen items nuevos, normalizarlos y recalcular subtotal
+        const incomingFiscal = req.body.fiscal;
+
+        // ✅ NCF: si lo pidió y aún no tiene NCF, asignar
+        const alreadyHasNCF = current?.fiscal?.ncfNumber || current?.ncfNumber;
+
+        if (fiscalFeatureEnabled && incomingFiscal?.requested === true && !alreadyHasNCF) {
+            const { type, ncfNumber } = await allocateNCF({
+                tenantId,
+                ncfType: incomingFiscal.ncfType || current?.fiscal?.ncfType || "B02",
+            });
+
+            safeUpdate.ncfNumber = ncfNumber;
+            safeUpdate.fiscal = {
+                ...(safeUpdate.fiscal || {}),
+                requested: true,
+                ncfType: type,
+                ncfNumber,
+                issuedAt: new Date(),
+            };
+        } else if (!fiscalFeatureEnabled) {
+            // Si fiscal está apagado, aseguramos que no quede requested true
+            safeUpdate.fiscal = {
+                ...(safeUpdate.fiscal || {}),
+                requested: false,
+                ncfNumber: undefined,
+                ncfType: undefined,
+                issuedAt: undefined,
+            };
+            safeUpdate.ncfNumber = undefined;
+        }
+
+
+        // Si vienen items nuevos, normalizarlos
         if (req.body.items) {
             safeUpdate.items = normalizeAndPriceItems(req.body.items);
         }
@@ -257,7 +354,6 @@ const updateOrder = async (req, res, next) => {
         // === RECALCULAR SUBTOTAL, DESCUENTO, ITBIS Y TOTAL ===
         let subtotal = 0;
 
-        // 1) Subtotal a partir de los items normalizados
         if (safeUpdate.items && Array.isArray(safeUpdate.items)) {
             subtotal = safeUpdate.items.reduce((sum, item) => {
                 const line = Number(item.unitPrice || 0) * Number(item.quantity || 1);
@@ -265,76 +361,62 @@ const updateOrder = async (req, res, next) => {
             }, 0);
         }
 
-        // 2) Bills que llegan desde el frontend (Bill.jsx o OrderCard.jsx)
         const incomingBills = req.body.bills || {};
 
         // ---- DESCUENTO ----
-        const discount = Number(
-            incomingBills.discount ??
-            safeUpdate.bills.discount ??
-            0
-        );
+        let discount = 0;
+
+        if (discountFeatureEnabled) {
+            discount = Number(incomingBills.discount ?? safeUpdate.bills.discount ?? 0);
+            if (discount < 0) discount = 0;
+            if (discount > subtotal) discount = subtotal;
+        } else {
+            discount = 0;
+        }
+        if (discount < 0) discount = 0;
+        if (discount > subtotal) discount = subtotal;
 
         // ---- ITBIS (taxEnabled verdadero o falso) ----
         let taxEnabled;
 
-        // Caso 1: si el frontend lo envía explícitamente
         if (incomingBills.taxEnabled !== undefined) {
             taxEnabled = Boolean(incomingBills.taxEnabled);
-        }
-        // Caso 2: si la orden anterior ya tenía un valor guardado
-        else if (existingBills.taxEnabled !== undefined) {
+        } else if (existingBills.taxEnabled !== undefined) {
             taxEnabled = Boolean(existingBills.taxEnabled);
-        }
-        // Caso 3: inferir a partir del tax previo
-        else if (incomingBills.tax !== undefined) {
+        } else if (incomingBills.tax !== undefined) {
             taxEnabled = Number(incomingBills.tax) > 0;
         } else if (existingBills.tax !== undefined) {
             taxEnabled = Number(existingBills.tax) > 0;
-        }
-        // Caso 4: default seguro
-        else {
+        } else {
             taxEnabled = false;
         }
 
-        // Base imponible
+        taxEnabled = taxFeatureEnabled ? taxEnabled : false;
         const taxable = Math.max(subtotal - discount, 0);
-
-        // ITBIS
         const effectiveTaxRate = taxEnabled ? TAX_RATE : 0;
         const tax = taxable * effectiveTaxRate;
 
-
-        // ---- TIP (Propina en monto) ----
+        // ---- TIP ----
         let tip = 0;
 
-        // Caso 1: Si el frontend dice que tipEnabled es false → propina 0
         if (incomingBills.tipEnabled === false) {
             tip = 0;
-        }
-        // Caso 2: Si el frontend envía tipAmount → usarlo
-        else if (incomingBills.tipAmount !== undefined) {
+        } else if (incomingBills.tipAmount !== undefined) {
             tip = Number(incomingBills.tipAmount);
-        }
-        // Caso 3: Si el frontend envía tip → usarlo
-        else if (incomingBills.tip !== undefined) {
+        } else if (incomingBills.tip !== undefined) {
             tip = Number(incomingBills.tip);
-        }
-        // Caso 4: Orden existente → mantener propina previa (tipAmount o tip)
-        else if (safeUpdate.bills.tipAmount !== undefined) {
+        } else if (safeUpdate.bills.tipAmount !== undefined) {
             tip = Number(safeUpdate.bills.tipAmount);
         } else if (safeUpdate.bills.tip !== undefined) {
             tip = Number(safeUpdate.bills.tip);
         }
 
-        // Total final
         const totalWithTax = taxable + tax + tip;
 
-
-
-        // Guardamos bills actualizados (respetando compatibilidad con 'tip')
+        // Guardar bills actualizados (respetando compatibilidad con 'tip')
         safeUpdate.bills = {
             ...safeUpdate.bills,
+            subtotal,
             total: subtotal,
             discount,
             taxEnabled,
@@ -344,9 +426,8 @@ const updateOrder = async (req, res, next) => {
             totalWithTax,
         };
 
-        let order = await Order.findByIdAndUpdate(id, safeUpdate, {
-            new: true,
-        })
+        // ✅ Update seguro multi-tenant
+        let order = await Order.findOneAndUpdate(orderScope, safeUpdate, { new: true })
             .populate("table", "tableNo status")
             .populate("user", "name email role");
 
@@ -356,36 +437,34 @@ const updateOrder = async (req, res, next) => {
         const deletableStatuses = ["In Progress", "Cancelled"];
 
         if (isClearingItems && deletableStatuses.includes(current.orderStatus)) {
-            console.log(`🗑 Eliminando orden vacía (items explícitamente limpiados): ${current._id}`);
+            if (current.table?._id || current.table) {
+                const tableId = current.table?._id ? current.table._id : current.table;
 
-            if (current.table?._id) {
                 await Table.findOneAndUpdate(
-                    { _id: current.table._id, tenantId: req.user.tenantId, clientId: req.clientId },
+                    {
+                        _id: tableId,
+                        tenantId,
+                        $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                    },
                     { status: "Available", currentOrder: null }
                 );
             }
 
-            await Order.deleteOne({
-                _id: current._id,
-                tenantId: req.user.tenantId,
-                clientId: req.clientId
-            });
+            await Order.deleteOne(orderScope);
 
             return res.status(200).json({
                 success: true,
                 autoDeleted: true,
-                message: "Order deleted because items were explicitly cleared."
+                message: "Order deleted because items were explicitly cleared.",
             });
         }
 
-        // Si se completó → generar factura PDF
+        // ✅ Si se completó → generar factura PDF
         if (req.body.orderStatus === "Completed") {
             try {
-                console.log("LO QUE ESTOY ENVIANDO AL PDF:", order, "ID:", order._id);
                 const { generateInvoicePDF } = require("../utils/generateInvoicePDF");
 
-                const pdf = await generateInvoicePDF(order._id.toString(), req.user.tenantId);
-                console.log("[updateOrder] Factura generada OK");
+                const pdf = await generateInvoicePDF(order._id.toString(), tenantId);
                 order.invoiceUrl = pdf.url;
                 await order.save();
             } catch (err) {
@@ -393,20 +472,29 @@ const updateOrder = async (req, res, next) => {
             }
         }
 
-        // Liberar mesa si se cancela/completa
-        if ((req.body.orderStatus === "Cancelled" ||
-            req.body.orderStatus === "Completed") && current.table) {
-
+        // ✅ Liberar mesa si se cancela/completa
+        if (
+            (req.body.orderStatus === "Cancelled" || req.body.orderStatus === "Completed") &&
+            current.table
+        ) {
             await Table.findOneAndUpdate(
-                { _id: current.table, tenantId: req.user.tenantId, clientId: req.clientId },
+                {
+                    _id: current.table,
+                    tenantId,
+                    $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                },
                 { status: "Available", currentOrder: null }
             );
         }
 
-        // Marcar nueva mesa si se asigna
+        // ✅ Marcar nueva mesa si se asigna
         if (req.body.table) {
             await Table.findOneAndUpdate(
-                { _id: req.body.table, tenantId: req.user.tenantId, clientId: req.clientId },
+                {
+                    _id: req.body.table,
+                    tenantId,
+                    $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                },
                 { status: "Booked", currentOrder: order._id }
             );
         }
@@ -414,14 +502,14 @@ const updateOrder = async (req, res, next) => {
         return res.status(200).json({
             success: true,
             message: "Order updated successfully",
-            data: order
+            data: order,
         });
-
     } catch (error) {
         console.error("[updateOrder] error:", error);
         next(createHttpError(500, "UPDATE_ORDER_FAILED"));
     }
 };
+
 
 
 

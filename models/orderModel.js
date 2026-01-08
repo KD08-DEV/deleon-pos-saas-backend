@@ -34,6 +34,8 @@ const orderSchema = new mongoose.Schema(
             enum: ["In Progress", "Ready", "Completed", "Cancelled"], // ⟵ añadimos Cancelled
             default: "In Progress",
         },
+        invoicePath: { type: String, default: "" },
+        invoiceUrl: { type: String, default: "" },
         bills: {
             total: { type: Number, default: 0 },        // Subtotal
             discount: { type: Number, default: 0 },
@@ -41,6 +43,16 @@ const orderSchema = new mongoose.Schema(
             tax: { type: Number, default: 0 },
             totalWithTax: { type: Number, default: 0 }, // Total final
         },
+        // --- FACTURACIÓN FISCAL (NCF) ---
+        fiscal: {
+            requested: { type: Boolean, default: false },
+            ncfType: { type: String, default: "B02" },     // B01, B02, etc.
+            ncfNumber: { type: String, default: null },    // B0200000001
+            issuedAt: { type: Date, default: null },
+        },
+
+// Opcional: duplicado top-level (útil para búsquedas rápidas)
+        ncfNumber: { type: String, default: null },
         items: { type: [itemSchema], default: [] },
         table: {
             type: mongoose.Schema.Types.ObjectId,

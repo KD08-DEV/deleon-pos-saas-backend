@@ -3,6 +3,8 @@ const router = express.Router();
 const verifyToken = require("../middlewares/tokenVerification");
 const Tenant = require("../models/tenantModel");
 const { getTenantUsage } = require("../controllers/superadminUsageController");
+const { updateTenantFeatures } = require("../controllers/userController");
+
 
 // Middleware local para asegurar SuperAdmin
 function isSuperAdmin(req, res, next) {
@@ -51,7 +53,15 @@ router.patch("/tenants/:tenantId/status", verifyToken, isSuperAdmin, async (req,
 
     res.json({ success: true, data: tenant });
 });
-
+// =========================
+// PATCH: Features del tenant (tax/discount/fiscal)
+// =========================
+router.patch(
+    "/tenants/:tenantId/features",
+    verifyToken,
+    isSuperAdmin,
+    updateTenantFeatures
+);
 // =========================
 // PATCH: Cambiar plan del tenant
 // =========================

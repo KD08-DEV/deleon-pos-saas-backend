@@ -37,7 +37,7 @@ const register = async (req, res, next) => {
         let tenantId;
         let membershipRole = "Waiter";
 
-// 🔥 CASO 1: SUPERADMIN crea un Admin (nueva empresa)
+/// 🔥 CASO 1: SUPERADMIN crea un Admin (nueva empresa)
         if (req.user && req.user.role === "SuperAdmin" && role === "Admin") {
             const companyName = tenantName || `${name}'s Business`;
             const tenantPlan = (plan || "emprendedor").toLowerCase();
@@ -60,6 +60,33 @@ const register = async (req, res, next) => {
 
             tenantId = uuidv4();
 
+            // ✅ FISCAL INFO (nuevo formato)
+            const fiscalPayload = req.body.fiscal || {};
+
+            const normalizeCfg = (cfg = {}) => {
+                const start = Number(cfg.start) || 1;
+                const current = Number(cfg.current) || start;
+                const max = Number(cfg.max) || 0;
+                const active = Boolean(cfg.active);
+                return { start, current, max, active };
+            };
+
+            const fiscalToSave = {
+                enabled: Boolean(fiscalPayload.enabled),
+                nextInvoiceNumber: Number(fiscalPayload.nextInvoiceNumber) || 1,
+                ncfConfig: {
+                    B01: normalizeCfg(fiscalPayload.ncfConfig?.B01),
+                    B02: normalizeCfg(fiscalPayload.ncfConfig?.B02),
+                },
+            };
+
+            // Si fiscal.enabled es false => apagamos los tipos
+            if (!fiscalToSave.enabled) {
+                fiscalToSave.ncfConfig.B01.active = false;
+                fiscalToSave.ncfConfig.B02.active = false;
+            }
+
+            // ✅ Crear tenant UNA sola vez (sin duplicados)
             await Tenant.create({
                 tenantId,
                 name: companyName,
@@ -68,24 +95,18 @@ const register = async (req, res, next) => {
 
                 // BUSINESS INFO
                 business: {
-                    name: req.body.business?.name || req.body.commercialName,
-                    rnc: req.body.business?.rnc || req.body.rnc || null,
-                    address: req.body.business?.address || req.body.businessAddress || null,
-                    phone: req.body.business?.phone || req.body.businessPhone || null
+                    name: req.body.business?.name || null,
+                    rnc: req.body.business?.rnc || null,
+                    address: req.body.business?.address || null,
+                    phone: req.body.business?.phone || null,
                 },
 
-                // FISCAL INFO
-                fiscal: {
-                    ncfType: req.body.ncfType || "B02",
-                    ncfNumber: req.body.ncfNumber || null,
-                    issueDate: req.body.issueDate || null,
-                }
+                fiscal: fiscalToSave,
             });
-
-
 
             membershipRole = "Owner"; // primer admin = dueño
         }
+
         // 🔥 CASO 2: Admin de empresa crea empleados en SU tenant
         else if (req.user && req.user.role === "Admin") {
             tenantId = req.user.tenantId;
@@ -308,5 +329,77 @@ const logout = async (req, res, next) => {
         next(error);
     }
 };
+// ✅ PATCH /api/superadmin/tenants/:tenantId/features
+// Body soportado (2 formas):
+// A) { taxEnabled: false, discountEnabled: false, fiscalEnabled: false }
+// B) { features: { tax: { enabled: false }, discount: { enabled: false }, fiscal: { enabled: false } } }
 
-module.exports = { register, login, getUserData, logout };
+const updateTenantFeatures = async (req, res, next) => {
+    try {
+        // tenantId viene por URL
+        const { tenantId } = req.params;
+
+        if (!tenantId) {
+            return res.status(400).json({ success: false, message: "tenantId is required" });
+        }
+
+        // Soportar ambos formatos
+        const taxEnabled =
+            req.body?.taxEnabled ?? req.body?.features?.tax?.enabled;
+
+        const discountEnabled =
+            req.body?.discountEnabled ?? req.body?.features?.discount?.enabled;
+
+        const fiscalEnabled =
+            req.body?.fiscalEnabled ?? req.body?.features?.fiscal?.enabled;
+
+        // Validación: si viene definido, debe ser boolean
+        const isBool = (v) => typeof v === "boolean";
+
+        if (taxEnabled !== undefined && !isBool(taxEnabled)) {
+            return res.status(400).json({ success: false, message: "taxEnabled must be boolean" });
+        }
+        if (discountEnabled !== undefined && !isBool(discountEnabled)) {
+            return res.status(400).json({ success: false, message: "discountEnabled must be boolean" });
+        }
+        if (fiscalEnabled !== undefined && !isBool(fiscalEnabled)) {
+            return res.status(400).json({ success: false, message: "fiscalEnabled must be boolean" });
+        }
+
+        // Construir $set solo con lo que venga
+        const $set = {};
+        if (taxEnabled !== undefined) $set["features.tax.enabled"] = taxEnabled;
+        if (discountEnabled !== undefined) $set["features.discount.enabled"] = discountEnabled;
+        if (fiscalEnabled !== undefined) $set["features.fiscal.enabled"] = fiscalEnabled;
+
+        if (Object.keys($set).length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "No features provided to update",
+            });
+        }
+
+        const tenant = await Tenant.findOneAndUpdate(
+            { tenantId },
+            { $set },
+            { new: true }
+        );
+
+        if (!tenant) {
+            return res.status(404).json({ success: false, message: "Tenant not found" });
+        }
+
+        return res.json({
+            success: true,
+            message: "Tenant features updated",
+            data: tenant,
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+
+
+module.exports = { register, login, getUserData, logout, updateTenantFeatures };
+
