@@ -20,14 +20,13 @@ const orderRoute = require("./routes/orderRoute"); // ✅ CommonJS correcto
 
 const PORT = config.port;
 connectDB();
-
+const allowedOrigins = (process.env.CORS_ORIGIN || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
 const io = new Server(server, {
     cors: {
-        origin: [
-            "http://localhost:5173",
-            "http://localhost:5174",
-            "https://deleon-pos-saas-frontend.vercel.app",
-        ],
+        origin: allowedOrigins,
         credentials: true,
         methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     },
@@ -80,22 +79,29 @@ io.on("connection", (socket) => {
 
 // Middlewares
 app.use(cors({
-    origin: [
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "https://deleon-pos-saas-frontend.vercel.app"
-    ],
+    origin: (origin, cb) => {
+        // Permite requests sin Origin (Postman, server-to-server)
+        if (!origin) return cb(null, true);
+
+        // Permite solo lo que está en allowedOrigins
+        if (allowedOrigins.includes(origin)) return cb(null, true);
+
+        return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: [
-        "Content-Type",
-        "Authorization",
-        "x-client-id",
-        "x-tenant-id"
-    ]
+    allowedHeaders: ["Content-Type", "Authorization", "x-client-id", "x-tenant-id"],
 }));
 
-app.options("*", cors());
+app.options("*", cors({
+    origin: (origin, cb) => {
+        if (!origin) return cb(null, true);
+        if (allowedOrigins.includes(origin)) return cb(null, true);
+        return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    credentials: true,
+}));
+
 app.use(express.json());
 app.use(cookieParser());
 
