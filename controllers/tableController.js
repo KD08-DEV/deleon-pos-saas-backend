@@ -103,6 +103,9 @@ const updateTable = async (req, res, next) => {
                 { new: true }
             );
 
+            const io = req.app?.get?.("io");
+            io?.to?.(req.user.tenantId)?.emit?.("tenant:tablesUpdated", { tenantId: req.user.tenantId });
+
             return res.status(200).json({
                 success: true,
                 message: "Table released",

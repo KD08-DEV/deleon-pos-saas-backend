@@ -57,10 +57,13 @@ exports.getReports = async (req, res) => {
             orderCount,
             avgTicket: Number(avgTicket.toFixed(2)),
             cashSales: orders
-                .filter((o) => o.paymentMethod === "Cash")
+                .filter((o) => o.paymentMethod === "Efectivo")
                 .reduce((s, o) => s + o.totalAmount, 0),
             onlineSales: orders
                 .filter((o) => o.paymentMethod === "Tarjeta")
+                .reduce((s, o) => s + o.totalAmount, 0),
+            transferSales: orders
+                .filter((o) => o.paymentMethod === "Transferencia")
                 .reduce((s, o) => s + o.totalAmount, 0),
         };
 
@@ -116,6 +119,111 @@ exports.getUsers = async (req, res) => {
             .json({ success: false, message: "Error al obtener usuarios" });
     }
 };
+exports.getFiscalConfig = async (req, res) => {
+    try {
+        const tenantId = req.user.tenantId;
+        const tenant = await Tenant.findOne({ tenantId }).select("fiscal features");
+
+        return res.json({
+            success: true,
+            data: {
+                fiscal: tenant?.fiscal || null,
+                features: tenant?.features || {},
+            },
+        });
+    } catch (e) {
+        return res.status(500).json({ success: false, message: e.message });
+    }
+};
+
+
+exports.updateFiscalConfig = async (req, res) => {
+    try {
+        const tenantId = req.user.tenantId;
+
+
+        const fiscalEnabled = !!req.body?.fiscalEnabled;
+        const taxEnabled = req.body?.features?.tax?.enabled;
+        const tipEnabled = req.body?.features?.tip?.enabled;
+
+        const ncfConfig = req.body?.ncfConfig || {};
+        const B01 = ncfConfig.B01;
+        const B02 = ncfConfig.B02;
+        const discountEnabled = req.body?.features?.discount?.enabled;
+        const $set = {};
+        if (typeof discountEnabled === "boolean") $set["features.discount.enabled"] = discountEnabled;
+
+
+
+
+        // fiscal enabled
+        $set["fiscal.enabled"] = fiscalEnabled;
+
+        // features toggles (solo si vienen)
+        if (typeof taxEnabled === "boolean") $set["features.tax.enabled"] = taxEnabled;
+        if (typeof tipEnabled === "boolean") $set["features.tip.enabled"] = tipEnabled;
+
+        // Reusa tu buildUpdateForType pero apuntando a fiscal.ncfConfig...
+        // + permitir "active" si viene
+        const buildUpdateForType = (type, data) => {
+            const u = {};
+            if (!data) return u;
+
+            ["start", "current", "max"].forEach((k) => {
+                if (data[k] !== undefined && data[k] !== null && data[k] !== "") {
+                    const n = Number(data[k]);
+                    if (!Number.isFinite(n) || n < 0) throw new Error(`${type}.${k} inválido`);
+                    u[`fiscal.ncfConfig.${type}.${k}`] = Math.floor(n);
+                }
+            });
+
+            if ("active" in data) {
+                u[`fiscal.ncfConfig.${type}.active`] = !!data.active;
+            }
+
+            if ("expiresAt" in data) {
+                if (!data.expiresAt) u[`fiscal.ncfConfig.${type}.expiresAt`] = null;
+                else {
+                    const d = new Date(data.expiresAt);
+                    if (Number.isNaN(d.getTime())) throw new Error(`${type}.expiresAt inválido`);
+                    u[`fiscal.ncfConfig.${type}.expiresAt`] = d;
+                }
+            }
+
+            return u;
+        };
+
+        Object.assign($set, buildUpdateForType("B01", B01));
+        Object.assign($set, buildUpdateForType("B02", B02));
+
+        const updated = await Tenant.findOneAndUpdate(
+            { tenantId },
+            { $set },
+            { new: true }
+        ).select("fiscal features");
+        console.log("[ADMIN] updated.features:", updated?.features);
+        console.log("[ADMIN] updated.fiscal.enabled:", updated?.fiscal?.enabled);
+        const io = req.app.get("io");
+        console.log("[socket] emit configUpdated", tenantId, "io?", !!io);
+
+        if (io) {
+            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", {
+                tenantId,
+                features: updated.features,
+                fiscal: updated.fiscal,
+            });
+            console.log("[socket] emitted to room:", `tenant:${tenantId}`);
+        }
+
+        return res.json({
+            success: true,
+            data: { fiscal: updated.fiscal, features: updated.features },
+        });
+    } catch (e) {
+        return res.status(400).json({ success: false, message: e.message });
+    }
+};
+
 // 🔹 Uso del plan: usuarios, platos, mesas y límites
 exports.getUsage = async (req, res) => {
     try {

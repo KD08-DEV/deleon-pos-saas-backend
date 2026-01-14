@@ -13,6 +13,10 @@ const {
     getEmployees,
     getUsers,
     getUsage,
+
+    // ✅ NUEVO (agrega estas 2 en tu adminController)
+    getFiscalConfig,
+    updateFiscalConfig,
 } = require("../controllers/adminController");
 
 // Panel admin: nivel tenant (no requiere clientId)
@@ -34,5 +38,19 @@ router.get(
     requireRole("Owner", "Admin"),
     exportExcel
 );
+router.get(
+    "/fiscal-config",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    getFiscalConfig
+);
+
+router.patch(
+    "/fiscal-config",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    updateFiscalConfig
+);
+
 
 module.exports = router;

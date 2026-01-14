@@ -57,5 +57,7 @@ router.post("/movements", requireRole("Owner", "Admin"), inventoryController.cre
 // Exports (Owner/Admin)
 router.get("/export/items.csv", requireRole("Owner", "Admin"), inventoryExportController.exportItemsCSV);
 router.get("/export/movements.csv", requireRole("Owner", "Admin"), inventoryExportController.exportMovementsCSV);
+router.get("/consumption", inventoryController.consumption);
+
 
 module.exports = router;

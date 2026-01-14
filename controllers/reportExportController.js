@@ -49,7 +49,7 @@ async function exportExcel(req, res) {
                 "descuento": descuento,
                 "itbs": itbs,
                 "propina": propina,
-                "método de pago": order.paymentMethod || "Cash",
+                "método de pago": order.paymentMethod || "Efectivo",
                 "usuario": order.user?.name || "—",
                 "grand total": grandTotal
             });

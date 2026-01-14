@@ -1,17 +1,14 @@
 const Dish = require("../models/dish");
 const createHttpError = require("http-errors");
 const mongoose = require("mongoose");
-const supabase = require("../config/supabaseClient");
+const { supabase } = require("../config/supabaseClient");
 
 const uploadToSupabase = async (tenantId, file) => {
     const ext = file.originalname.split(".").pop();
-
-    // Guardamos en carpetas por tenant: ejemplo /tenant_123/file.png
     const filename = `${Date.now()}.${ext}`;
     const fullPath = `${tenantId}/${filename}`;
 
-    // --- SUBIR ARCHIVO ---
-    const { data, error } = await supabase.storage
+    const { error } = await supabase.storage
         .from(process.env.SUPABASE_BUCKET)
         .upload(fullPath, file.buffer, {
             contentType: file.mimetype,
@@ -23,20 +20,44 @@ const uploadToSupabase = async (tenantId, file) => {
         throw createHttpError(500, error.message || "Error uploading image");
     }
 
-    // --- GENERAR URL PÚBLICA CORRECTA ---
     const { data: publicData } = supabase.storage
         .from(process.env.SUPABASE_BUCKET)
         .getPublicUrl(fullPath);
 
-    const publicUrl = publicData.publicUrl;
+    return { publicUrl: publicData.publicUrl, fullPath };
+};
 
-    return { publicUrl, fullPath };
+const extractSupabaseKeyFromPublicUrl = (imageUrl) => {
+    try {
+        const u = new URL(String(imageUrl));
+        const parts = u.pathname.split("/").filter(Boolean);
+        const i = parts.findIndex((p) => p === "public");
+        if (i === -1) return null;
+
+        const bucket = parts[i + 1];
+        const key = parts.slice(i + 2).join("/");
+
+        // Si el URL trae "public/<bucket>/<key>", remove() solo quiere <key>
+        if (bucket && key) return key;
+
+        return null;
+    } catch (_) {
+        return null;
+    }
 };
 
 const deleteFromSupabase = async (imageUrl) => {
     try {
-        const relativePath = imageUrl.split("/public/")[1];
-        await supabase.storage.from(process.env.SUPABASE_BUCKET).remove([relativePath]);
+        const key = extractSupabaseKeyFromPublicUrl(imageUrl);
+        if (!key) return;
+
+        const { error } = await supabase.storage
+            .from(process.env.SUPABASE_BUCKET)
+            .remove([key]);
+
+        if (error) {
+            console.log("Error deleting Supabase image:", error.message);
+        }
     } catch (error) {
         console.log("Error deleting Supabase image:", error.message);
     }
@@ -95,7 +116,14 @@ exports.getDishes = async (req, res, next) => {
 exports.updateDish = async (req, res, next) => {
     try {
         const { id } = req.params;
-        const { name, price, category } = req.body;
+        const {
+            name,
+            price,
+            category,
+            sellMode,
+            weightUnit,
+            pricePerLb,
+        } = req.body;
 
         if (!mongoose.Types.ObjectId.isValid(id)) {
             return next(createHttpError(404, "Invalid dish ID!"));
@@ -110,16 +138,48 @@ exports.updateDish = async (req, res, next) => {
 
         // Nueva imagen
         if (req.file) {
-            // Eliminar la imagen anterior
             if (dish.imageUrl) await deleteFromSupabase(dish.imageUrl);
-
             const upload = await uploadToSupabase(req.user.tenantId, req.file);
             dish.imageUrl = upload.publicUrl;
         }
 
-        dish.name = name || dish.name;
-        dish.price = price || dish.price;
-        dish.category = category || dish.category;
+        if (name !== undefined) dish.name = String(name);
+        if (category !== undefined) dish.category = String(category);
+
+        if (sellMode !== undefined) {
+            const sm = String(sellMode);
+            if (!["unit", "weight"].includes(sm)) {
+                return next(createHttpError(400, "sellMode inválido"));
+            }
+            dish.sellMode = sm;
+        }
+
+        if (weightUnit !== undefined) {
+            const wu = String(weightUnit);
+            if (!["lb", "kg"].includes(wu)) {
+                return next(createHttpError(400, "weightUnit inválido"));
+            }
+            dish.weightUnit = wu;
+        }
+
+        if (price !== undefined) {
+            const p = Number(price);
+            if (!Number.isFinite(p) || p < 0) {
+                return next(createHttpError(400, "price inválido"));
+            }
+            dish.price = p;
+        }
+
+        if (pricePerLb !== undefined) {
+            const pp = Number(pricePerLb);
+            if (!Number.isFinite(pp) || pp < 0) {
+                return next(createHttpError(400, "pricePerLb inválido"));
+            }
+            dish.pricePerLb = pp;
+        } else if (dish.sellMode === "unit") {
+            // si vuelve a unit, limpia pricePerLb para evitar confusión
+            dish.pricePerLb = dish.pricePerLb ?? null;
+        }
 
         const updated = await dish.save();
 
@@ -128,12 +188,85 @@ exports.updateDish = async (req, res, next) => {
             message: "Dish updated successfully!",
             data: updated,
         });
-
     } catch (error) {
         next(error);
     }
 };
 
+exports.getDishRecipe = async (req, res) => {
+    try {
+        const tenantId = req.tenantId || req.headers["x-tenant-id"];
+        const dish = await Dish.findOne({ _id: req.params.id, tenantId });
+
+        if (!dish) {
+            return res.status(404).json({ success: false, message: "Dish no encontrado" });
+        }
+
+        return res.json({
+            success: true,
+            sellMode: dish.sellMode || "unit",
+            weightUnit: dish.weightUnit || "lb",
+            pricePerLb: dish.pricePerLb ?? null,
+            recipe: dish.recipe || [],
+        });
+    } catch (err) {
+        console.error("getDishRecipe error:", err);
+        return res.status(500).json({ success: false, message: "Error interno" });
+    }
+};
+
+exports.updateDishRecipe = async (req, res) => {
+    try {
+        const tenantId = req.tenantId || req.headers["x-tenant-id"];
+
+        const { sellMode, weightUnit, pricePerLb, recipe } = req.body;
+
+        if (sellMode && !["unit", "weight"].includes(sellMode)) {
+            return res.status(400).json({ success: false, message: "sellMode inválido" });
+        }
+        if (weightUnit && !["lb", "kg"].includes(weightUnit)) {
+            return res.status(400).json({ success: false, message: "weightUnit inválido" });
+        }
+        if (recipe && !Array.isArray(recipe)) {
+            return res.status(400).json({ success: false, message: "recipe debe ser un array" });
+        }
+
+        // Validación mínima de receta
+        if (Array.isArray(recipe)) {
+            for (const r of recipe) {
+                if (!r.inventoryItemId) {
+                    return res.status(400).json({ success: false, message: "Cada receta requiere inventoryItemId" });
+                }
+                const q = Number(r.qty);
+                if (!Number.isFinite(q) || q <= 0) {
+                    return res.status(400).json({ success: false, message: "Cada receta requiere qty > 0" });
+                }
+            }
+        }
+
+        const dish = await Dish.findOne({ _id: req.params.id, tenantId });
+        if (!dish) {
+            return res.status(404).json({ success: false, message: "Dish no encontrado" });
+        }
+
+        if (sellMode) dish.sellMode = sellMode;
+        if (weightUnit) dish.weightUnit = weightUnit;
+
+        // Si es weight, pricePerLb debe existir (o al menos permitirlo null si lo manejarás en front)
+        if (sellMode === "weight" || dish.sellMode === "weight") {
+            dish.pricePerLb = (pricePerLb === undefined ? dish.pricePerLb : Number(pricePerLb));
+        }
+
+        if (Array.isArray(recipe)) dish.recipe = recipe;
+
+        await dish.save();
+
+        return res.json({ success: true, dish });
+    } catch (err) {
+        console.error("updateDishRecipe error:", err);
+        return res.status(500).json({ success: false, message: "Error interno" });
+    }
+};
 // --------------------------------------------
 // DELETE
 exports.deleteDish = async (req, res, next) => {

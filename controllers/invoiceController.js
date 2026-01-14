@@ -3,7 +3,8 @@ const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
 const path = require("path");
 const fs = require("fs");
 const Order = require("../models/orderModel");
-const { generateInvoicePDF } = require("../utils/generateInvoicePDF");
+const generateInvoicePDF = require("../utils/generateInvoicePDF");
+
 
 
 exports.createInvoice = async (req, res) => {

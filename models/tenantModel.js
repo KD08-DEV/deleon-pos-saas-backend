@@ -13,11 +13,17 @@ const tenantSchema = new mongoose.Schema(
 
         name: { type: String, required: true, trim: true },
 
+        // pos-backend/models/tenantModel.js
+
         fiscal: {
-            // ✅ IMPORTANTE: flag principal para saber si el tenant puede facturar con NCF
+            // ✅ flag principal para saber si el tenant puede facturar con NCF
             enabled: { type: Boolean, default: false },     // NCF/Comprobante fiscal
             allowRequest: { type: Boolean, default: true }, // si el cajero puede pedirlo
             defaultType: { type: String, default: "B02" },
+
+            // ✅ Punto de emisión / sucursal (se muestran en la factura)
+            emissionPoint: { type: String, default: "001" },
+            branchName: { type: String, default: "Principal" },
 
             // número interno de factura (por tenant)
             nextInvoiceNumber: { type: Number, default: 1 },
@@ -27,20 +33,28 @@ const tenantSchema = new mongoose.Schema(
                 B01: {
                     start: { type: Number, default: 1 },
                     current: { type: Number, default: 1 }, // next to use
-                    max: { type: Number, default: 0 }, // 0 = no configurado
+                    max: { type: Number, default: 0 },     // 0 = no configurado
                     active: { type: Boolean, default: false },
+
+                    // ✅ FECHA DE VENCIMIENTO del rango NCF (DGII)
+                    expiresAt: { type: Date, default: null },
                 },
                 B02: {
                     start: { type: Number, default: 1 },
                     current: { type: Number, default: 1 },
                     max: { type: Number, default: 0 },
                     active: { type: Boolean, default: false },
+
+                    // ✅ FECHA DE VENCIMIENTO del rango NCF (DGII)
+                    expiresAt: { type: Date, default: null },
                 },
             },
 
             // ⚠️ recomendado: NO usar esto en tenant (issueDate es por factura)
             issueDate: { type: String, default: null },
         },
+
+
 
         features: {
             tax: {
@@ -52,6 +66,11 @@ const tenantSchema = new mongoose.Schema(
                 enabled: { type: Boolean, default: true },
                 allowToggle: { type: Boolean, default: true },
             },
+            tip: {
+                enabled: { type: Boolean, default: true },
+                allowToggle: { type: Boolean, default: true },
+            },
+
 
         },
 

@@ -48,7 +48,7 @@ exports.exportInvoicesExcel = async (req, res) => {
                 id: o._id.toString(),
                 date: new Date(o.createdAt).toLocaleString(),
                 client: o.customerDetails?.name || "N/A",
-                method: o.paymentMethod || "Cash",
+                method: o.paymentMethod || "Efectivo",
                 subtotal: o.bills?.total || 0,
                 discount: o.bills?.discount || 0,
                 tip: o.bills?.tip || 0,

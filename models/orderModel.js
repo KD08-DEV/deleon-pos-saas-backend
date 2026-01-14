@@ -2,21 +2,23 @@ const mongoose = require("mongoose");
 
 const itemSchema = new mongoose.Schema(
     {
+        dishId: { type: mongoose.Schema.Types.ObjectId, ref: "dish", required: false },
+
         name: { type: String, required: true, trim: true },
 
-        // Nuevo: precio unitario real (lo que usas en el frontend)
+        qtyType: { type: String, enum: ["unit", "weight"], default: "unit" },
+        weightUnit: { type: String, enum: ["lb", "kg"], default: "lb" },
+
         unitPrice: { type: Number, required: true, min: 0 },
 
-        quantity: { type: Number, required: true, min: 1 },
+        // ahora soporta 0.75 lb, 1.25 lb, etc.
+        quantity: { type: Number, required: true, min: 0.001 },
 
-        // Total por ítem (unitPrice * quantity)
         price: { type: Number, required: true, min: 0 },
-
-        // Deprecated: precio antiguo — ya NO se usa, pero lo dejamos NO requerido
-        pricePerQuantity: { type: Number, required: false },
     },
     { _id: false }
 );
+
 
 const orderSchema = new mongoose.Schema(
     {
@@ -28,28 +30,54 @@ const orderSchema = new mongoose.Schema(
             name: { type: String, trim: true },
             phone: { type: String, default: "" },
             guests: { type: Number, default: 0, min: 0 },
+            rnc: String,
+            rncCedula: String,
         },
         orderStatus: {
             type: String,
-            enum: ["In Progress", "Ready", "Completed", "Cancelled"], // ⟵ añadimos Cancelled
-            default: "In Progress",
+            enum: ["En Progreso", "Listo", "Completado", "Cancelado"], // ⟵ añadimos Cancelled
+            default: "En Progreso",
         },
         invoicePath: { type: String, default: "" },
         invoiceUrl: { type: String, default: "" },
         bills: {
-            total: { type: Number, default: 0 },        // Subtotal
+            // subtotal real (antes de ITBIS y propina)
+            subtotal: { type: Number, default: 0 },
+
+            // compat (tu app usa total como "subtotal" a veces)
+            total: { type: Number, default: 0 },
+
             discount: { type: Number, default: 0 },
-            tip: { type: Number, default: 0 },// Monto de descuento
+
+            // propina (guardamos ambos por compatibilidad)
+            tip: { type: Number, default: 0 },
+            tipAmount: { type: Number, default: 0 },
+
+            // ITBIS
+            taxEnabled: { type: Boolean, default: true },
             tax: { type: Number, default: 0 },
-            totalWithTax: { type: Number, default: 0 }, // Total final
+
+            // total final
+            totalWithTax: { type: Number, default: 0 },
         },
         // --- FACTURACIÓN FISCAL (NCF) ---
         fiscal: {
             requested: { type: Boolean, default: false },
             ncfType: { type: String, default: "B02" },     // B01, B02, etc.
-            ncfNumber: { type: String, default: null },    // B0200000001
+            ncfNumber: { type: String, default: null },    // B0200000001 (B02 + 8 dígitos)
             issuedAt: { type: Date, default: null },
+
+            // NUEVO: secuencial interno de empresa/registradora (no es el OrderId)
+            internalSeq: { type: Number, default: null },
+
+            // NUEVO: punto de emisión / sucursal (simple)
+            emissionPoint: { type: String, default: "001" }, // ej: 001
+
+            // NUEVO: fecha de impresión (cuando se genera el PDF)
+            printedAt: { type: Date, default: null },
         },
+        inventoryDeducted: { type: Boolean, default: false },
+        inventoryDeductedAt: { type: Date, default: null },
 
 // Opcional: duplicado top-level (útil para búsquedas rápidas)
         ncfNumber: { type: String, default: null },
@@ -60,7 +88,7 @@ const orderSchema = new mongoose.Schema(
             required: false,
             default: null,
         },
-        paymentMethod: { type: String, enum: ["Cash", "Tarjeta"], default: "Cash" },
+        paymentMethod: { type: String, enum: ["Efectivo", "Tarjeta,Transferencia"], default: "Efectivo" },
         user: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // quien creó la orden
     },
     { timestamps: true }

@@ -1,37 +1,344 @@
 const createHttpError = require("http-errors");
-const { default: mongoose } = require("mongoose");
+const mongoose = require("mongoose");
 const Order = require("../models/orderModel");
 const Table = require("../models/tableModel");
 const Tenant = require("../models/tenantModel");
+const Dish = require("../models/dish"); // ajusta si el nombre es dishModel.js
+const InventoryItem = require("../models/inventoryItemModel");
+const InventoryMovement = require("../models/inventoryMovementModel");
 
-// Impuesto por defecto (5.25% para coincidir con tu UI)
+// Impuesto por defecto (0.25% para coincidir con tu UI)
 const TAX_RATE = Number(process.env.TAX_RATE ?? 0.18);
+
 
 function round2(n) {
     return Math.round((Number(n) || 0) * 100) / 100;
 }
+function escapeRegex(str = "") {
+    return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function normalizeMongoDate(value) {
+    if (!value) return null;
+
+    // Date real
+    if (value instanceof Date) return value;
+
+    // ISO string / timestamp
+    if (typeof value === "string" || typeof value === "number") {
+        const d = new Date(value);
+        return Number.isNaN(d.getTime()) ? null : d;
+    }
+
+    // Extended JSON guardado como objeto: { $date: "..." }
+    if (typeof value === "object") {
+        if (value.$date) return normalizeMongoDate(value.$date);
+        if (value.date) return normalizeMongoDate(value.date);
+    }
+
+    return null;
+}
+function normalizeOrderStatus(s) {
+    const v = String(s || "").trim();
+
+    const map = {
+        "In Progress": "En Progreso",
+        "Ready": "Listo",
+        "Completed": "Completado",
+        "Cancelled": "Cancelado",
+        "Canceled": "Cancelado",
+
+        "En Progreso": "En Progreso",
+        "Listo": "Listo",
+        "Completado": "Completado",
+        "Cancelado": "Cancelado",
+    };
+
+    return map[v] || "En Progreso";
+}
+
+
+
+
+async function deductInventoryForOrder(order, userId) {
+    const session = await mongoose.startSession();
+
+    try {
+        await session.withTransaction(async () => {
+            const freshOrder = await Order.findById(order._id).session(session);
+            if (!freshOrder) throw new Error("Orden no encontrada");
+
+            // idempotente
+            if (freshOrder.inventoryDeducted) {
+                console.log("[INV] order already deducted:", String(freshOrder._id));
+                return;
+            }
+
+            console.log("[INV] deductInventoryForOrder => order:", String(freshOrder._id));
+            console.log("[INV] tenantId:", String(freshOrder.tenantId), "clientId:", String(freshOrder.clientId));
+            console.log("[INV] status:", freshOrder.orderStatus, "inventoryDeducted:", freshOrder.inventoryDeducted);
+
+            let deductedCount = 0;
+
+            for (const item of freshOrder.items || []) {
+                console.log("[INV] item:", {
+                    name: item.name,
+                    dishId: item.dishId,
+                    qtyType: item.qtyType,
+                    weightUnit: item.weightUnit,
+                    quantity: item.quantity,
+                });
+
+                if (!item.dishId) {
+                    console.log(`[INV] WARNING: item "${item.name}" no tiene dishId. Saltando.`);
+                    continue;
+                }
+
+                const dishQuery = {
+                    _id: item.dishId,
+                    tenantId: freshOrder.tenantId,
+                    $or: [
+                        { clientId: freshOrder.clientId },
+                        { clientId: { $exists: false } },
+                        { clientId: "default" },
+                    ],
+                };
+
+                const dish = await Dish.findOne(dishQuery).session(session);
+
+                console.log("[INV] dishQuery:", dishQuery);
+
+                if (!dish) {
+                    console.log(`[INV] WARNING: Dish no encontrado para item "${item.name}". Saltando.`);
+                    continue;
+                }
+
+                const dishSellMode = dish.sellMode || "unit";
+                const itemQtyType = item.qtyType || "unit";
+
+                // consistencia (no lo rompo, solo aviso)
+                if (dishSellMode !== itemQtyType) {
+                    console.log(
+                        `[INV] WARNING: modo inconsistente para "${dish.name}". Dish=${dishSellMode} vs Order=${itemQtyType}. Saltando.`
+                    );
+                    continue;
+                }
+
+                const factor = Number(item.quantity);
+                if (!Number.isFinite(factor) || factor <= 0) {
+                    console.log(`[INV] WARNING: cantidad inválida en item "${item.name}". Saltando.`);
+                    continue;
+                }
+
+
+                const recipe = Array.isArray(dish.recipe) ? dish.recipe : [];
+                console.log("[INV] dish:", dish.name, "sellMode:", dishSellMode, "recipeCount:", recipe.length);
+
+                // 1) Si tiene receta -> descuenta por receta
+                if (recipe.length > 0) {
+                    for (const r of recipe) {
+                        const consume = Number(r.qty) * factor; // qty por unidad o por lb
+                        if (!Number.isFinite(consume) || consume <= 0) continue;
+
+                        const invItem = await InventoryItem.findOne({
+                            _id: r.inventoryItemId,
+                            tenantId: freshOrder.tenantId,
+                            clientId: freshOrder.clientId,
+                            isArchived: false,
+                        }).session(session);
+
+                        if (!invItem) {
+                            throw new Error(`Insumo no encontrado para receta de "${dish.name}"`);
+                        }
+
+                        const beforeStock = Number(invItem.stockCurrent || 0);
+                        const afterStock = beforeStock - Math.abs(consume);
+
+                        console.log(`[INV] recipe deduct -> ${invItem.name}:`, {
+                            consume,
+                            beforeStock,
+                            afterStock,
+                        });
+
+                        if (afterStock < 0) {
+                            throw new Error(
+                                `Stock insuficiente: ${invItem.name}. Necesitas ${consume}, disponible ${beforeStock}`
+                            );
+                        }
+
+                        invItem.stockCurrent = afterStock;
+                        await invItem.save({ session });
+
+                        await InventoryMovement.create(
+                            [
+                                {
+                                    tenantId: freshOrder.tenantId,
+                                    clientId: freshOrder.clientId,
+                                    itemId: invItem._id,
+                                    type: "sale",
+                                    qty: Math.abs(consume),
+                                    unitCost: null,
+                                    note: `Venta: ${dish.name} (Order ${freshOrder._id})`,
+                                    beforeStock,
+                                    afterStock,
+                                    createdBy: userId || null,
+                                },
+                            ],
+                            { session }
+                        );
+
+                        deductedCount++;
+                    }
+
+                    continue; // ya deduje por receta
+                }
+
+                // 2) FALLBACK: no hay receta -> intenta match por nombre de plato == nombre de insumo
+                //    Esto permite que "Chuleta" descuente del insumo "Chuleta" sin receta.
+                // 2) FALLBACK: no hay receta -> intenta match por nombre (case-insensitive + trim)
+//    y compatible con clientId missing/default
+
+                const dishName = (dish.name || "").trim();
+                const itemName = (item.name || "").trim(); // por si el item.name viene mejor que dish.name
+
+                const nameRegex = dishName
+                    ? new RegExp(`^${escapeRegex(dishName)}$`, "i")
+                    : null;
+
+                const itemNameRegex = itemName
+                    ? new RegExp(`^${escapeRegex(itemName)}$`, "i")
+                    : null;
+
+                const fallbackQuery = {
+                    tenantId: freshOrder.tenantId,
+                    isArchived: false,
+                    $or: [
+                        // match por dish.name
+                        ...(nameRegex ? [{ name: nameRegex }] : []),
+
+                        // match por item.name (por si el dish.name difiere)
+                        ...(itemNameRegex ? [{ name: itemNameRegex }] : []),
+                    ],
+                    // compat clientId
+                    $and: [
+                        {
+                            $or: [
+                                { clientId: freshOrder.clientId },
+                                { clientId: { $exists: false } },
+                                { clientId: "default" },
+                            ],
+                        },
+                    ],
+                };
+
+                console.log("[INV] fallbackQuery:", fallbackQuery);
+
+                const fallbackInv = await InventoryItem.findOne(fallbackQuery).session(session);
+
+                if (!fallbackInv) {
+                    console.log(
+                        `[INV] NO RECIPE + NO FALLBACK MATCH: Dish "${dish.name}" no tiene receta y no existe insumo con nombre compatible.`
+                    );
+                    console.log("[INV] DEBUG fallback names:", { dishName, orderItemName, clientId: freshOrder.clientId });
+
+                    continue;
+                }
+
+
+                // consumo: si vendes por unidad -> consume = quantity
+                //         si vendes por weight -> consume = quantity (lbs/kg según tu sistema)
+                const consume = factor;
+
+                const beforeStock = Number(fallbackInv.stockCurrent || 0);
+                const afterStock = beforeStock - Math.abs(consume);
+
+                console.log(`[INV] fallback deduct -> ${fallbackInv.name}:`, {
+                    consume,
+                    beforeStock,
+                    afterStock,
+                });
+
+                if (afterStock < 0) {
+                    throw new Error(
+                        `Stock insuficiente: ${fallbackInv.name}. Necesitas ${consume}, disponible ${beforeStock}`
+                    );
+                }
+
+                fallbackInv.stockCurrent = afterStock;
+                await fallbackInv.save({ session });
+
+                await InventoryMovement.create(
+                    [
+                        {
+                            tenantId: freshOrder.tenantId,
+                            clientId: freshOrder.clientId,
+                            itemId: fallbackInv._id,
+                            type: "sale",
+                            qty: Math.abs(consume),
+                            unitCost: null,
+                            note: `Venta (fallback): ${dish.name} (Order ${freshOrder._id})`,
+                            beforeStock,
+                            afterStock,
+                            createdBy: userId || null,
+                        },
+                    ],
+                    { session }
+                );
+
+                deductedCount++;
+            }
+
+            // Solo marca como descontado si realmente descontó algo
+            if (deductedCount > 0) {
+                freshOrder.inventoryDeducted = true;
+                freshOrder.inventoryDeductedAt = new Date();
+                await freshOrder.save({ session });
+                console.log("[INV] inventory deducted OK for order:", String(freshOrder._id), "deductions:", deductedCount);
+            } else {
+                console.log(
+                    "[INV] No deductions applied. Order NOT marked inventoryDeducted. order:",
+                    String(freshOrder._id)
+                );
+            }
+        });
+    } finally {
+        session.endSession();
+    }
+}
+
+
 
 // Normaliza items y calcula price por ítem
-function normalizeAndPriceItems(items = []) {
-    return items.map((it) => {
-        const pricePerQuantity = Number(
-            it.pricePerQuantity ??
-            it.unitPrice ??
-            it.price ??
-            it?.dish?.price ??
-            0
-        );
+function normalizeAndPriceItems(items) {
+    if (!Array.isArray(items)) return [];
 
-        const quantity = Number(it.quantity ?? 1);
+    return items.map((it) => {
+        const dishId = it.dishId || null;
+
+        const name = (it.name || "").toString().trim();
+        const qtyType = (it.qtyType || "unit").toString();
+        const weightUnit = (it.weightUnit || "lb").toString();
+
+        const quantity = Number(it.quantity);
+        const unitPrice = Number(it.unitPrice);
+
+        if (!name) throw new Error("Item sin name");
+        if (!Number.isFinite(quantity) || quantity <= 0) throw new Error(`Cantidad inválida para ${name}`);
+        if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new Error(`Precio inválido para ${name}`);
+
+        const price = Number((unitPrice * quantity).toFixed(2));
 
         return {
-            name: String(it.name ?? it?.dish?.name ?? "Unnamed Dish"),
+            dishId,
+            name,
+            qtyType,
+            weightUnit,
             quantity,
-            unitPrice: pricePerQuantity,
-            price: pricePerQuantity * quantity,
+            unitPrice,
+            price,
         };
     });
 }
+
 
 const addOrder = async (req, res, next) => {
     try {
@@ -40,15 +347,18 @@ const addOrder = async (req, res, next) => {
             return next(createHttpError(401, "TENANT_NOT_FOUND"));
         }
 
+
         const clientId = req.clientId;
+
         const {
             customerDetails = {},
-            orderStatus = "In Progress",
+            orderStatus,
             items = [],
             table = null, // ✅ ahora puede ser null
-            paymentMethod = "Cash",
+            paymentMethod = "Efectivo",
             discount = 0,
         } = req.body;
+        const normalizedStatus = normalizeOrderStatus(orderStatus);
 
 
         customerDetails.name = customerDetails.name || "";
@@ -98,15 +408,16 @@ const addOrder = async (req, res, next) => {
 
 
         // Crear payload base
+
         const payload = {
-            tenantId: req.tenantId,
-            clientId: req.clientId,
+            tenantId,
+            clientId,
             customerDetails: {
                 name: String(customerDetails?.name ?? ""),
                 phone: String(customerDetails?.phone ?? ""),
                 guests: Number(customerDetails?.guests ?? 0),
             },
-            orderStatus,
+            orderStatus: normalizedStatus,
             bills: {
                 total: subtotal,
                 discount: discountAmt,
@@ -129,7 +440,15 @@ const addOrder = async (req, res, next) => {
         // Solo marcar la mesa si fue enviada
         if (tableRef) {
             await Table.findOneAndUpdate(
-                { _id: tableRef, tenantId: req.tenantId, clientId: req.clientId },
+                {
+                    _id: tableRef,
+                    tenantId,
+                    $or: [
+                        { clientId: req.clientId },
+                        { clientId: { $exists: false } },
+                        { clientId: "default" },
+                    ],
+                },
                 { status: "Booked", currentOrder: order._id }
             );
         }
@@ -215,9 +534,29 @@ const deleteOrder = async (req, res, next) => {
     }
 };
 function formatNCF(type, seq) {
-    // Formato típico: B02 + 8 dígitos => B0200000001 (11 chars)
-    return `${type}${String(seq).padStart(8, "0")}`;
+    const t = String(type || "B02").toUpperCase().trim();
+
+    const n = Number(seq);
+    if (!Number.isFinite(n) || n <= 0) {
+        const err = new Error(`Secuencia NCF inválida: ${seq}`);
+        err.statusCode = 400;
+        throw err;
+    }
+
+    // En tu caso estás usando B02 + 8 dígitos (total 11 caracteres).
+    // Si el número crece (9 dígitos), aquí lo recortamos y además avisamos.
+    if (n > 99999999) {
+        const err = new Error(
+            `NCF excede 8 dígitos (seq=${n}). Ajusta el rango en el panel admin.`
+        );
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const digits = String(Math.floor(n)).padStart(8, "0").slice(-8);
+    return `${t}${digits}`;
 }
+
 
 async function allocateNCF({ tenantId, ncfType }) {
     const type = ncfType || "B02";
@@ -249,6 +588,38 @@ async function allocateNCF({ tenantId, ncfType }) {
 
     return { type, ncfNumber: formatNCF(type, assignedSeq) };
 }
+async function allocateInternalSeq({ tenantId }) {
+    const tenant = await Tenant.findOneAndUpdate(
+        { tenantId },
+        { $inc: { "fiscal.nextInvoiceNumber": 1 } },
+        { new: true }
+    ).lean();
+
+    if (!tenant) {
+        const err = new Error("Tenant no encontrado para asignar secuencial interno.");
+        err.statusCode = 404;
+        throw err;
+    }
+
+    const next = Number(tenant?.fiscal?.nextInvoiceNumber ?? 0);
+
+    // normal: asignado = next - 1
+    // fallback: si el tenant viejo tenía 0, asignado sería 0 (inválido)
+    let assigned = next - 1;
+    if (!Number.isFinite(assigned) || assigned <= 0) assigned = next;
+
+    if (!Number.isFinite(assigned) || assigned <= 0) {
+        const err = new Error("No se pudo asignar secuencia interna.");
+        err.statusCode = 500;
+        throw err;
+    }
+
+    const internalNumber = String(assigned).padStart(8, "0");
+    return { internalSeq: assigned, internalNumber };
+}
+
+
+
 
 
 const updateOrder = async (req, res, next) => {
@@ -259,71 +630,108 @@ const updateOrder = async (req, res, next) => {
             return next(createHttpError(404, "Invalid id!"));
         }
 
-// ✅ Unificar tenantId UNA VEZ
+        // ✅ Unificar tenantId UNA VEZ
         const tenantId = req.tenantId || req.user?.tenantId;
         if (!tenantId) {
             return next(createHttpError(401, "TENANT_NOT_FOUND"));
         }
 
-// ✅ Traer settings/features del tenant ANTES de calcular totales
-        const tenant = await Tenant.findOne({ tenantId }).lean();
-        const features = tenant?.features || {};
-
-        const taxFeatureEnabled = features?.tax?.enabled !== false;         // default true
-        const discountFeatureEnabled = features?.discount?.enabled !== false; // default true
-        const fiscalFeatureEnabled = features?.fiscal?.enabled !== false;
-
         const clientId = req.clientId;
 
-        // Helper: compatibilidad con datos viejos (por si existen docs sin clientId)
+        // ✅ Traer settings del tenant al inicio
+        const tenant = await Tenant.findOne({ tenantId }).lean();
+        if (!tenant) return next(createHttpError(404, "TENANT_NOT_FOUND"));
+
+        const features = tenant?.features || {};
+        const taxFeatureEnabled = features?.tax?.enabled !== false; // default true
+        const discountFeatureEnabled = features?.discount?.enabled !== false; // default true
+
+        // ✅ fiscalFeatureEnabled viene del tenant.fiscal.enabled
+        const fiscalFeatureEnabled = tenant?.fiscal?.enabled === true;
+
+        // Helper: compatibilidad con docs viejos (sin clientId)
         const orderScope = {
             _id: id,
             tenantId,
             $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
         };
 
-        // Obtener orden actual
-        let current = await Order.findOne(orderScope);
+        // ✅ Orden actual primero (evita TDZ errors)
+        const current = await Order.findOne(orderScope);
+        if (!current) return next(createHttpError(404, "Order not found!"));
 
-        if (!current) {
-            return next(createHttpError(404, "Order not found!"));
-        }
-
-        // Partir SIEMPRE de los bills que ya existen en la DB
+        const prevStatus = current.orderStatus;
         const existingBills = current.bills || {};
 
-        // Mezclar de forma segura sin borrar nested objects
+        // ---- construir safeUpdate ----
+        const fiscalFromClient = req.body.fiscal || {};
+        const fiscalSafeFromClient = {
+            requested: fiscalFromClient.requested,
+            ncfType: fiscalFromClient.ncfType,
+        };
         const safeUpdate = {
             customerDetails: {
-                ...current.customerDetails,
+                ...(current.customerDetails || {}),
                 ...(req.body.customerDetails || {}),
             },
             items: req.body.items ?? current.items,
             table: req.body.table ?? current.table,
             paymentMethod: req.body.paymentMethod ?? current.paymentMethod,
-            orderStatus: req.body.orderStatus ?? current.orderStatus,
+            orderStatus: normalizeOrderStatus(req.body.orderStatus ?? current.orderStatus),
             bills: { ...existingBills },
             fiscal: {
                 ...(current.fiscal || {}),
-                ...(req.body.fiscal || {}),
+                ...(fiscalSafeFromClient || {}),
             },
         };
 
-        // Normalizar tipAmount previo (por compatibilidad con 'tip')
+        // compat tip
         if (safeUpdate.bills.tipAmount === undefined && safeUpdate.bills.tip !== undefined) {
             safeUpdate.bills.tipAmount = Number(safeUpdate.bills.tip);
         }
 
         const incomingFiscal = req.body.fiscal;
-
         // ✅ NCF: si lo pidió y aún no tiene NCF, asignar
         const alreadyHasNCF = current?.fiscal?.ncfNumber || current?.ncfNumber;
 
         if (fiscalFeatureEnabled && incomingFiscal?.requested === true && !alreadyHasNCF) {
+            const requestedType = incomingFiscal.ncfType || current?.fiscal?.ncfType || "B02";
+
             const { type, ncfNumber } = await allocateNCF({
                 tenantId,
-                ncfType: incomingFiscal.ncfType || current?.fiscal?.ncfType || "B02",
+                ncfType: requestedType,
             });
+
+            // secuencial interno (empresa/registradora)
+            const { internalSeq, internalNumber } = await allocateInternalSeq({ tenantId });
+
+            const emissionPoint = String(tenant?.fiscal?.emissionPoint || "001").trim() || "001";
+
+            const branchName = String(tenant?.fiscal?.branchName || "Principal").trim() || "Principal";
+
+
+            // ✅ Vence (NCF) (si existe en config)
+            const expiresAtRaw =
+                tenant?.fiscal?.ncfConfig?.[type]?.expiresAt ??
+                tenant?.fiscal?.ncfConfig?.[type]?.expirationDate ??
+                tenant?.fiscal?.expiresAt ??
+                null;
+            const expirationDate = normalizeMongoDate(expiresAtRaw);
+            const expirationDateISO = expirationDate ? expirationDate.toISOString() : null;
+            console.log("[FISCAL] expiresAtRaw:", expiresAtRaw);
+            console.log("[FISCAL] expirationDate normalized:", expirationDateISO);
+
+            console.log("[FISCAL] assigned =>", {
+                tenantId,
+                type,
+                ncfNumber,
+                internalSeq,
+                internalNumber,
+                emissionPoint,
+                branchName,
+                expirationDate,
+            });
+            console.log("[FISCAL] tenant ncfConfig:", tenant?.fiscal?.ncfConfig);
 
             safeUpdate.ncfNumber = ncfNumber;
             safeUpdate.fiscal = {
@@ -332,29 +740,61 @@ const updateOrder = async (req, res, next) => {
                 ncfType: type,
                 ncfNumber,
                 issuedAt: new Date(),
+                expirationDate: expirationDateISO, // <-- para que el front muestre "Vence (NCF)"
+
+                internalSeq,     // numero (1,2,3...)
+                internalNumber,  // string "00000001"
+                emissionPoint,
+                branchName,
             };
-        } else if (!fiscalFeatureEnabled) {
-            // Si fiscal está apagado, aseguramos que no quede requested true
+        } else if (fiscalFeatureEnabled && incomingFiscal?.requested === true && alreadyHasNCF) {
+        // Backfill por si la orden vieja tiene NCF pero le faltan campos
+        const currentType = current?.fiscal?.ncfType || incomingFiscal?.ncfType || "B02";
+
+        const expiresAtRaw =
+            tenant?.fiscal?.ncfConfig?.[currentType]?.expiresAt ??
+            tenant?.fiscal?.ncfConfig?.[currentType]?.expirationDate ??
+            tenant?.fiscal?.expiresAt ??
+            null;
+
+        const expirationDate = normalizeMongoDate(expiresAtRaw);
+        const expirationDateISO = expirationDate ? expirationDate.toISOString() : null;
+
+        safeUpdate.fiscal = {
+            ...(safeUpdate.fiscal || {}),
+            requested: true,
+            ncfType: currentType,
+            // si ya existe, lo conserva; si falta, lo rellena
+            branchName: safeUpdate.fiscal.branchName || String(tenant?.fiscal?.branchName || "Principal").trim() || "Principal",
+            emissionPoint: safeUpdate.fiscal.emissionPoint || String(tenant?.fiscal?.emissionPoint || "001").trim() || "001",
+            expirationDate: safeUpdate.fiscal.expirationDate || expirationDateISO,
+        };
+    }
+    else if (!fiscalFeatureEnabled) {
             safeUpdate.fiscal = {
                 ...(safeUpdate.fiscal || {}),
                 requested: false,
                 ncfNumber: undefined,
                 ncfType: undefined,
                 issuedAt: undefined,
+                expirationDate: undefined,
+                internalSeq: undefined,
+                internalNumber: undefined,
             };
             safeUpdate.ncfNumber = undefined;
         }
 
 
-        // Si vienen items nuevos, normalizarlos
+        // ✅ Normalizar items si vienen del front
         if (req.body.items) {
             safeUpdate.items = normalizeAndPriceItems(req.body.items);
         }
 
-        // === RECALCULAR SUBTOTAL, DESCUENTO, ITBIS Y TOTAL ===
+        // =========================
+        // RECALCULO TOTALES
+        // =========================
         let subtotal = 0;
-
-        if (safeUpdate.items && Array.isArray(safeUpdate.items)) {
+        if (Array.isArray(safeUpdate.items)) {
             subtotal = safeUpdate.items.reduce((sum, item) => {
                 const line = Number(item.unitPrice || 0) * Number(item.quantity || 1);
                 return sum + line;
@@ -363,9 +803,8 @@ const updateOrder = async (req, res, next) => {
 
         const incomingBills = req.body.bills || {};
 
-        // ---- DESCUENTO ----
+        // Descuento
         let discount = 0;
-
         if (discountFeatureEnabled) {
             discount = Number(incomingBills.discount ?? safeUpdate.bills.discount ?? 0);
             if (discount < 0) discount = 0;
@@ -373,12 +812,9 @@ const updateOrder = async (req, res, next) => {
         } else {
             discount = 0;
         }
-        if (discount < 0) discount = 0;
-        if (discount > subtotal) discount = subtotal;
 
-        // ---- ITBIS (taxEnabled verdadero o falso) ----
+        // Tax enabled
         let taxEnabled;
-
         if (incomingBills.taxEnabled !== undefined) {
             taxEnabled = Boolean(incomingBills.taxEnabled);
         } else if (existingBills.taxEnabled !== undefined) {
@@ -388,17 +824,20 @@ const updateOrder = async (req, res, next) => {
         } else if (existingBills.tax !== undefined) {
             taxEnabled = Number(existingBills.tax) > 0;
         } else {
-            taxEnabled = false;
+            taxEnabled = true;
         }
 
+        subtotal = round2(subtotal);
+        discount = round2(discount);
+
         taxEnabled = taxFeatureEnabled ? taxEnabled : false;
-        const taxable = Math.max(subtotal - discount, 0);
+
+        const taxable = round2(Math.max(subtotal - discount, 0));
         const effectiveTaxRate = taxEnabled ? TAX_RATE : 0;
-        const tax = taxable * effectiveTaxRate;
+        const tax = round2(taxable * effectiveTaxRate);
 
-        // ---- TIP ----
+        // Tip
         let tip = 0;
-
         if (incomingBills.tipEnabled === false) {
             tip = 0;
         } else if (incomingBills.tipAmount !== undefined) {
@@ -410,10 +849,10 @@ const updateOrder = async (req, res, next) => {
         } else if (safeUpdate.bills.tip !== undefined) {
             tip = Number(safeUpdate.bills.tip);
         }
+        tip = round2(tip);
 
-        const totalWithTax = taxable + tax + tip;
+        const totalWithTax = round2(taxable + tax + tip);
 
-        // Guardar bills actualizados (respetando compatibilidad con 'tip')
         safeUpdate.bills = {
             ...safeUpdate.bills,
             subtotal,
@@ -426,20 +865,14 @@ const updateOrder = async (req, res, next) => {
             totalWithTax,
         };
 
-        // ✅ Update seguro multi-tenant
-        let order = await Order.findOneAndUpdate(orderScope, safeUpdate, { new: true })
-            .populate("table", "tableNo status")
-            .populate("user", "name email role");
-
-        // -------- AUTO-DELETE SOLO SI items: [] FUE ENVIADO DESDE EL FRONT --------
+        // ✅ AUTO-DELETE SOLO SI items: [] fue enviado explícitamente
         const incomingItems = req.body.items;
         const isClearingItems = Array.isArray(incomingItems) && incomingItems.length === 0;
-        const deletableStatuses = ["In Progress", "Cancelled"];
+        const deletableStatuses = ["En Progreso", "Cancelado"];
 
         if (isClearingItems && deletableStatuses.includes(current.orderStatus)) {
-            if (current.table?._id || current.table) {
+            if (current.table) {
                 const tableId = current.table?._id ? current.table._id : current.table;
-
                 await Table.findOneAndUpdate(
                     {
                         _id: tableId,
@@ -459,27 +892,40 @@ const updateOrder = async (req, res, next) => {
             });
         }
 
-        // ✅ Si se completó → generar factura PDF
-        if (req.body.orderStatus === "Completed") {
-            try {
-                const { generateInvoicePDF } = require("../utils/generateInvoicePDF");
+        // ✅ Update
+        let order = await Order.findOneAndUpdate(orderScope, safeUpdate, { new: true })
+            .populate("table", "tableNo status")
+            .populate("user", "name email role");
 
-                const pdf = await generateInvoicePDF(order._id.toString(), tenantId);
-                order.invoiceUrl = pdf.url;
+        const incomingStatus = normalizeOrderStatus(req.body.orderStatus ?? current.orderStatus);
+
+        // ✅ Si se completó => generar PDF (no rompe la respuesta)
+        if (incomingStatus === "Completado") {
+            try {
+                const generateInvoicePDF = require("../utils/generateInvoicePDF");
+                const pdfUrl = await generateInvoicePDF(order._id.toString(), tenantId);
+                order.invoiceUrl = pdfUrl;
+
+                // (si quieres, puedes dejar esto o quitarlo; ya no lo mostramos como “fecha impresión”)
+                order.fiscal = order.fiscal || {};
+                order.fiscal.printedAt = new Date();
+
                 await order.save();
             } catch (err) {
                 console.error("PDF ERROR =>", err);
             }
         }
 
-        // ✅ Liberar mesa si se cancela/completa
+        // ✅ Liberar mesa si cancelada/completada
         if (
-            (req.body.orderStatus === "Cancelled" || req.body.orderStatus === "Completed") &&
+            (incomingStatus === "Cancelado" || incomingStatus=== "Completado") &&
             current.table
         ) {
+            const tableId = current.table?._id ? current.table._id : current.table;
+
             await Table.findOneAndUpdate(
                 {
-                    _id: current.table,
+                    _id: tableId,
                     tenantId,
                     $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
                 },
@@ -499,6 +945,32 @@ const updateOrder = async (req, res, next) => {
             );
         }
 
+        const io = req.app?.get?.("io");
+        if (io) {
+            const room = `tenant:${tenantId}`;
+
+            const tableId =
+                order?.table?._id
+                    ? String(order.table._id)
+                    : order?.table
+                        ? String(order.table)
+                        : null;
+
+            io.to(room).emit("tenant:orderUpdated", {
+                tenantId,
+                orderId: String(order._id),
+                orderStatus: incomingStatus,
+            });
+
+            // clave para que /tables se actualice al marcar Completed/Cancelado (libera mesa)
+            io.to(room).emit("tenant:tablesUpdated", {
+                tenantId,
+                orderId: String(order._id),
+                tableId,
+                orderStatus: incomingStatus,
+            });
+        }
+
         return res.status(200).json({
             success: true,
             message: "Order updated successfully",
@@ -506,9 +978,11 @@ const updateOrder = async (req, res, next) => {
         });
     } catch (error) {
         console.error("[updateOrder] error:", error);
-        next(createHttpError(500, "UPDATE_ORDER_FAILED"));
+        return next(createHttpError(500, "UPDATE_ORDER_FAILED"));
     }
 };
+
+
 
 
 

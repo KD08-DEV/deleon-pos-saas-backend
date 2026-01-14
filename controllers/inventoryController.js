@@ -195,7 +195,9 @@ exports.listMovements = async (req, res, next) => {
 
         const filter = { tenantId };
         if (itemId) filter.itemId = itemId;
-        if (type && ["purchase", "adjustment", "waste"].includes(type)) filter.type = type;
+        if (type && ["purchase", "adjustment", "waste", "sale"].includes(type)) {
+            filter.type = type;
+        }
 
         if (from || to) {
             filter.createdAt = {};
@@ -238,3 +240,64 @@ exports.lowStock = async (req, res, next) => {
         next(e);
     }
 };
+// GET /api/inventory/consumption?from=&to=
+exports.consumption = async (req, res, next) => {
+    try {
+        const tenantId = getTenantId(req);
+        if (!tenantId) return next(createHttpError(400, "Missing tenantId"));
+
+        const { from, to } = req.query;
+
+        const match = { tenantId, type: "sale" };
+        if (from || to) {
+            match.createdAt = {};
+            if (from) match.createdAt.$gte = new Date(from);
+            if (to) match.createdAt.$lte = new Date(to);
+        }
+
+        const rows = await InventoryMovement.aggregate([
+            { $match: match },
+
+            // qty siempre debería ser positivo en sale, pero por seguridad:
+            {
+                $addFields: {
+                    qtyAbs: {
+                        $cond: [{ $gte: ["$qty", 0] }, "$qty", { $multiply: ["$qty", -1] }],
+                    },
+                },
+            },
+
+            { $group: { _id: "$itemId", soldQty: { $sum: "$qtyAbs" } } },
+
+            {
+                $lookup: {
+                    from: "inventoryitems",
+                    localField: "_id",
+                    foreignField: "_id",
+                    as: "item",
+                },
+            },
+            { $unwind: "$item" },
+
+            {
+                $project: {
+                    _id: 0,
+                    itemId: "$item._id",
+                    name: "$item.name",
+                    category: "$item.category",
+                    unit: "$item.unit",
+                    stockCurrent: "$item.stockCurrent",
+                    stockMin: "$item.stockMin",
+                    soldQty: 1,
+                },
+            },
+
+            { $sort: { soldQty: -1 } },
+        ]);
+
+        res.json({ rows });
+    } catch (e) {
+        next(e);
+    }
+};
+

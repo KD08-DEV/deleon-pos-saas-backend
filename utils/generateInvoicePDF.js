@@ -1,345 +1,298 @@
-// pos-backend/utils/generateInvoicePDF.js
-const path = require("path");
+const PDFDocument = require("pdfkit");
 const fs = require("fs");
-const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
+const path = require("path");
 
 const Order = require("../models/orderModel");
 const Tenant = require("../models/tenantModel");
-const  supabase  = require("../config/supabaseClient");
 
-async function generateInvoicePDF(orderId, tenantId) {
-    console.log("[PDF] >>> generateInvoicePDF llamado con orderId:", orderId,"tenant:", tenantId);
-
-    orderId = orderId.toString();
-    const order = await Order.findById(orderId).lean();
-    if (!order) throw new Error("Orden no encontrada");
-
-    // =======================
-    // 1) DATOS DEL TENANT / NEGOCIO
-    // =======================
-
-// OJO: tenantId es un UUID (tenantid), NO el _id de Mongo
-    const tenantDoc = await Tenant.findOne({ tenantId }).lean();
+const { supabase } = require("../config/supabaseClient"); // ajusta si tu import es distinto
 
 
-    const business = (tenantDoc && tenantDoc.business) || {};
+// ---------- helpers ----------
+const normalizeMongoDate = (val) => {
+    if (!val) return null;
+    if (val instanceof Date) return val;
 
-    const restaurantName =
-        (business.name && business.name.trim()) ||
-        (tenantDoc && tenantDoc.name) ||
-        "Restaurant";
-
-    const restaurantRNC =
-        (business.rnc && business.rnc.trim()) || "N/A";
-
-    const restaurantAddress =
-        (business.address && business.address.trim()) ||
-        "Dirección no disponible";
-
-    const restaurantPhone =
-        (business.phone && business.phone.trim()) || "";
-
-
-    // =======================
-    // 2) CREAR PDF
-    // =======================
-    const pdfDoc = await PDFDocument.create();
-    const page = pdfDoc.addPage([595.28, 841.89]); // A4
-
-    const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-    const marginLeft = 70;
-    let y = 780;
-
-    // =======================
-    // 3) ENCABEZADO DEL NEGOCIO
-    // =======================
-    page.drawText(restaurantName, {
-        x: marginLeft,
-        y,
-        size: 14,
-        font: boldFont
-    });
-    y -= 16;
-
-    page.drawText(`RNC: ${restaurantRNC}`, {
-        x: marginLeft,
-        y,
-        size: 10,
-        font: regularFont
-    });
-    y -= 12;
-
-    page.drawText(restaurantAddress, {
-        x: marginLeft,
-        y,
-        size: 10,
-        font: regularFont
-    });
-    y -= 12;
-
-    if (restaurantPhone) {
-        page.drawText(`Tel: ${restaurantPhone}`, {
-            x: marginLeft,
-            y,
-            size: 10,
-            font: regularFont
-        });
-        y -= 16;
-    } else {
-        y -= 8;
+    if (typeof val === "string") {
+        const d = new Date(val);
+        return isNaN(d.getTime()) ? null : d;
     }
 
-    // =======================
-    // 4) TÍTULO DE LA FACTURA
-    // =======================
-    page.drawText("Factura para Consumidor Final", {
-        x: marginLeft,
-        y,
-        size: 14,
-        font: boldFont
-    });
-    y -= 14;
+    if (typeof val === "object") {
+        // Soporta { $date: "..." } o { "$date": "..." }
+        const raw = val.$date || val["$date"];
+        if (raw) {
+            const d = new Date(raw);
+            return isNaN(d.getTime()) ? null : d;
+        }
+    }
 
-    page.drawText("Gracias por su compra", {
-        x: marginLeft,
-        y,
-        size: 10,
-        font: regularFont
-    });
-    y -= 20;
+    return null;
+};
 
-    // =======================
-    // 5) DATOS DE LA ORDEN
-    // =======================
-    const createdAt = order.createdAt
-        ? new Date(order.createdAt)
-        : new Date();
+const moneyRD = (n) => {
+    const x = Number(n || 0);
+    return `RD$${x.toFixed(2)}`;
+};
 
-    // Formato simple de fecha/hora
-    const fechaStr = createdAt.toLocaleDateString("es-DO", {
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit"
-    });
-    const horaStr = createdAt.toLocaleTimeString("es-DO", {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hour12: true
-    });
+const getTaxRate = (order) => {
+    const r = Number(order?.taxRate);
+    if (!r) return 0.18;
+    if (r > 1) return r / 100;
+    return r;
+};
 
-    const clientName =
-        (order.customerDetails &&
-            order.customerDetails.name &&
-            order.customerDetails.name.trim()) ||
-        "Consumidor Final";
+const getLineNet = (item) => {
+    const qty = Number(item?.quantity || item?.qty || 1);
 
-    page.drawText(`Order ID: ${order._id}`, {
-        x: marginLeft,
-        y,
-        size: 10,
-        font: regularFont
-    });
-    y -= 12;
+    const unit =
+        Number(item?.unitPrice ?? item?.pricePerQuantity ?? item?.price ?? 0);
 
-    page.drawText(`Fecha/Hora: ${fechaStr} ${horaStr}`, {
-        x: marginLeft,
-        y,
-        size: 10,
-        font: regularFont
-    });
-    y -= 12;
+    const line = qty * unit;
+    return isNaN(line) ? 0 : line;
+};
 
-    page.drawText(`Cliente: ${clientName}`, {
-        x: marginLeft,
-        y,
-        size: 10,
-        font: regularFont
-    });
-    y -= 20;
 
-//---------------------------------------------
-// 6) TABLA DETALLE DE CONSUMO (CORREGIDO)
-//---------------------------------------------
-    page.drawText("Detalle de consumo", {
-        x: marginLeft,
-        y,
-        size: 11,
-        font: boldFont
-    });
-    y -= 14;
+const fmtDateDO = new Intl.DateTimeFormat("es-DO", {
+    timeZone: "America/Santo_Domingo",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+});
 
-// Columnas dinámicas según si hay ITBIS
-    const showTaxColumn = order.bills?.taxEnabled === true;
+const fmtTimeDO = new Intl.DateTimeFormat("es-DO", {
+    timeZone: "America/Santo_Domingo",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+});
 
-    const colDesc = marginLeft;
-    const colCant = marginLeft + 200;
-    const colValor = marginLeft + 350;
-    const colITBIS = showTaxColumn ? (marginLeft + 270) : null;
+const fmtDateUTC = new Intl.DateTimeFormat("es-DO", {
+    timeZone: "UTC",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+});
 
-// Encabezados
-    page.drawText("Descripción", { x: colDesc, y, size: 10, font: boldFont });
-    page.drawText("Cant.", { x: colCant, y, size: 10, font: boldFont });
+const formatDateTimeDO = (dateLike) => {
+    const d = normalizeMongoDate(dateLike);
+    if (!d) return "N/A";
+    return `${fmtDateDO.format(d)}, ${fmtTimeDO.format(d)}`;
+};
 
-    if (showTaxColumn) page.drawText("ITBIS", { x: colITBIS, y, size: 10, font: boldFont });
+const formatDateUTC = (dateLike) => {
+    const d = normalizeMongoDate(dateLike);
+    if (!d) return "N/A";
+    return fmtDateUTC.format(d);
+};
 
-    page.drawText("Valor", { x: colValor, y, size: 10, font: boldFont });
-    y -= 10;
+const NCF_TYPE_LABEL = {
+    B01: "Crédito Fiscal",
+    B02: "Consumidor Final",
+};
 
-    page.drawLine({
-        start: { x: marginLeft, y },
-        end: { x: marginLeft + 430, y },
-        thickness: 0.5
-    });
-    y -= 12;
+// ---------- main ----------
+async function generateInvoicePDF(orderId, tenantId) {
+    try {
+        console.log("[PDF] >>> generateInvoicePDF llamado con orderId:", orderId, "tenant:", tenantId);
 
-// Items
+        const order = await Order.findOne({ _id: orderId, tenantId });
+        if (!order) throw new Error("Orden no encontrada para generar PDF.");
 
-// Sacamos subtotal y tasa efectiva de ITBIS
-    const bills = order.bills || {};
-    const subtotalLines = Number(bills.total || 0);  // lo que guardaste como total de líneas
-    const totalTax = Number(bills.tax || 0);         // ITBIS total que calculó el backend
-    const taxRate = subtotalLines > 0 ? totalTax / subtotalLines : 0;
-    const items = order.items || [];
+        const tenant = await Tenant.findOne({ tenantId });
+        if (!tenant) throw new Error("Tenant no encontrado para generar PDF.");
 
-    items.forEach((item) => {
-        const name = item.name || "Producto";
-        const quantity = Number(item.quantity || 0);
-        const unit = Number(item.unitPrice || 0);
-        const lineTotal = unit * quantity;
+        // ----- fiscal fields -----
+        const fiscal = order?.fiscal || {};
+        const hasNCF = Boolean(fiscal?.ncfNumber || order?.ncfNumber);
+        const ncfType = fiscal?.ncfType || order?.ncfType || "";
+        const ncfNumber = fiscal?.ncfNumber || order?.ncfNumber || "";
+        const pad8 = (val) => String(val).padStart(8, "0");
+        const internalNumber =
+            fiscal?.internalNumber ||
+            (fiscal?.internalSeq ? pad8(fiscal.internalSeq) : "");
+        const branchName =
+            fiscal?.branchName ||
+            tenant?.fiscal?.defaultBranchName ||
+            "Principal";
+        const emissionPoint =
+            fiscal?.emissionPoint ||
+            tenant?.fiscal?.defaultEmissionPoint ||
+            "001";
 
-        page.drawText(name, { x: colDesc, y, size: 10, font: regularFont });
-        page.drawText(String(quantity), { x: colCant, y, size: 10, font: regularFont });
+        // Expiration: primero lo que quedó en la orden; si no existe, lo tomamos del tenant config
+        const fallbackExpiresAt =
+            tenant?.fiscal?.ncfConfig?.[ncfType]?.expiresAt ||
+            tenant?.fiscal?.ncfConfig?.[ncfType]?.expirationDate ||
+            null;
 
-        if (showTaxColumn) {
-            // ITBIS proporcional a lo que vale la línea
-            const lineTax = lineTotal * taxRate;
-            page.drawText(`RD$${lineTax.toFixed(2)}`, {
-                x: colITBIS,
-                y,
-                size: 10,
-                font: regularFont
-            });
+        const expirationDate =
+            fiscal?.expirationDate ||
+            fiscal?.expiresAt ||
+            fallbackExpiresAt;
+
+        const invoiceTitle = hasNCF ? "Factura con Comprobante Fiscal" : "Factura";
+        const ncfLabel = NCF_TYPE_LABEL[ncfType] ? `${ncfType} - ${NCF_TYPE_LABEL[ncfType]}` : ncfType;
+
+
+        // ----- customer -----
+        const customerName =
+            order?.customerDetails?.name ||
+            order?.client?.name ||
+            "Consumidor Final";
+
+        const customerRnc =
+            order?.customerDetails?.rncCedula ||
+            order?.customerDetails?.rnc ||
+            order?.client?.rnc ||
+            order?.customerRNC ||
+            "";
+
+
+
+        // ----- totals -----
+        const items = Array.isArray(order?.items) ? order.items : [];
+        const computedSubtotal = items.reduce((acc, it) => acc + getLineNet(it), 0);
+
+        const subtotal = Number(order?.bills?.subtotal ?? computedSubtotal);
+        const tip = Number(order?.bills?.tip ?? 0);
+        const totalTax = Number(order?.bills?.tax ?? 0);
+        const total = Number(order?.bills?.total ?? subtotal + tip + totalTax);
+
+        const taxEnabled = Boolean(order?.taxEnabled ?? order?.bills?.taxEnabled ?? true);
+        const taxRate = getTaxRate(order);
+
+        // ----- create pdf -----
+        const doc = new PDFDocument({ size: "A4", margin: 50 });
+
+        const tempDir = path.join(__dirname, "..", "temp");
+        if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
+
+        const fileName = `invoice_${orderId}.pdf`;
+        const filePath = path.join(tempDir, fileName);
+
+        const stream = fs.createWriteStream(filePath);
+        doc.pipe(stream);
+
+        // Header: business
+        doc.fontSize(16).text(tenant?.business?.name || "Empresa", { align: "center" });
+        doc.fontSize(10).text(`RNC: ${tenant?.business?.rnc || "N/A"}`, { align: "center" });
+        doc.text(tenant?.business?.address || "", { align: "center" });
+        doc.text(tenant?.business?.phone || "", { align: "center" });
+
+        doc.moveDown(1);
+        doc.fontSize(18).text(invoiceTitle, { align: "center" });
+
+        if (hasNCF) {
+            doc.moveDown(0.5);
+            doc.fontSize(11).text(`Tipo NCF: ${ncfLabel}`, { align: "center" });
+            doc.fontSize(11).text(`NCF: ${ncfNumber}`, { align: "center" });
         }
 
-        page.drawText(`RD$${unit.toFixed(2)}`, { x: colValor, y, size: 10, font: regularFont });
-        y -= 14;
-    });
+        doc.moveDown(1);
+        doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor("#e5e7eb").stroke();
+        doc.moveDown(1);
 
-    y -= 10;
+        // Top details
+        doc.fontSize(10).fillColor("#111827");
 
+        if (hasNCF) {
+            doc.text(`Factura No.: ${internalNumber || "N/A"}`);
+            doc.text(`Sucursal: ${branchName} · Punto de emisión: ${emissionPoint}`);
+        }
 
-//---------------------------------------------
-// 7) RESUMEN (USAR SÓLO VALORES DEL BACKEND)
-//---------------------------------------------
-    const subtotal = Number(bills.total || 0);
-    const discount = Number(bills.discount || 0);
-    const tax = Number(bills.tax || 0);
-    const tipAmount = Number(
-        bills.tipAmount ??    // nuevo formato correcto
-        bills.tip ??          // formato viejo que ya tienes en DB
-        0
-    );
-    const totalToPay = Number(bills.totalWithTax || subtotal + tax + tipAmount);
-    const paymentMethod = order.paymentMethod || "N/A";
+        doc.text(`Order ID: ${String(order?._id || "")}`);
+        doc.text(`Fecha/Hora: ${formatDateTimeDO(order?.createdAt)}`);
+        if (hasNCF) doc.text(`Vence (NCF): ${formatDateUTC(expirationDate)}`);
 
-    function drawSummary(label, value, bold = false) {
-        page.drawText(label, {
-            x: marginLeft,
-            y,
-            size: 10,
-            font: bold ? boldFont : regularFont
-        });
-        page.drawText(`RD$${value.toFixed(2)}`, {
-            x: marginLeft + 130,
-            y,
-            size: 10,
-            font: bold ? boldFont : regularFont
-        });
-        y -= 12;
-    }
+        doc.moveDown(0.5);
+        doc.text(`Cliente: ${customerName}`);
+        if (customerRnc) doc.text(`RNC/Cédula: ${customerRnc}`);
 
-// Mostrar SIEMPRE subtotal
-    drawSummary("Subtotal:", subtotal);
+        doc.moveDown(1);
 
-// Descuento si existe
-    if (discount > 0) drawSummary("Descuento:", discount);
+        // Table header
+        const tableTop = doc.y;
+        doc.fontSize(10).fillColor("#374151");
+        doc.text("Descripción", 50, tableTop);
+        doc.text("Cant.", 260, tableTop, { width: 60, align: "right" });
+        doc.text("ITBIS", 340, tableTop, { width: 80, align: "right" });
+        doc.text("Valor", 440, tableTop, { width: 100, align: "right" });
+        doc.moveTo(50, tableTop + 15).lineTo(545, tableTop + 15).strokeColor("#e5e7eb").stroke();
 
-// Mostrar ITBIS solo si realmente hay impuesto (> 0)
-// (se activará/desactivará según el cálculo del backend)
-    if (tax > 0) {
-        drawSummary("ITBIS (18%):", tax);
-    }
+        // Rows
+        let y = tableTop + 25;
+        doc.fontSize(10).fillColor("#111827");
 
-// Propina si existe
-    if (tipAmount > 0) {
-        drawSummary("Propina:", tipAmount);
-    }
+        items.forEach((it) => {
+            const qty = Number(it?.quantity || it?.qty || 0);
+
+            const unitPrice =
+                Number(it?.unitPrice ?? it?.pricePerQuantity ?? it?.price ?? 0);
+
+            const lineTotal = qty * unitPrice;
 
 
-    drawSummary("Total a pagar:", totalToPay, true);
+            let lineTax = Number(it?.tax);
+            if (isNaN(lineTax)) {
+                if (taxEnabled) {
+                    if (subtotal > 0 && totalTax > 0) lineTax = (lineTotal / subtotal) * totalTax;
+                    else lineTax = lineTotal * taxRate;
+                } else {
+                    lineTax = 0;
+                }
+            }
 
-    page.drawText(`Método de pago: ${paymentMethod}`, {
-        x: marginLeft,
-        y,
-        size: 10,
-        font: regularFont
-    });
-    y -= 20;
-
-    page.drawText("------------------------------", {
-        x: marginLeft, y, size: 10
-    });
-    y -= 12;
-
-    page.drawText("Gracias por su compra", {
-        x: marginLeft, y, size: 10
-    });
-
-    // =======================
-    // 8) GUARDAR PDF
-    // =======================
-    console.log("ORDER ID FINAL:", orderId, "tipo:", typeof orderId);
-    const fileName = `invoice_${orderId}.pdf`;
-    const filePath = `tenant_${tenantId}/orders/${fileName}`;
-    const outputPath = path.join(
-        __dirname,
-        "../uploads/invoices",
-        fileName
-    );
-
-    const pdfBytes = await pdfDoc.save();
-
-
-
-
-    const { error } = await supabase.storage
-        .from("invoices")
-        .upload(filePath, pdfBytes, {
-            contentType: "application/pdf",
-            upsert: true,
+            doc.text(it?.name || "Item", 50, y, { width: 200 });
+            doc.text(String(qty), 260, y, { width: 60, align: "right" });
+            doc.text(moneyRD(lineTax), 340, y, { width: 80, align: "right" });
+            doc.text(moneyRD(unitPrice), 440, y, { width: 100, align: "right" });
+            y += 18;
         });
 
-    if (error) {
-        console.error("[PDF] Error subiendo PDF:", error);
-        throw error;
+        doc.moveDown(2);
+        doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor("#e5e7eb").stroke();
+        doc.moveDown(0.8);
+
+        // Totals
+        doc.fontSize(10).fillColor("#111827");
+        doc.text(`Subtotal: ${moneyRD(subtotal)}`);
+        doc.text(`Propina: ${moneyRD(tip)}`);
+        doc.text(`ITBIS: ${moneyRD(totalTax)}`);
+        doc.font("Helvetica-Bold").text(`Total a pagar: ${moneyRD(total)}`);
+        doc.font("Helvetica").text(`Método de pago: ${order?.paymentMethod || "N/A"}`);
+
+        doc.end();
+
+        // Wait file write
+        await new Promise((resolve, reject) => {
+            stream.on("finish", resolve);
+            stream.on("error", reject);
+        });
+
+        // Upload to Supabase
+        const storagePath = `invoices/tenant_${tenantId}/orders/${fileName}`;
+        const fileBuffer = fs.readFileSync(filePath);
+
+        const { error: uploadError } = await supabase.storage
+            .from("invoices")
+            .upload(storagePath, fileBuffer, { contentType: "application/pdf", upsert: true });
+
+        if (uploadError) throw uploadError;
+
+        const { data: publicData } = supabase.storage.from("invoices").getPublicUrl(storagePath);
+        const publicUrl = publicData?.publicUrl || null;
+
+        console.log("[PDF] URL pública generada:", publicUrl);
+
+        // Cleanup temp
+        try { fs.unlinkSync(filePath); } catch (_) {}
+
+        return publicUrl;
+    } catch (err) {
+        console.error("[PDF] Error generando invoice PDF:", err);
+        throw err;
     }
-
-    // Obtener URL pública
-    const { data: publicUrlData } = supabase.storage
-        .from("invoices")
-        .getPublicUrl(filePath);
-
-    console.log("[PDF] URL pública generada:", publicUrlData.publicUrl);
-
-// Retornar objeto compatible con updateOrder()
-    return {
-        path: filePath,
-        url: publicUrlData.publicUrl
-    };
 }
 
-
-module.exports = { generateInvoicePDF };
+module.exports = generateInvoicePDF;

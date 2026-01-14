@@ -8,14 +8,75 @@ const app = express();
 const dishRoutes  = require("./routes/dishRoute");
 const path = require("path");
 const dgiiRoute = require("./routes/dgiiRoute");
+const http = require("http");
+const { Server } = require("socket.io");
+const server = http.createServer(app);
 
 
 // ❌ ELIMINAR ESTO (ROMPE TODO): import orderRoute from "./routes/orderRoute.js";
+
 
 const orderRoute = require("./routes/orderRoute"); // ✅ CommonJS correcto
 
 const PORT = config.port;
 connectDB();
+
+const io = new Server(server, {
+    cors: {
+        origin: [
+            "http://localhost:5173",
+            "http://localhost:5174",
+            "https://deleon-pos-saas-frontend.vercel.app",
+        ],
+        credentials: true,
+        methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    },
+});
+
+// 🔹 Guardar io para usarlo en controllers sin circular imports
+app.set("io", io);
+
+// 🔹 Auth/tenant room
+io.on("connection", (socket) => {
+
+
+    // 1) Recibe tenantId desde el cliente (handshake)
+    const tenantId =
+        socket.handshake.auth?.tenantId ||
+        socket.handshake.headers["x-tenant-id"];
+
+
+
+    if (!tenantId) {
+
+        socket.disconnect(true);
+        return;
+    }
+
+    // 2) Room por tenant
+    const room = `tenant:${tenantId}`;
+    socket.join(room);
+
+
+    // ✅ Forward: cuando un cliente emite, el server lo rebroadcastea al tenant
+    // (Así funciona "al instante" sin navegar/refresh)
+    socket.on("tenant:tablesUpdated", (payload = {}) => {
+        io.to(room).emit("tenant:tablesUpdated", { tenantId, ...payload });
+    });
+
+    socket.on("tenant:orderUpdated", (payload = {}) => {
+        io.to(room).emit("tenant:orderUpdated", { tenantId, ...payload });
+    });
+
+    // (Opcional) fiscal config también, si algún cliente lo emite
+    socket.on("tenant:configUpdated", (payload = {}) => {
+        io.to(room).emit("tenant:configUpdated", { tenantId, ...payload });
+    });
+
+    socket.on("disconnect", () => {
+        // opcional log
+    });
+});
 
 // Middlewares
 app.use(cors({
@@ -63,6 +124,6 @@ app.use("/api/inventory", require("./routes/inventoryRoute"));
 app.use(globalErrorHandler);
 
 // Server
-app.listen(PORT, () => {
+server.listen(PORT, () => {
     console.log(`☑️ POS Server is listening on port ${PORT}`);
 });
