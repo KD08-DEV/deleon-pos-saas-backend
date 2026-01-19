@@ -23,22 +23,14 @@ const register = async (req, res, next) => {
         const { name, phone, email, password, role, tenantName, plan } = req.body;
 
         if (!name || !phone || !email || !password || !role) {
-            const error = createHttpError(400, "All fields are required!");
-            return next(error);
+            return next(createHttpError(400, "All fields are required!"));
         }
 
-        // 💡 SUPERADMIN no está en la DB, así que este chequeo es por email global.
-        const isUserPresent = await User.findOne({ email, tenantId })
-
-        if (isUserPresent) {
-            const error = createHttpError(400, "User already exist!");
-            return next(error);
-        }
-
+        // ✅ Declarar primero (para evitar el error "Cannot access tenantId before initialization")
         let tenantId;
         let membershipRole = "Camarero";
 
-/// 🔥 CASO 1: SUPERADMIN crea un Admin (nueva empresa)
+        // 🔥 CASO 1: SUPERADMIN crea un Admin (nueva empresa)
         if (req.user && req.user.role === "SuperAdmin" && role === "Admin") {
             const companyName = tenantName || `${name}'s Business`;
             const tenantPlan = (plan || "emprendedor").toLowerCase();
@@ -111,16 +103,16 @@ const register = async (req, res, next) => {
         // 🔥 CASO 2: Admin de empresa crea empleados en SU tenant
         else if (req.user && req.user.role === "Admin") {
             tenantId = req.user.tenantId;
+
             if (!tenantId) {
-                const error = createHttpError(403, "Tenant not identified for Admin!");
-                return next(error);
+                return next(createHttpError(403, "Tenant not identified for Admin!"));
             }
 
             const tenant = await Tenant.findOne({ tenantId });
             if (!tenant) {
-                const error = createHttpError(404, "Tenant not found!");
-                return next(error);
+                return next(createHttpError(404, "Tenant not found!"));
             }
+
             const limits = getPlanLimits(tenant.plan);
 
             // 🔐 Límite TOTAL de usuarios del tenant
@@ -137,6 +129,7 @@ const register = async (req, res, next) => {
                     )
                 );
             }
+
             // Contar memberships activas por rol
             if (role === "Admin") {
                 const countAdmins = await Membership.countDocuments({
@@ -145,9 +138,7 @@ const register = async (req, res, next) => {
                     status: "active",
                 });
                 if (countAdmins >= limits.admins) {
-                    return next(
-                        createHttpError(403, "Admin limit reached for this plan!")
-                    );
+                    return next(createHttpError(403, "Admin limit reached for this plan!"));
                 }
                 membershipRole = "Admin";
             } else if (role === "Cajera") {
@@ -158,7 +149,10 @@ const register = async (req, res, next) => {
                 });
                 if (countCashiers >= limits.cajeras) {
                     return next(
-                        createHttpError(403, "Se alcanzó el límite de cajeros para este plan!")
+                        createHttpError(
+                            403,
+                            "Se alcanzó el límite de cajeros para este plan!"
+                        )
                     );
                 }
                 membershipRole = "Cajera";
@@ -170,7 +164,10 @@ const register = async (req, res, next) => {
                 });
                 if (countWaiters >= limits.camareros) {
                     return next(
-                        createHttpError(403, "¡Se alcanzó el límite de camareros para este plan!")
+                        createHttpError(
+                            403,
+                            "¡Se alcanzó el límite de camareros para este plan!"
+                        )
                     );
                 }
                 membershipRole = "Camarero";
@@ -178,8 +175,18 @@ const register = async (req, res, next) => {
                 return next(createHttpError(400, "Invalid role!"));
             }
         } else {
-            const error = createHttpError(403, "¡No está permitido crear este usuario!");
-            return next(error);
+            return next(createHttpError(403, "¡No está permitido crear este usuario!"));
+        }
+
+        // ✅ AQUÍ VA EL CHECK (cuando tenantId ya está definido)
+        if (!tenantId) {
+            return next(createHttpError(400, "tenantId is required"));
+        }
+
+        // ✅ Validar usuario existente en ESTE tenant (multi-tenant)
+        const isUserPresent = await User.findOne({ email, tenantId });
+        if (isUserPresent) {
+            return next(createHttpError(400, "User already exist!"));
         }
 
         // Crear usuario
@@ -188,26 +195,29 @@ const register = async (req, res, next) => {
             phone,
             email,
             password,
-            role,      // Admin / Cashier / Waiter
-            tenantId,  // NO existe para SuperAdmin porque él no se guarda aquí
+            role,     // Admin / Cajera / Camarero
+            tenantId, // tenant del usuario
         });
 
         // Crear membership
         await Membership.create({
             user: newUser._id,
             tenantId,
-            role: membershipRole, // Owner/Admin/Cashier/Waiter
+            role: membershipRole, // Owner/Admin/Cajera/Camarero
             clientIds: ["default"],
             status: "active",
         });
 
-        res
-            .status(201)
-            .json({ success: true, message: "New user created!", data: newUser });
+        return res.status(201).json({
+            success: true,
+            message: "New user created!",
+            data: newUser,
+        });
     } catch (error) {
-        next(error);
+        return next(error);
     }
 };
+
 
 const login = async (req, res, next) => {
     try {
