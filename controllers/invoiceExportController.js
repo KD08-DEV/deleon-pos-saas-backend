@@ -39,7 +39,7 @@ exports.exportInvoicesExcel = async (req, res) => {
             { header: "Propina", key: "tip", width: 14 },
             { header: "ITBIS", key: "tax", width: 14 },
             { header: "Total", key: "total", width: 14 },
-            { header: "Cajero", key: "user", width: 22 },
+            { header: "Cajera", key: "user", width: 22 },
             { header: "Invoice URL", key: "invoiceUrl", width: 40 },
         ];
 

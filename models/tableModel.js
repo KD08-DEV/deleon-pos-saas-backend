@@ -3,7 +3,7 @@ const mongoose = require("mongoose");
 const tableSchema = new mongoose.Schema(
     {
         tableNo: { type: Number, required: true }, // ❌ sin unique global
-        status: { type: String, default: "Available" },
+        status: { type: String, default: "Disponible" },
         seats: { type: Number, required: true, min: 1 },
         currentOrder: { type: mongoose.Schema.Types.ObjectId, ref: "Order", default: null },
 

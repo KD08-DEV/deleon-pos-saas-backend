@@ -5,6 +5,15 @@ const dishSchema = new mongoose.Schema(
         name: { type: String, required: true, trim: true },
         price: { type: Number, required: true, min: 0 },
         category: { type: String, required: true, trim: true },
+
+        // Vinculo con Categoria de Inventario (para control de stock por plato)
+        inventoryCategoryId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "InventoryCategory",
+            default: null,
+            index: true,
+        },
+
         imageUrl: { type: String },
 
         // 🔐 multi-tenant

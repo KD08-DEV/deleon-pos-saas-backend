@@ -29,7 +29,7 @@ router.post(
 // READ
 router.get(
     "/",
-    requireRole("Owner", "Admin", "Cashier", "Waiter"),
+    requireRole("Owner", "Admin", "Cajera", "Camarero"),
     getDishes
 );
 
@@ -51,7 +51,7 @@ router.delete(
 // RECIPE (NEW)
 router.get(
     "/:id/recipe",
-    requireRole("Owner", "Admin", "Cashier", "Waiter"),
+    requireRole("Owner", "Admin", "Cajera", "Camarero"),
     getDishRecipe
 );
 

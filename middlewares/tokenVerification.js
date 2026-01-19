@@ -42,10 +42,15 @@ const verifyToken = async (req, res, next) => {
             return next();
         }
 
-        // 🔐 Usuario normal (de la base de datos)
-        const user = await User.findById(decoded._id).select("_id role tenantId");
+        // 🔐 Usuario normal (de la base de datos)=
+        const user = await User.findById(decoded._id).select("_id role tenantId activeSessionId");
         if (!user) {
             return next(createHttpError(401, "User not exist!"));
+        }
+
+// ✅ Si el token no tiene sid o no coincide => sesión inválida (logueado en otro dispositivo)
+        if (!decoded.sid || !user.activeSessionId || decoded.sid !== user.activeSessionId) {
+            return next(createHttpError(401, "Session expired. Your account is active on another device."));
         }
 
         req.user = {
@@ -55,6 +60,7 @@ const verifyToken = async (req, res, next) => {
         };
 
         next();
+
     } catch (error) {
 
         return next(createHttpError(401, "Invalid Token!"));

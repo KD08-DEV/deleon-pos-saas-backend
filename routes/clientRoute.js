@@ -7,7 +7,7 @@ const Client = require("../models/clientModel");
 router.use(verifyToken );
 
 // Listar clients del tenant actual
-router.get("/", requireScope({ level: "tenant" }), requireRole("Owner","Admin","Cashier","Waiter"), async (req, res) => {
+router.get("/", requireScope({ level: "tenant" }), requireRole("Owner","Admin","Cajera","Camarero"), async (req, res) => {
     const list = await Client.find({ tenantId: req.scope.tenantId }).sort({ createdAt: -1 });
     res.json({ success: true, data: list });
 });

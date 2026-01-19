@@ -51,18 +51,34 @@ exports.createInvoice = async (req, res) => {
         }
 
         // Genera PDF (ya validaste pertenencia)
-        const invoiceData = await generateInvoicePDF(orderId, tenantId); // { path, url }
+        const invoiceData = await generateInvoicePDF(orderId, tenantId);
 
-        // ✅ Actualiza de forma segura (no por findByIdAndUpdate)
+// Soporta ambos formatos: string (url) o { url, path }
+        const invoiceUrl =
+            typeof invoiceData === "string" ? invoiceData : (invoiceData?.url || null);
+        const invoicePath =
+            typeof invoiceData === "string" ? null : (invoiceData?.path || null);
+
+        if (!invoiceUrl) {
+            return res.status(500).json({
+                success: false,
+                message: "Invoice generated but URL is missing",
+            });
+        }
+
         await Order.findOneAndUpdate(query, {
-            invoicePath: invoiceData.path,
-            invoiceUrl: invoiceData.url,
+            ...(invoicePath ? { invoicePath } : {}),
+            invoiceUrl,
         });
 
         return res.status(200).json({
+            success: true,
             message: "Invoice generated successfully",
-            invoiceUrl: invoiceData.url,
+            url: invoiceUrl,
+            invoiceUrl,
         });
+
+
     } catch (error) {
         console.error("Invoice Create Error:", error);
         return res.status(500).json({
@@ -106,14 +122,26 @@ exports.getInvoice = async (req, res) => {
             return res.status(200).json({ success: true, url: order.invoiceUrl });
         }
 
-        const invoiceData = await generateInvoicePDF(orderId, tenantId); // { path, url }
+        const invoiceData = await generateInvoicePDF(orderId, tenantId);
 
-        await Order.findByIdAndUpdate(orderId, {
-            invoicePath: invoiceData.path,
-            invoiceUrl: invoiceData.url,
+        const invoiceUrl =
+            typeof invoiceData === "string" ? invoiceData : (invoiceData?.url || null);
+        const invoicePath =
+            typeof invoiceData === "string" ? null : (invoiceData?.path || null);
+
+        if (!invoiceUrl) {
+            return res.status(500).json({
+                success: false,
+                message: "Invoice generated but URL is missing",
+            });
+        }
+
+        await Order.findOneAndUpdate(query, {
+            ...(invoicePath ? { invoicePath } : {}),
+            invoiceUrl,
         });
 
-        return res.status(200).json({ success: true, url: invoiceData.url });
+        return res.status(200).json({ success: true, url: invoiceUrl });
     } catch (error) {
         console.error("Get Invoice Error:", error);
         return res.status(500).json({

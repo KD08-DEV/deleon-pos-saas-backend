@@ -12,8 +12,8 @@ function getPlanLimits(plan) {
     const tier = TIERS[plan] || TIERS.emprendedor;
     return {
         admins: tier.limits.maxAdmins,
-        cashiers: tier.limits.maxCashiers,
-        waiters: tier.limits.maxWaiters,
+        cajeras: tier.limits.maxCashiers,
+        camareros: tier.limits.maxWaiters,
         maxUsers: tier.limits.maxUsers,
     };
 }
@@ -28,14 +28,15 @@ const register = async (req, res, next) => {
         }
 
         // 💡 SUPERADMIN no está en la DB, así que este chequeo es por email global.
-        const isUserPresent = await User.findOne({ email });
+        const isUserPresent = await User.findOne({ email, tenantId })
+
         if (isUserPresent) {
             const error = createHttpError(400, "User already exist!");
             return next(error);
         }
 
         let tenantId;
-        let membershipRole = "Waiter";
+        let membershipRole = "Camarero";
 
 /// 🔥 CASO 1: SUPERADMIN crea un Admin (nueva empresa)
         if (req.user && req.user.role === "SuperAdmin" && role === "Admin") {
@@ -43,7 +44,7 @@ const register = async (req, res, next) => {
             const tenantPlan = (plan || "emprendedor").toLowerCase();
 
             // 1) Validar plan
-            const allowedPlans = ["emprendedor", "pro", "vip"];
+            const allowedPlans = ["emprendedor", "premium", "vip"];
             if (!allowedPlans.includes(tenantPlan)) {
                 return next(createHttpError(400, "Invalid plan for tenant!"));
             }
@@ -149,35 +150,35 @@ const register = async (req, res, next) => {
                     );
                 }
                 membershipRole = "Admin";
-            } else if (role === "Cashier") {
+            } else if (role === "Cajera") {
                 const countCashiers = await Membership.countDocuments({
                     tenantId,
-                    role: "Cashier",
+                    role: "Cajera",
                     status: "active",
                 });
-                if (countCashiers >= limits.cashiers) {
+                if (countCashiers >= limits.cajeras) {
                     return next(
-                        createHttpError(403, "Cashier limit reached for this plan!")
+                        createHttpError(403, "Se alcanzó el límite de cajeros para este plan!")
                     );
                 }
-                membershipRole = "Cashier";
-            } else if (role === "Waiter") {
+                membershipRole = "Cajera";
+            } else if (role === "Camarero") {
                 const countWaiters = await Membership.countDocuments({
                     tenantId,
-                    role: "Waiter",
+                    role: "Camarero",
                     status: "active",
                 });
-                if (countWaiters >= limits.waiters) {
+                if (countWaiters >= limits.camareros) {
                     return next(
-                        createHttpError(403, "Waiter limit reached for this plan!")
+                        createHttpError(403, "¡Se alcanzó el límite de camareros para este plan!")
                     );
                 }
-                membershipRole = "Waiter";
+                membershipRole = "Camarero";
             } else {
                 return next(createHttpError(400, "Invalid role!"));
             }
         } else {
-            const error = createHttpError(403, "Not allowed to create this user!");
+            const error = createHttpError(403, "¡No está permitido crear este usuario!");
             return next(error);
         }
 
@@ -253,21 +254,37 @@ const login = async (req, res, next) => {
         // 🔐 LOGIN USUARIO NORMAL
         const isUserPresent = await User.findOne({ email });
         if (!isUserPresent) {
-            const error = createHttpError(401, "Invalid Credentials");
-            return next(error);
+            return next(createHttpError(401, "Invalid Credentials"));
         }
 
         const isMatch = await bcrypt.compare(password, isUserPresent.password);
         if (!isMatch) {
-            const error = createHttpError(401, "Invalid Credentials");
-            return next(error);
+            return next(createHttpError(401, "Invalid Credentials"));
         }
 
+// ✅ 1) Crear nueva sesión (invalidará la anterior)
+        const { deviceId } = req.body; // opcional
+        const sessionId = uuidv4();
+
+// ✅ 2) Guardar session activa en el usuario
+        await User.updateOne(
+            { _id: isUserPresent._id },
+            {
+                $set: {
+                    activeSessionId: sessionId,
+                    activeDeviceId: deviceId || null,
+                    lastLoginAt: new Date(),
+                },
+            }
+        );
+
+// ✅ 3) Incluir sid en el JWT
         const accessToken = jwt.sign(
             {
                 _id: isUserPresent._id,
                 tenantId: isUserPresent.tenantId,
                 role: isUserPresent.role,
+                sid: sessionId,
             },
             config.accessTokenSecret,
             { expiresIn: "1d" }
@@ -280,7 +297,7 @@ const login = async (req, res, next) => {
             secure: false,
         });
 
-        res.status(200).json({
+        return res.status(200).json({
             message: "User login successfully!",
             token: accessToken,
             data: {
@@ -289,7 +306,6 @@ const login = async (req, res, next) => {
                 email: isUserPresent.email,
                 role: isUserPresent.role,
                 tenantId: isUserPresent.tenantId,
-
             },
         });
     } catch (error) {
@@ -321,6 +337,10 @@ const getUserData = async (req, res, next) => {
 
 const logout = async (req, res, next) => {
     try {
+        await User.updateOne(
+            { _id: req.user._id },
+            { $set: { activeSessionId: null, activeDeviceId: null } }
+        );
         res.clearCookie("accessToken");
         res
             .status(200)

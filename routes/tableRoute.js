@@ -10,7 +10,7 @@ router.use(verifyToken );
 
 // Mesas del client actual
 router.post("/",    requireScope({ level: "client" }), requireRole("Owner","Admin"), addTable);
-router.get("/",     requireScope({ level: "client" }), requireRole("Owner","Admin","Cashier","Waiter"), getTables);
+router.get("/",     requireScope({ level: "client" }), requireRole("Owner","Admin","Cajera","Camarero"), getTables);
 router.put("/:id",  requireScope({ level: "client" }), requireRole("Owner","Admin"), updateTable);
 router.delete("/:id", requireScope({ level: "client" }), requireRole("Owner","Admin"), deleteTable);
 

@@ -67,9 +67,9 @@ router.patch(
 // =========================
 router.patch("/tenants/:tenantId/plan", verifyToken, isSuperAdmin, async (req, res) => {
     const { tenantId } = req.params;
-    const { plan } = req.body; // "emprendedor" | "pro" | "vip"
+    const { plan } = req.body; // "emprendedor" | "premium" | "vip"
 
-    if (!["emprendedor", "pro", "vip"].includes(plan)) {
+    if (!["emprendedor", "premium", "vip"].includes(plan)) {
         return res.status(400).json({ message: "Invalid plan" });
     }
 

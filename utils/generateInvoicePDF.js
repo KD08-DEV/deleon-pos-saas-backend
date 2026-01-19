@@ -150,18 +150,31 @@ async function generateInvoicePDF(orderId, tenantId) {
 
 
 
-        // ----- totals -----
+    // ----- totals -----
         const items = Array.isArray(order?.items) ? order.items : [];
         const computedSubtotal = items.reduce((acc, it) => acc + getLineNet(it), 0);
 
         const subtotal = Number(order?.bills?.subtotal ?? computedSubtotal);
-        const tip = Number(order?.bills?.tip ?? 0);
+        const discount = Number(order?.bills?.discount ?? 0);
+        const tip = Number(order?.bills?.tipAmount ?? order?.bills?.tip ?? 0);
         const totalTax = Number(order?.bills?.tax ?? 0);
-        const total = Number(order?.bills?.total ?? subtotal + tip + totalTax);
 
-        const taxEnabled = Boolean(order?.taxEnabled ?? order?.bills?.taxEnabled ?? true);
+        // ADD:
         const taxRate = getTaxRate(order);
+        const taxEnabled = Number(totalTax) > 0;
+    // total real (con ITBIS + propina) viene como totalWithTax en tu backend
+        const grandTotal = Number(
+            order?.bills?.totalWithTax ??
+            (Math.max(subtotal - discount, 0) + totalTax + tip)
+        );
 
+    // comisión delivery (si aplica)
+        const source = String(order?.orderSource || "").toUpperCase();
+        const isDelivery = source === "PEDIDOSYA" || source === "UBEREATS";
+        const commissionAmount = Number(order?.commissionAmount ?? 0);
+
+    // total a pagar: si es delivery, normalmente el cliente paga total + comisión
+        const totalToPay = isDelivery ? (grandTotal + commissionAmount) : grandTotal;
         // ----- create pdf -----
         const doc = new PDFDocument({ size: "A4", margin: 50 });
 
@@ -256,11 +269,18 @@ async function generateInvoicePDF(orderId, tenantId) {
 
         // Totals
         doc.fontSize(10).fillColor("#111827");
+        if (discount > 0) doc.text(`Descuento: -${moneyRD(discount)}`);
         doc.text(`Subtotal: ${moneyRD(subtotal)}`);
         doc.text(`Propina: ${moneyRD(tip)}`);
         doc.text(`ITBIS: ${moneyRD(totalTax)}`);
-        doc.font("Helvetica-Bold").text(`Total a pagar: ${moneyRD(total)}`);
+
+        if (isDelivery && commissionAmount > 0) {
+            doc.text(`Comisión: ${moneyRD(commissionAmount)}`);
+        }
+
+        doc.font("Helvetica-Bold").text(`Total a pagar: ${moneyRD(totalToPay)}`);
         doc.font("Helvetica").text(`Método de pago: ${order?.paymentMethod || "N/A"}`);
+
 
         doc.end();
 

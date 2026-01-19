@@ -23,10 +23,16 @@ const userSchema = new mongoose.Schema(
             }
         },
         password: { type: String, required: true },
-        role: { type: String, required: true, enum: ["Admin", "Waiter", "Cashier"] },
+        role: { type: String, required: true, enum: ["Admin", "Camarero", "Cajera"] },
 
         // 🔐 multi-tenant
         tenantId: { type: String, required: true, index: true },
+
+        // 🔐 single-session (una sola sesión activa por cuenta)
+        activeSessionId: { type: String, default: null, index: true },
+        activeDeviceId: { type: String, default: null },
+        lastLoginAt: { type: Date, default: null },
+
     },
     { timestamps: true }
 );

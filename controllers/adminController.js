@@ -41,12 +41,15 @@ exports.getReports = async (req, res) => {
         // Buscar órdenes que cumplan con los filtros
         const orders = await Order.find(filter)
             .populate("user", "name role email")
-            .populate("table", "tableNumber")
+            .populate("table", "tableNumber virtualType type isVirtual name")
+
             .sort({ createdAt: -1 });
 
         // Calcular totales
-        const totalSales = orders.reduce((sum, o) => sum + (o.totalAmount || 0), 0);
-        const totalTax = orders.reduce((sum, o) => sum + (o.taxAmount || 0), 0);
+        const totalSales = orders.reduce((sum, o) => sum + (Number(o.bills?.totalWithTax) || 0), 0);
+        const totalTax = orders.reduce((sum, o) => sum + (Number(o.bills?.tax) || 0), 0);
+        const totalCommission = orders.reduce((sum, o) => sum + (Number(o.commissionAmount) || 0), 0);
+        const totalNet = orders.reduce((sum, o) => sum + (Number(o.netTotal) || 0), 0);
         const orderCount = orders.length;
         const avgTicket = orderCount > 0 ? totalSales / orderCount : 0;
 
@@ -55,16 +58,20 @@ exports.getReports = async (req, res) => {
             totalSales,
             totalTax,
             orderCount,
+            totalCommission,
+            totalNet,
             avgTicket: Number(avgTicket.toFixed(2)),
             cashSales: orders
                 .filter((o) => o.paymentMethod === "Efectivo")
-                .reduce((s, o) => s + o.totalAmount, 0),
+                .reduce((s, o) => s + (Number(o.bills?.totalWithTax) || 0), 0),
+
             onlineSales: orders
                 .filter((o) => o.paymentMethod === "Tarjeta")
-                .reduce((s, o) => s + o.totalAmount, 0),
+                .reduce((s, o) => s + (Number(o.bills?.totalWithTax) || 0), 0),
+
             transferSales: orders
                 .filter((o) => o.paymentMethod === "Transferencia")
-                .reduce((s, o) => s + o.totalAmount, 0),
+                .reduce((s, o) => s + (Number(o.bills?.totalWithTax) || 0), 0),
         };
 
         // 🔹 También agrupar por fecha (para gráficas)
@@ -72,13 +79,15 @@ exports.getReports = async (req, res) => {
         orders.forEach((o) => {
             const date = o.createdAt.toISOString().split("T")[0];
             if (!groupedByDate[date]) groupedByDate[date] = 0;
-            groupedByDate[date] += o.totalAmount || 0;
+            groupedByDate[date] += Number(o.bills?.totalWithTax) || 0;
         });
 
         res.status(200).json({
             success: true,
             count: orderCount,
             dailySummary,
+
+
             salesByDate: groupedByDate, // { '2025-10-27': 512, '2025-10-26': 430, ... }
             data: orders,
         });
@@ -96,7 +105,7 @@ exports.getEmployees = async (req, res) => {
         const employees = await User.find({
             tenantId: req.user.tenantId,
             role: { $ne: "Admin" },
-        }).select("name email phone role");
+        }).select("_id name email phone role");
         res.status(200).json({ success: true, data: employees });
     } catch (error) {
         console.error("❌ Error al obtener empleados:", error);
@@ -117,6 +126,107 @@ exports.getUsers = async (req, res) => {
         res
             .status(500)
             .json({ success: false, message: "Error al obtener usuarios" });
+    }
+};
+
+// 🔹 Actualizar empleado
+exports.updateEmployee = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, email, phone, role, password } = req.body;
+
+        // Verificar que el empleado existe y pertenece al mismo tenant
+        const employee = await User.findOne({ _id: id, tenantId: req.user.tenantId });
+        
+        if (!employee) {
+            return res.status(404).json({ success: false, message: "Empleado no encontrado" });
+        }
+
+        // No permitir editar al Admin principal (puedes ajustar esta lógica)
+        // Si quieres permitir editar admin, puedes remover esta validación
+        if (employee.role === "Admin" && role !== "Admin") {
+            return res.status(400).json({ success: false, message: "No se puede cambiar el rol del administrador principal" });
+        }
+
+        // Preparar campos a actualizar
+        const updateData = {};
+        if (name && name.trim()) updateData.name = name.trim();
+        if (email && email.trim()) {
+            // Verificar que el email no esté en uso por otro usuario del mismo tenant
+            const existingUser = await User.findOne({ 
+                tenantId: req.user.tenantId, 
+                email: email.trim(),
+                _id: { $ne: id }
+            });
+            if (existingUser) {
+                return res.status(400).json({ success: false, message: "El email ya está en uso por otro empleado" });
+            }
+            updateData.email = email.trim();
+        }
+        if (phone) {
+            const phoneNum = Number(phone);
+            if (isNaN(phoneNum) || phoneNum.toString().length !== 10) {
+                return res.status(400).json({ success: false, message: "El teléfono debe ser un número de 10 dígitos" });
+            }
+            updateData.phone = phoneNum;
+        }
+        if (role && ["Admin", "Camarero", "Cajera"].includes(role)) {
+            updateData.role = role;
+        }
+        // Actualizar contraseña si se proporciona
+        if (password && password.trim()) {
+            if (password.length < 6) {
+                return res.status(400).json({ success: false, message: "La contraseña debe tener al menos 6 caracteres" });
+            }
+            updateData.password = password.trim();
+        }
+
+        // Actualizar usuario
+        const updatedEmployee = await User.findByIdAndUpdate(
+            id,
+            { $set: updateData },
+            { new: true, runValidators: true }
+        ).select("name email phone role");
+
+        // Actualizar membership si el rol cambió
+        if (role && role !== employee.role) {
+            const Membership = require("../models/membershipModel");
+            const membershipRoleMap = {
+                "Admin": "Admin",
+                "Cajera": "Cajera",
+                "Camarero": "Camarero"
+            };
+            
+            await Membership.updateMany(
+                { user: id, tenantId: req.user.tenantId },
+                { $set: { role: membershipRoleMap[role] || role } }
+            );
+        }
+
+        res.status(200).json({ 
+            success: true, 
+            message: "Empleado actualizado exitosamente", 
+            data: updatedEmployee 
+        });
+    } catch (error) {
+        console.error("❌ Error al actualizar empleado:", error);
+        
+        // Manejar errores de validación de Mongoose
+        if (error.name === "ValidationError") {
+            const messages = Object.values(error.errors).map(e => e.message).join(", ");
+            return res.status(400).json({ success: false, message: messages });
+        }
+        
+        // Manejar errores de duplicación
+        if (error.code === 11000) {
+            return res.status(400).json({ success: false, message: "El email ya está en uso" });
+        }
+
+        res.status(500).json({ 
+            success: false, 
+            message: "Error al actualizar empleado",
+            error: error.message 
+        });
     }
 };
 exports.getFiscalConfig = async (req, res) => {
@@ -145,6 +255,8 @@ exports.updateFiscalConfig = async (req, res) => {
         const fiscalEnabled = !!req.body?.fiscalEnabled;
         const taxEnabled = req.body?.features?.tax?.enabled;
         const tipEnabled = req.body?.features?.tip?.enabled;
+        const orderSources = req.body?.features?.orderSources;
+
 
         const ncfConfig = req.body?.ncfConfig || {};
         const B01 = ncfConfig.B01;
@@ -195,6 +307,28 @@ exports.updateFiscalConfig = async (req, res) => {
 
         Object.assign($set, buildUpdateForType("B01", B01));
         Object.assign($set, buildUpdateForType("B02", B02));
+        if (orderSources?.pedidosYa) {
+            if (typeof orderSources.pedidosYa.enabled === "boolean") {
+                $set["features.orderSources.pedidosYa.enabled"] = orderSources.pedidosYa.enabled;
+            }
+            if (orderSources.pedidosYa.commissionRate !== undefined) {
+                const r = Number(orderSources.pedidosYa.commissionRate);
+                if (!Number.isFinite(r) || r < 0 || r > 1) throw new Error("pedidosYa.commissionRate inválido (usa 0.26)");
+                $set["features.orderSources.pedidosYa.commissionRate"] = r;
+            }
+        }
+
+        if (orderSources?.uberEats) {
+            if (typeof orderSources.uberEats.enabled === "boolean") {
+                $set["features.orderSources.uberEats.enabled"] = orderSources.uberEats.enabled;
+            }
+            if (orderSources.uberEats.commissionRate !== undefined) {
+                const r = Number(orderSources.uberEats.commissionRate);
+                if (!Number.isFinite(r) || r < 0 || r > 1) throw new Error("uberEats.commissionRate inválido (usa 0.22)");
+                $set["features.orderSources.uberEats.commissionRate"] = r;
+            }
+        }
+
 
         const updated = await Tenant.findOneAndUpdate(
             { tenantId },
@@ -239,11 +373,11 @@ exports.getUsage = async (req, res) => {
         const limits = tier.limits || {};
 
         // Cálculos en paralelo
-        const [totalUsers, admins, cashiers, waiters, dishes, tables] = await Promise.all([
+        const [totalUsers, admins, cajeras, camareros, dishes, tables] = await Promise.all([
             Membership.countDocuments({ tenantId, status: "active" }),
             Membership.countDocuments({ tenantId, status: "active", role: { $in: ["Owner", "Admin"] } }),
             Membership.countDocuments({ tenantId, status: "active", role: "Cajera" }),
-            Membership.countDocuments({ tenantId, status: "active", role: "Waiter" }),
+            Membership.countDocuments({ tenantId, status: "active", role: "Camarero" }),
             Dish.countDocuments({ tenantId }),
             Table.countDocuments({ tenantId }),
         ]);
@@ -266,16 +400,16 @@ exports.getUsage = async (req, res) => {
                 usage: {
                     users: totalUsers,
                     admins,
-                    cashiers,
-                    waiters,
+                    cajeras,
+                    camareros,
                     dishes,
                     tables,
                 },
                 remaining: {
                     users: remaining(limits.maxUsers, totalUsers),
                     admins: remaining(limits.maxAdmins, admins),
-                    cashiers: remaining(limits.maxCashiers, cashiers),
-                    waiters: remaining(limits.maxWaiters, waiters),
+                    cajeras: remaining(limits.maxCashiers, cajeras),
+                    camareros: remaining(limits.maxWaiters, camareros),
                     dishes: remaining(limits.maxDishes, dishes),
                     tables: remaining(limits.maxTables, tables),
                 },

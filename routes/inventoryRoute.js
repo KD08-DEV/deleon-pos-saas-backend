@@ -23,7 +23,7 @@ const requirePlanOrSuper = (checkFn) => {
 const requireInventoryPlan = requirePlanOrSuper((tenant) => {
     const plan = (tenant.plan || "").toString().toLowerCase(); // viene de Tenant.plan
 
-    const ok = ["pro", "vip"].includes(plan); // Pro (Premium) + VIP
+    const ok = ["premium", "vip"].includes(plan); // Pro (Premium) + VIP
 
     return {
         ok,
@@ -43,9 +43,9 @@ router.use(requireScope({ level: "tenant" }));
 router.use(requireInventoryPlan);
 
 // Lectura (Owner/Admin/Cashier)
-router.get("/items", requireRole("Owner", "Admin", "Cashier"), inventoryController.listItems);
-router.get("/movements", requireRole("Owner", "Admin", "Cashier"), inventoryController.listMovements);
-router.get("/low-stock", requireRole("Owner", "Admin", "Cashier"), inventoryController.lowStock);
+router.get("/items", requireRole("Owner", "Admin", "Cajera", "Camarero"), inventoryController.listItems);
+router.get("/movements", requireRole("Owner", "Admin", "Cajera", "Camarero"), inventoryController.listMovements);
+router.get("/low-stock", requireRole("Owner", "Admin", "Cajera", "Camarero"), inventoryController.lowStock);
 
 // Escritura (Owner/Admin)
 router.post("/items", requireRole("Owner", "Admin"), inventoryController.createItem);

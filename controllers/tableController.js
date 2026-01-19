@@ -86,7 +86,7 @@ const updateTable = async (req, res, next) => {
         }
 
         // 🔒 VALIDACIÓN CRÍTICA
-        if (status === "Booked" && !orderId) {
+        if (status === "Ocupada" && !orderId) {
             return next(
                 createHttpError(
                     400,
@@ -95,11 +95,11 @@ const updateTable = async (req, res, next) => {
             );
         }
 
-        if (status === "Available") {
+        if (status === "Disponible") {
             // Liberar siempre
             const table = await Table.findOneAndUpdate(
                 { _id: id, tenantId: req.user.tenantId },
-                { status: "Available", currentOrder: null },
+                { status: "Disponible", currentOrder: null },
                 { new: true }
             );
 
@@ -113,10 +113,10 @@ const updateTable = async (req, res, next) => {
             });
         }
 
-        // Booked + orderId válido
+        // Ocupada + orderId válido
         const table = await Table.findOneAndUpdate(
             { _id: id, tenantId: req.user.tenantId },
-            { status: "Booked", currentOrder: orderId },
+            { status: "Ocupada", currentOrder: orderId },
             { new: true }
         );
 

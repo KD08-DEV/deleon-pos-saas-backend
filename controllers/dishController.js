@@ -68,7 +68,15 @@ const deleteFromSupabase = async (imageUrl) => {
 exports.addDish = async (req, res, next) => {
     const clientId = req.clientId || "default";
     try {
-        const { name, price, category } = req.body;
+        const { name, price, category, inventoryCategoryId } = req.body;
+
+        let invCatId = null;
+        if (inventoryCategoryId) {
+            if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
+                return next(createHttpError(400, "inventoryCategoryId inválido"));
+            }
+            invCatId = inventoryCategoryId;
+        }
 
         if (!name || !price || !category) {
             return next(createHttpError(400, "Please provide name, price and category!"));
@@ -85,11 +93,11 @@ exports.addDish = async (req, res, next) => {
             name,
             price,
             category,
+            inventoryCategoryId: invCatId,
             imageUrl,
             tenantId: req.user.tenantId,
             clientId: clientId,
         });
-
         res.status(201).json({
             success: true,
             message: "Dish added successfully!",
@@ -145,6 +153,20 @@ exports.updateDish = async (req, res, next) => {
 
         if (name !== undefined) dish.name = String(name);
         if (category !== undefined) dish.category = String(category);
+
+            // >>> AQUI MISMO PEGA ESTO (inventoryCategoryId) <<<
+        const { inventoryCategoryId } = req.body;
+
+        if (inventoryCategoryId !== undefined) {
+            if (inventoryCategoryId === "" || inventoryCategoryId === null) {
+                dish.inventoryCategoryId = null;
+            } else {
+                if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
+                    return next(createHttpError(400, "inventoryCategoryId inválido"));
+                }
+                dish.inventoryCategoryId = inventoryCategoryId;
+            }
+        }
 
         if (sellMode !== undefined) {
             const sm = String(sellMode);
@@ -232,10 +254,12 @@ exports.updateDishRecipe = async (req, res) => {
         }
 
         // Validación mínima de receta
+        // Ahora las recetas usan dishId en lugar de inventoryItemId
         if (Array.isArray(recipe)) {
             for (const r of recipe) {
-                if (!r.inventoryItemId) {
-                    return res.status(400).json({ success: false, message: "Cada receta requiere inventoryItemId" });
+                // Acepta dishId (nuevo) o inventoryItemId (legacy para compatibilidad)
+                if (!r.dishId && !r.inventoryItemId) {
+                    return res.status(400).json({ success: false, message: "Cada receta requiere dishId" });
                 }
                 const q = Number(r.qty);
                 if (!Number.isFinite(q) || q <= 0) {

@@ -13,7 +13,7 @@ const createOrder = async (req, res, next) => {
     const { amount } = req.body;
     const options = {
       amount: amount * 100, // Amount in paisa (1 INR = 100 paisa)
-      currency: "INR",
+      currency: "USD",
       receipt: `receipt_${Date.now()}`,
     };
 

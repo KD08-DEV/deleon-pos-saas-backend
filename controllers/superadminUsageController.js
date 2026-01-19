@@ -16,7 +16,7 @@ exports.getTenantUsage = async (req, res) => {
                 const limits = tier.limits || {};
 
                 // Contadores por tenant (solo memberships activas)
-                const [totalUsers, admins, cashiers, waiters, dishes, tables] =
+                const [totalUsers, admins, cajeras, camareros, dishes, tables] =
                     await Promise.all([
                         Membership.countDocuments({ tenantId, status: "active" }),
                         Membership.countDocuments({
@@ -27,12 +27,12 @@ exports.getTenantUsage = async (req, res) => {
                         Membership.countDocuments({
                             tenantId,
                             status: "active",
-                            role: "Cashier",
+                            role: "Cajeras",
                         }),
                         Membership.countDocuments({
                             tenantId,
                             status: "active",
-                            role: "Waiter",
+                            role: "Camareros",
                         }),
                         Dish.countDocuments({ tenantId }),
                         Table.countDocuments({ tenantId }),
@@ -58,16 +58,16 @@ exports.getTenantUsage = async (req, res) => {
                     usage: {
                         users: totalUsers,
                         admins,
-                        cashiers,
-                        waiters,
+                        cajeras,
+                        camareros,
                         dishes,
                         tables,
                     },
                     remaining: {
                         users: remaining(limits.maxUsers, totalUsers),
                         admins: remaining(limits.maxAdmins, admins),
-                        cashiers: remaining(limits.maxCashiers, cashiers),
-                        waiters: remaining(limits.maxWaiters, waiters),
+                        cajeras: remaining(limits.maxCashiers, cajeras),
+                        camareros: remaining(limits.maxWaiters, camareros),
                         dishes: remaining(limits.maxDishes, dishes),
                         tables: remaining(limits.maxTables, tables),
                     },

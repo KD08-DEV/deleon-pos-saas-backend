@@ -40,6 +40,17 @@ const orderSchema = new mongoose.Schema(
         },
         invoicePath: { type: String, default: "" },
         invoiceUrl: { type: String, default: "" },
+        orderSource: {
+            type: String,
+            enum: ["DINE_IN", "TAKEOUT", "PEDIDOSYA", "UBEREATS"],
+            default: "DINE_IN",
+            index: true,
+        },
+
+// Comisión congelada en el momento de crear/cambiar el canal
+        commissionRate: { type: Number, default: 0 },     // 0.26, 0.22, etc
+        commissionAmount: { type: Number, default: 0 },   // monto calculado
+        netTotal: { type: Number, default: 0 },
         bills: {
             // subtotal real (antes de ITBIS y propina)
             subtotal: { type: Number, default: 0 },
@@ -88,7 +99,7 @@ const orderSchema = new mongoose.Schema(
             required: false,
             default: null,
         },
-        paymentMethod: { type: String, enum: ["Efectivo", "Tarjeta,Transferencia"], default: "Efectivo" },
+        paymentMethod: { type: String, enum: ["Efectivo", "Tarjeta", "Transferencia", "Pedido Ya", "Uber Eats"], default: "Efectivo" },
         user: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // quien creó la orden
     },
     { timestamps: true }

@@ -7,8 +7,8 @@ const requireRole = require("../middlewares/requireRole");
 const { createOrder, verifyPayment, webHookVerification } = require("../controllers/paymentController");
 
 // pagos del client actual
-router.post("/create-order",   verifyToken , requireScope({ level: "client" }), requireRole("Owner","Admin","Cashier"), createOrder);
-router.post("/verify-payment", verifyToken , requireScope({ level: "client" }), requireRole("Owner","Admin","Cashier"), verifyPayment);
+router.post("/create-order",   verifyToken , requireScope({ level: "client" }), requireRole("Owner", "Admin", "Cajera", "Camarero"), createOrder);
+router.post("/verify-payment", verifyToken , requireScope({ level: "client" }), requireRole("Owner", "Admin", "Cajera", "Camarero"), verifyPayment);
 
 // Webhook de pasarela (sin token)
 router.post("/webhook-verification", webHookVerification);

@@ -56,6 +56,7 @@ const tenantSchema = new mongoose.Schema(
 
 
 
+
         features: {
             tax: {
                 enabled: { type: Boolean, default: true },
@@ -70,8 +71,16 @@ const tenantSchema = new mongoose.Schema(
                 enabled: { type: Boolean, default: true },
                 allowToggle: { type: Boolean, default: true },
             },
-
-
+            orderSources: {
+                pedidosYa: {
+                    enabled: { type: Boolean, default: false },
+                    commissionRate: { type: Number, default: 0.26 },
+                },
+                uberEats: {
+                    enabled: { type: Boolean, default: false },
+                    commissionRate: { type: Number, default: 0.22 },
+                },
+            },
         },
 
         status: {
@@ -82,7 +91,7 @@ const tenantSchema = new mongoose.Schema(
 
         plan: {
             type: String,
-            enum: ["emprendedor", "pro", "vip"],
+            enum: ["emprendedor", "premium", "vip"],
             default: "emprendedor",
         },
 

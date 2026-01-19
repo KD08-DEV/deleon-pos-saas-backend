@@ -38,7 +38,7 @@ const invoiceSchema = new mongoose.Schema(
         total: { type: Number, required: true },
 
         // ----- PAGO -----
-        paymentMethod: { type: String, enum: ["Efectivo", "Tarjeta", "Transferencia"], default: "Efectivo" },
+        paymentMethod: { type: String, enum: ["Efectivo", "Tarjeta", "Transferencia", "Pedido Ya", "Uber Eats"],default: "Efectivo" },
     },
     { timestamps: true }
 );

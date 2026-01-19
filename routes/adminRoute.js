@@ -17,7 +17,22 @@ const {
     // ✅ NUEVO (agrega estas 2 en tu adminController)
     getFiscalConfig,
     updateFiscalConfig,
+    updateEmployee,
 } = require("../controllers/adminController");
+
+const {
+    getSuppliers,
+    createSupplier,
+    updateSupplier,
+    deleteSupplier,
+} = require("../controllers/supplierController");
+
+const {
+    getCategories,
+    createCategory,
+    updateCategory,
+    deleteCategory,
+} = require("../controllers/inventoryCategoryController");
 
 // Panel admin: nivel tenant (no requiere clientId)
 router.use(verifyToken );
@@ -52,5 +67,63 @@ router.patch(
     updateFiscalConfig
 );
 
+router.patch(
+    "/employees/:id",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    updateEmployee
+);
+
+// Suppliers routes
+router.get(
+    "/suppliers",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    getSuppliers
+);
+router.post(
+    "/suppliers",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    createSupplier
+);
+router.put(
+    "/suppliers/:id",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    updateSupplier
+);
+router.delete(
+    "/suppliers/:id",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    deleteSupplier
+);
+
+// Inventory Categories routes
+router.get(
+    "/inventory/categories",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    getCategories
+);
+router.post(
+    "/inventory/categories",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    createCategory
+);
+router.put(
+    "/inventory/categories/:id",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    updateCategory
+);
+router.delete(
+    "/inventory/categories/:id",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    deleteCategory
+);
 
 module.exports = router;

@@ -4,8 +4,8 @@ const Order = require("../models/orderModel");
 const Table = require("../models/tableModel");
 const Tenant = require("../models/tenantModel");
 const Dish = require("../models/dish"); // ajusta si el nombre es dishModel.js
-const InventoryItem = require("../models/inventoryItemModel");
-const InventoryMovement = require("../models/inventoryMovementModel");
+// const InventoryItem = require("../models/inventoryItemModel"); // DEPRECATED: Ya no se usa InventoryItem, solo Dish
+// const InventoryMovement = require("../models/inventoryMovementModel"); // DEPRECATED
 
 // Impuesto por defecto (0.25% para coincidir con tu UI)
 const TAX_RATE = Number(process.env.TAX_RATE ?? 0.18);
@@ -14,6 +14,42 @@ const TAX_RATE = Number(process.env.TAX_RATE ?? 0.18);
 function round2(n) {
     return Math.round((Number(n) || 0) * 100) / 100;
 }
+const ORDER_SOURCES = ["DINE_IN", "TAKEOUT", "PEDIDOSYA", "UBEREATS"];
+function normalizeSource(v) {
+    const s = String(v || "").trim().toUpperCase();
+    if (!s) return "DINE_IN";
+    return ORDER_SOURCES.includes(s) ? s : "DINE_IN";
+}
+
+function getCommissionRateFromTenant(tenant, source) {
+    const os = tenant?.features?.orderSources || {};
+    if (source === "PEDIDOSYA") {
+        if (os?.pedidosYa?.enabled !== true) return { allowed: false, rate: 0 };
+        return { allowed: true, rate: Number(os?.pedidosYa?.commissionRate ?? 0.26) };
+    }
+    if (source === "UBEREATS") {
+        if (os?.uberEats?.enabled !== true) return { allowed: false, rate: 0 };
+        return { allowed: true, rate: Number(os?.uberEats?.commissionRate ?? 0.22) };
+    }
+    // DINE_IN / TAKEOUT por defecto sin comisión
+    return { allowed: true, rate: 0 };
+}
+
+function computeCommission(totalBeforeTip, totalWithTax, rate) {
+    const r = Number(rate) || 0;
+
+    const base = round2(totalBeforeTip);
+    const total = round2(totalWithTax);
+
+    if (r <= 0) return { commissionAmount: 0, netTotal: total };
+
+    const commissionAmount = round2(base * r);     // comisión NO incluye tip
+    const netTotal = round2(total - commissionAmount);
+
+    return { commissionAmount, netTotal };
+}
+
+
 function escapeRegex(str = "") {
     return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -59,251 +95,11 @@ function normalizeOrderStatus(s) {
 
 
 
-async function deductInventoryForOrder(order, userId) {
-    const session = await mongoose.startSession();
-
-    try {
-        await session.withTransaction(async () => {
-            const freshOrder = await Order.findById(order._id).session(session);
-            if (!freshOrder) throw new Error("Orden no encontrada");
-
-            // idempotente
-            if (freshOrder.inventoryDeducted) {
-                console.log("[INV] order already deducted:", String(freshOrder._id));
-                return;
-            }
-
-            console.log("[INV] deductInventoryForOrder => order:", String(freshOrder._id));
-            console.log("[INV] tenantId:", String(freshOrder.tenantId), "clientId:", String(freshOrder.clientId));
-            console.log("[INV] status:", freshOrder.orderStatus, "inventoryDeducted:", freshOrder.inventoryDeducted);
-
-            let deductedCount = 0;
-
-            for (const item of freshOrder.items || []) {
-                console.log("[INV] item:", {
-                    name: item.name,
-                    dishId: item.dishId,
-                    qtyType: item.qtyType,
-                    weightUnit: item.weightUnit,
-                    quantity: item.quantity,
-                });
-
-                if (!item.dishId) {
-                    console.log(`[INV] WARNING: item "${item.name}" no tiene dishId. Saltando.`);
-                    continue;
-                }
-
-                const dishQuery = {
-                    _id: item.dishId,
-                    tenantId: freshOrder.tenantId,
-                    $or: [
-                        { clientId: freshOrder.clientId },
-                        { clientId: { $exists: false } },
-                        { clientId: "default" },
-                    ],
-                };
-
-                const dish = await Dish.findOne(dishQuery).session(session);
-
-                console.log("[INV] dishQuery:", dishQuery);
-
-                if (!dish) {
-                    console.log(`[INV] WARNING: Dish no encontrado para item "${item.name}". Saltando.`);
-                    continue;
-                }
-
-                const dishSellMode = dish.sellMode || "unit";
-                const itemQtyType = item.qtyType || "unit";
-
-                // consistencia (no lo rompo, solo aviso)
-                if (dishSellMode !== itemQtyType) {
-                    console.log(
-                        `[INV] WARNING: modo inconsistente para "${dish.name}". Dish=${dishSellMode} vs Order=${itemQtyType}. Saltando.`
-                    );
-                    continue;
-                }
-
-                const factor = Number(item.quantity);
-                if (!Number.isFinite(factor) || factor <= 0) {
-                    console.log(`[INV] WARNING: cantidad inválida en item "${item.name}". Saltando.`);
-                    continue;
-                }
-
-
-                const recipe = Array.isArray(dish.recipe) ? dish.recipe : [];
-                console.log("[INV] dish:", dish.name, "sellMode:", dishSellMode, "recipeCount:", recipe.length);
-
-                // 1) Si tiene receta -> descuenta por receta
-                if (recipe.length > 0) {
-                    for (const r of recipe) {
-                        const consume = Number(r.qty) * factor; // qty por unidad o por lb
-                        if (!Number.isFinite(consume) || consume <= 0) continue;
-
-                        const invItem = await InventoryItem.findOne({
-                            _id: r.inventoryItemId,
-                            tenantId: freshOrder.tenantId,
-                            clientId: freshOrder.clientId,
-                            isArchived: false,
-                        }).session(session);
-
-                        if (!invItem) {
-                            throw new Error(`Insumo no encontrado para receta de "${dish.name}"`);
-                        }
-
-                        const beforeStock = Number(invItem.stockCurrent || 0);
-                        const afterStock = beforeStock - Math.abs(consume);
-
-                        console.log(`[INV] recipe deduct -> ${invItem.name}:`, {
-                            consume,
-                            beforeStock,
-                            afterStock,
-                        });
-
-                        if (afterStock < 0) {
-                            throw new Error(
-                                `Stock insuficiente: ${invItem.name}. Necesitas ${consume}, disponible ${beforeStock}`
-                            );
-                        }
-
-                        invItem.stockCurrent = afterStock;
-                        await invItem.save({ session });
-
-                        await InventoryMovement.create(
-                            [
-                                {
-                                    tenantId: freshOrder.tenantId,
-                                    clientId: freshOrder.clientId,
-                                    itemId: invItem._id,
-                                    type: "sale",
-                                    qty: Math.abs(consume),
-                                    unitCost: null,
-                                    note: `Venta: ${dish.name} (Order ${freshOrder._id})`,
-                                    beforeStock,
-                                    afterStock,
-                                    createdBy: userId || null,
-                                },
-                            ],
-                            { session }
-                        );
-
-                        deductedCount++;
-                    }
-
-                    continue; // ya deduje por receta
-                }
-
-                // 2) FALLBACK: no hay receta -> intenta match por nombre de plato == nombre de insumo
-                //    Esto permite que "Chuleta" descuente del insumo "Chuleta" sin receta.
-                // 2) FALLBACK: no hay receta -> intenta match por nombre (case-insensitive + trim)
-//    y compatible con clientId missing/default
-
-                const dishName = (dish.name || "").trim();
-                const itemName = (item.name || "").trim(); // por si el item.name viene mejor que dish.name
-
-                const nameRegex = dishName
-                    ? new RegExp(`^${escapeRegex(dishName)}$`, "i")
-                    : null;
-
-                const itemNameRegex = itemName
-                    ? new RegExp(`^${escapeRegex(itemName)}$`, "i")
-                    : null;
-
-                const fallbackQuery = {
-                    tenantId: freshOrder.tenantId,
-                    isArchived: false,
-                    $or: [
-                        // match por dish.name
-                        ...(nameRegex ? [{ name: nameRegex }] : []),
-
-                        // match por item.name (por si el dish.name difiere)
-                        ...(itemNameRegex ? [{ name: itemNameRegex }] : []),
-                    ],
-                    // compat clientId
-                    $and: [
-                        {
-                            $or: [
-                                { clientId: freshOrder.clientId },
-                                { clientId: { $exists: false } },
-                                { clientId: "default" },
-                            ],
-                        },
-                    ],
-                };
-
-                console.log("[INV] fallbackQuery:", fallbackQuery);
-
-                const fallbackInv = await InventoryItem.findOne(fallbackQuery).session(session);
-
-                if (!fallbackInv) {
-                    console.log(
-                        `[INV] NO RECIPE + NO FALLBACK MATCH: Dish "${dish.name}" no tiene receta y no existe insumo con nombre compatible.`
-                    );
-                    console.log("[INV] DEBUG fallback names:", { dishName, orderItemName, clientId: freshOrder.clientId });
-
-                    continue;
-                }
-
-
-                // consumo: si vendes por unidad -> consume = quantity
-                //         si vendes por weight -> consume = quantity (lbs/kg según tu sistema)
-                const consume = factor;
-
-                const beforeStock = Number(fallbackInv.stockCurrent || 0);
-                const afterStock = beforeStock - Math.abs(consume);
-
-                console.log(`[INV] fallback deduct -> ${fallbackInv.name}:`, {
-                    consume,
-                    beforeStock,
-                    afterStock,
-                });
-
-                if (afterStock < 0) {
-                    throw new Error(
-                        `Stock insuficiente: ${fallbackInv.name}. Necesitas ${consume}, disponible ${beforeStock}`
-                    );
-                }
-
-                fallbackInv.stockCurrent = afterStock;
-                await fallbackInv.save({ session });
-
-                await InventoryMovement.create(
-                    [
-                        {
-                            tenantId: freshOrder.tenantId,
-                            clientId: freshOrder.clientId,
-                            itemId: fallbackInv._id,
-                            type: "sale",
-                            qty: Math.abs(consume),
-                            unitCost: null,
-                            note: `Venta (fallback): ${dish.name} (Order ${freshOrder._id})`,
-                            beforeStock,
-                            afterStock,
-                            createdBy: userId || null,
-                        },
-                    ],
-                    { session }
-                );
-
-                deductedCount++;
-            }
-
-            // Solo marca como descontado si realmente descontó algo
-            if (deductedCount > 0) {
-                freshOrder.inventoryDeducted = true;
-                freshOrder.inventoryDeductedAt = new Date();
-                await freshOrder.save({ session });
-                console.log("[INV] inventory deducted OK for order:", String(freshOrder._id), "deductions:", deductedCount);
-            } else {
-                console.log(
-                    "[INV] No deductions applied. Order NOT marked inventoryDeducted. order:",
-                    String(freshOrder._id)
-                );
-            }
-        });
-    } finally {
-        session.endSession();
-    }
-}
+// DEPRECATED: Esta función usa InventoryItem que ya no se usa. 
+// Ahora solo se usa el modelo Dish.
+// async function deductInventoryForOrder(order, userId) {
+//     ... (función deshabilitada porque usa InventoryItem)
+// }
 
 
 
@@ -357,6 +153,7 @@ const addOrder = async (req, res, next) => {
             table = null, // ✅ ahora puede ser null
             paymentMethod = "Efectivo",
             discount = 0,
+            orderSource,
         } = req.body;
         const normalizedStatus = normalizeOrderStatus(orderStatus);
 
@@ -376,15 +173,26 @@ const addOrder = async (req, res, next) => {
                 _id: tableRef,
                 tenantId,
                 $or: [
-                    { clientId: req.clientId },             // mesas nuevas
-                    { clientId: { $exists: false } },       // mesas viejas sin clientId
-                    { clientId: "default" },                // compatibilidad por si acaso
+                    { clientId: req.clientId },
+                    { clientId: { $exists: false } },
+                    { clientId: "default" },
                 ],
-            }).select("_id");
+            }).select("_id isVirtual virtualType");
+
 
             if (!sameTenantTable) {
                 return next(createHttpError(403, "TABLE_DOES_NOT_BELONG_TO_TENANT"));
             }
+        }
+        const tenant = await Tenant.findOne({ tenantId }).lean();
+        if (!tenant) return next(createHttpError(404, "TENANT_NOT_FOUND"));
+
+        // Canal / comisión (ya con tenant disponible)
+        const source = normalizeSource(orderSource);
+        const { allowed, rate } = getCommissionRateFromTenant(tenant, source);
+
+        if (!allowed) {
+            return next(createHttpError(400, `SOURCE_DISABLED_${source}`));
         }
 
 
@@ -392,8 +200,16 @@ const addOrder = async (req, res, next) => {
         const normItems = Array.isArray(items) && items.length
             ? normalizeAndPriceItems(items)
             : [];
-        const tenant = await Tenant.findOne({ tenantId }).lean();
+
         const features = tenant?.features || {};
+
+        const incomingBills = req.body?.bills || {};
+        let tip = 0;
+
+        if (incomingBills.tipAmount !== undefined) tip = Number(incomingBills.tipAmount);
+        else if (incomingBills.tip !== undefined) tip = Number(incomingBills.tip);
+
+        tip = round2(tip);
 
 
         // Calcular totales
@@ -404,7 +220,11 @@ const addOrder = async (req, res, next) => {
 
         const taxable = round2(subtotal - discountAmt);
         const tax = round2(taxable * TAX_RATE);
-        const totalWithTax = round2(taxable + tax);
+
+        const totalBeforeTip = round2(taxable + tax);      // base para comisión (sin tip)
+        const totalWithTax = round2(totalBeforeTip + tip);
+        const { commissionAmount, netTotal } = computeCommission(totalBeforeTip, totalWithTax, rate);
+
 
 
         // Crear payload base
@@ -419,15 +239,19 @@ const addOrder = async (req, res, next) => {
             },
             orderStatus: normalizedStatus,
             bills: {
+                subtotal,
                 total: subtotal,
                 discount: discountAmt,
                 tax,
+                taxEnabled: true,
+                tip,
+                tipAmount: tip,
                 totalWithTax,
-                // si viene tip desde el front, lo guardamos
-                ...(req.body?.bills?.tip !== undefined
-                    ? { tip: Number(req.body.bills.tip) }
-                    : {}),
             },
+            orderSource: source,
+            commissionRate: round2(rate),
+            commissionAmount,
+            netTotal,
 
             items: normItems,
             paymentMethod,
@@ -449,7 +273,7 @@ const addOrder = async (req, res, next) => {
                         { clientId: "default" },
                     ],
                 },
-                { status: "Booked", currentOrder: order._id }
+                { status: "Ocupada", currentOrder: order._id }
             );
         }
 
@@ -519,7 +343,7 @@ const deleteOrder = async (req, res, next) => {
         if (order.table?._id) {
             await Table.findOneAndUpdate(
                 { _id: order.table._id, tenantId: req.user.tenantId, clientId: req.clientId  }, // 🔐
-                { status: "Available", currentOrder: null }
+                { status: "Disponible", currentOrder: null }
             );
         }
 
@@ -851,7 +675,43 @@ const updateOrder = async (req, res, next) => {
         }
         tip = round2(tip);
 
-        const totalWithTax = round2(taxable + tax + tip);
+        const totalBeforeTip = round2(taxable + tax);      // base comisión (sin tip)
+        const totalWithTax = round2(totalBeforeTip + tip); // total final (con tip)
+
+// =========================
+// CANAL / COMISION
+// =========================
+        const incomingSource =
+            req.body.orderSource !== undefined ? normalizeSource(req.body.orderSource) : null;
+
+        const currentSource = normalizeSource(current.orderSource || "DINE_IN");
+
+        let finalSource = currentSource;
+        let finalRate = Number(current.commissionRate || 0);
+
+// Si cambió el source, valida contra config del tenant
+        if (incomingSource && incomingSource !== currentSource) {
+            const { allowed, rate } = getCommissionRateFromTenant(tenant, incomingSource);
+            if (!allowed) return next(createHttpError(400, `SOURCE_DISABLED_${incomingSource}`));
+
+            finalSource = incomingSource;
+            finalRate = Number(rate || 0);
+        }
+
+// Si NO cambió source pero la orden era vieja y no tenía rate, puedes backfill opcional:
+        if (!incomingSource && (currentSource === "PEDIDOSYA" || currentSource === "UBEREATS") && !current.commissionRate) {
+            const { allowed, rate } = getCommissionRateFromTenant(tenant, currentSource);
+            if (allowed) finalRate = Number(rate || 0);
+        }
+
+        const { commissionAmount, netTotal } = computeCommission(totalBeforeTip, totalWithTax, finalRate);
+
+        safeUpdate.orderSource = finalSource;
+        safeUpdate.commissionRate = round2(finalRate);
+        safeUpdate.commissionAmount = commissionAmount;
+        safeUpdate.netTotal = netTotal;
+
+
 
         safeUpdate.bills = {
             ...safeUpdate.bills,
@@ -879,7 +739,7 @@ const updateOrder = async (req, res, next) => {
                         tenantId,
                         $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
                     },
-                    { status: "Available", currentOrder: null }
+                    { status: "Disponible", currentOrder: null }
                 );
             }
 
@@ -929,20 +789,25 @@ const updateOrder = async (req, res, next) => {
                     tenantId,
                     $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
                 },
-                { status: "Available", currentOrder: null }
+                { status: "Disponible", currentOrder: null }
             );
         }
 
         // ✅ Marcar nueva mesa si se asigna
-        if (req.body.table) {
-            await Table.findOneAndUpdate(
-                {
-                    _id: req.body.table,
-                    tenantId,
-                    $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
-                },
-                { status: "Booked", currentOrder: order._id }
-            );
+        if (req.body.table && current.table) {
+            const prevTableId = current.table?._id ? String(current.table._id) : String(current.table);
+            const nextTableId = String(req.body.table);
+
+            if (prevTableId !== nextTableId) {
+                await Table.findOneAndUpdate(
+                    {
+                        _id: prevTableId,
+                        tenantId,
+                        $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                    },
+                    { status: "Disponible", currentOrder: null }
+                );
+            }
         }
 
         const io = req.app?.get?.("io");

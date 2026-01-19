@@ -14,7 +14,7 @@ router.post(
     verifyToken,
     protectTenant,
     requireScope({ level: "client" }),
-    requireRole("Owner", "Admin", "Cashier"),
+    requireRole("Owner", "Admin", "Owner", "Admin", "Cajera", "Camarero"),
     createInvoice
 );
 
