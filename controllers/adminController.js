@@ -286,6 +286,7 @@ exports.updateFiscalConfig = async (req, res) => {
     try {
         const tenantId = req.user.tenantId;
 
+
         // ✅ declarar primero (UNA sola vez)
         const $set = {};
 
