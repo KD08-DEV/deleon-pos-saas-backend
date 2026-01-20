@@ -234,11 +234,45 @@ exports.getFiscalConfig = async (req, res) => {
         const tenantId = req.user.tenantId;
         const tenant = await Tenant.findOne({ tenantId }).select("fiscal features");
 
+        const f = tenant?.features || {};
+        const norm = {
+            ...f,
+            tax: {
+                ...(f.tax || {}),
+                enabled: typeof f.tax?.enabled === "boolean" ? f.tax.enabled : true,
+            },
+            tip: {
+                ...(f.tip || {}),
+                enabled: typeof f.tip?.enabled === "boolean" ? f.tip.enabled : true,
+            },
+            discount: {
+                ...(f.discount || {}),
+                enabled: typeof f.discount?.enabled === "boolean" ? f.discount.enabled : true,
+            },
+            orderSources: {
+                ...(f.orderSources || {}),
+                pedidosYa: {
+                    ...(f.orderSources?.pedidosYa || {}),
+                    enabled: typeof f.orderSources?.pedidosYa?.enabled === "boolean"
+                        ? f.orderSources.pedidosYa.enabled
+                        : false,
+                    commissionRate: Number(f.orderSources?.pedidosYa?.commissionRate ?? 0.26),
+                },
+                uberEats: {
+                    ...(f.orderSources?.uberEats || {}),
+                    enabled: typeof f.orderSources?.uberEats?.enabled === "boolean"
+                        ? f.orderSources.uberEats.enabled
+                        : false,
+                    commissionRate: Number(f.orderSources?.uberEats?.commissionRate ?? 0.22),
+                },
+            },
+        };
+
         return res.json({
             success: true,
             data: {
                 fiscal: tenant?.fiscal || null,
-                features: tenant?.features || {},
+                features: norm,
             },
         });
     } catch (e) {
@@ -247,36 +281,31 @@ exports.getFiscalConfig = async (req, res) => {
 };
 
 
+
 exports.updateFiscalConfig = async (req, res) => {
     try {
         const tenantId = req.user.tenantId;
 
+        // ✅ declarar primero (UNA sola vez)
+        const $set = {};
 
-        const fiscalEnabled = !!req.body?.fiscalEnabled;
+        // ✅ leer values
+        const fiscalEnabled = req.body?.fiscalEnabled;
         const taxEnabled = req.body?.features?.tax?.enabled;
         const tipEnabled = req.body?.features?.tip?.enabled;
+        const discountEnabled = req.body?.features?.discount?.enabled;
         const orderSources = req.body?.features?.orderSources;
 
+        // ✅ SOLO setear si viene boolean (para que false se guarde)
+        if (typeof fiscalEnabled === "boolean") $set["fiscal.enabled"] = fiscalEnabled;
+        if (typeof taxEnabled === "boolean") $set["features.tax.enabled"] = taxEnabled;
+        if (typeof tipEnabled === "boolean") $set["features.tip.enabled"] = tipEnabled;
+        if (typeof discountEnabled === "boolean") $set["features.discount.enabled"] = discountEnabled;
 
         const ncfConfig = req.body?.ncfConfig || {};
         const B01 = ncfConfig.B01;
         const B02 = ncfConfig.B02;
-        const discountEnabled = req.body?.features?.discount?.enabled;
-        const $set = {};
-        if (typeof discountEnabled === "boolean") $set["features.discount.enabled"] = discountEnabled;
 
-
-
-
-        // fiscal enabled
-        $set["fiscal.enabled"] = fiscalEnabled;
-
-        // features toggles (solo si vienen)
-        if (typeof taxEnabled === "boolean") $set["features.tax.enabled"] = taxEnabled;
-        if (typeof tipEnabled === "boolean") $set["features.tip.enabled"] = tipEnabled;
-
-        // Reusa tu buildUpdateForType pero apuntando a fiscal.ncfConfig...
-        // + permitir "active" si viene
         const buildUpdateForType = (type, data) => {
             const u = {};
             if (!data) return u;
@@ -289,9 +318,7 @@ exports.updateFiscalConfig = async (req, res) => {
                 }
             });
 
-            if ("active" in data) {
-                u[`fiscal.ncfConfig.${type}.active`] = !!data.active;
-            }
+            if ("active" in data) u[`fiscal.ncfConfig.${type}.active`] = !!data.active;
 
             if ("expiresAt" in data) {
                 if (!data.expiresAt) u[`fiscal.ncfConfig.${type}.expiresAt`] = null;
@@ -307,6 +334,7 @@ exports.updateFiscalConfig = async (req, res) => {
 
         Object.assign($set, buildUpdateForType("B01", B01));
         Object.assign($set, buildUpdateForType("B02", B02));
+
         if (orderSources?.pedidosYa) {
             if (typeof orderSources.pedidosYa.enabled === "boolean") {
                 $set["features.orderSources.pedidosYa.enabled"] = orderSources.pedidosYa.enabled;
@@ -329,24 +357,19 @@ exports.updateFiscalConfig = async (req, res) => {
             }
         }
 
-
         const updated = await Tenant.findOneAndUpdate(
             { tenantId },
             { $set },
             { new: true }
         ).select("fiscal features");
-        console.log("[ADMIN] updated.features:", updated?.features);
-        console.log("[ADMIN] updated.fiscal.enabled:", updated?.fiscal?.enabled);
-        const io = req.app.get("io");
-        console.log("[socket] emit configUpdated", tenantId, "io?", !!io);
 
+        const io = req.app.get("io");
         if (io) {
             io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", {
                 tenantId,
                 features: updated.features,
                 fiscal: updated.fiscal,
             });
-            console.log("[socket] emitted to room:", `tenant:${tenantId}`);
         }
 
         return res.json({
@@ -357,6 +380,7 @@ exports.updateFiscalConfig = async (req, res) => {
         return res.status(400).json({ success: false, message: e.message });
     }
 };
+
 
 // 🔹 Uso del plan: usuarios, platos, mesas y límites
 exports.getUsage = async (req, res) => {

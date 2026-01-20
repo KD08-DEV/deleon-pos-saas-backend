@@ -99,7 +99,7 @@ const orderSchema = new mongoose.Schema(
             required: false,
             default: null,
         },
-        paymentMethod: { type: String, enum: ["Efectivo", "Tarjeta", "Transferencia", "Pedido Ya", "Uber Eats"], default: "Efectivo" },
+        paymentMethod: { type: String, enum: ["Efectivo", "Tarjeta", "Transferencia", "Pedido Ya", "Uber Eats", "Otros"], default: "Efectivo" },
         user: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // quien creó la orden
     },
     { timestamps: true }

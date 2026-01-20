@@ -793,12 +793,21 @@ const updateOrder = async (req, res, next) => {
             );
         }
 
-        // ✅ Marcar nueva mesa si se asigna
-        if (req.body.table && current.table) {
-            const prevTableId = current.table?._id ? String(current.table._id) : String(current.table);
+        // ✅ Manejar cambio/asignación de mesa (libera anterior y ocupa nueva)
+        if (req.body.table) {
+            const incomingStatusNow = incomingStatus; // ya lo tienes calculado arriba
             const nextTableId = String(req.body.table);
 
-            if (prevTableId !== nextTableId) {
+            if (!mongoose.Types.ObjectId.isValid(nextTableId)) {
+                return next(createHttpError(400, "INVALID_TABLE_ID"));
+            }
+
+            const prevTableId = current.table
+                ? (current.table?._id ? String(current.table._id) : String(current.table))
+                : null;
+
+            // Si cambió la mesa, libera la anterior
+            if (prevTableId && prevTableId !== nextTableId) {
                 await Table.findOneAndUpdate(
                     {
                         _id: prevTableId,
@@ -808,7 +817,20 @@ const updateOrder = async (req, res, next) => {
                     { status: "Disponible", currentOrder: null }
                 );
             }
+
+            // Ocupa la nueva mesa (solo si la orden NO está cancelada/completada)
+            if (incomingStatusNow !== "Cancelado" && incomingStatusNow !== "Completado") {
+                await Table.findOneAndUpdate(
+                    {
+                        _id: nextTableId,
+                        tenantId,
+                        $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                    },
+                    { status: "Ocupada", currentOrder: id } // id es el de la orden (req.params.id)
+                );
+            }
         }
+
 
         const io = req.app?.get?.("io");
         if (io) {

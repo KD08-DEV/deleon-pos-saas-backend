@@ -5,6 +5,8 @@ const requireScope = require("../middlewares/scope");
 const requireRole  = require("../middlewares/requireRole");
 const { exportAllInvoices } = require("../controllers/reportExportController");
 const { exportExcel } = require("../controllers/reportExportController");
+const { getCurrentCashSession, openCashSession } = require("../controllers/cashSessionController");
+
 
 
 
@@ -39,24 +41,24 @@ router.use(verifyToken );
 router.get(
     "/reports/export/invoices",
     requireScope({ level: "tenant" }),
-    requireRole("Owner", "Admin"),
+    requireRole("Owner", "Admin","Cajera"),
     exportAllInvoices
 );
 
-router.get("/reports",   requireScope({ level: "tenant" }), requireRole("Owner","Admin"), getReports);
+router.get("/reports",   requireScope({ level: "tenant" }), requireRole("Owner","Admin","Cajera"), getReports);
 router.get("/employees", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), getEmployees);
 router.get("/users",     requireScope({ level: "tenant" }), requireRole("Owner","Admin"), getUsers);
 router.get("/usage",     requireScope({ level: "tenant" }), requireRole("Owner","Admin"), getUsage);
 router.get(
     "/reports/export/excel",
     requireScope({ level: "tenant" }),
-    requireRole("Owner", "Admin"),
+    requireRole("Owner", "Admin","Cajera"),
     exportExcel
 );
 router.get(
     "/fiscal-config",
     requireScope({ level: "tenant" }),
-    requireRole("Owner", "Admin"),
+    requireRole("Owner", "Admin", "Cajera", "Camarero"),
     getFiscalConfig
 );
 
@@ -78,7 +80,7 @@ router.patch(
 router.get(
     "/suppliers",
     requireScope({ level: "tenant" }),
-    requireRole("Owner", "Admin"),
+    requireRole("Owner","Admin","Cajera","Camarero"),
     getSuppliers
 );
 router.post(
@@ -104,7 +106,7 @@ router.delete(
 router.get(
     "/inventory/categories",
     requireScope({ level: "tenant" }),
-    requireRole("Owner", "Admin"),
+    requireRole("Owner","Admin","Cajera","Camarero"),
     getCategories
 );
 router.post(
@@ -125,5 +127,18 @@ router.delete(
     requireRole("Owner", "Admin"),
     deleteCategory
 );
+
+router.get("/cash-session/current",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    getCurrentCashSession
+);
+
+router.post("/cash-session/open",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    openCashSession
+);
+
 
 module.exports = router;
