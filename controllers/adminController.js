@@ -357,6 +357,39 @@ exports.updateFiscalConfig = async (req, res) => {
                 $set["features.orderSources.uberEats.commissionRate"] = r;
             }
         }
+        const tenantPrev = await Tenant.findOne({ tenantId }).select("features");
+        const prev = tenantPrev?.features || {};
+        const tenantPrev2 = await Tenant.findOne({ tenantId }).select("features fiscal");
+        const prevFiscalEnabled =
+            typeof tenantPrev2?.fiscal?.enabled === "boolean" ? tenantPrev2.fiscal.enabled : true;
+
+        const currentFiscalEnabled =
+            typeof fiscalEnabled === "boolean" ? fiscalEnabled : prevFiscalEnabled;
+
+
+
+        const currentTaxEnabled =
+            typeof taxEnabled === "boolean"
+                ? taxEnabled
+                : (typeof prev?.tax?.enabled === "boolean" ? prev.tax.enabled : true);
+
+        const currentTipEnabled =
+            typeof tipEnabled === "boolean"
+                ? tipEnabled
+                : (typeof prev?.tip?.enabled === "boolean" ? prev.tip.enabled : true);
+
+        const currentDiscountEnabled =
+            typeof discountEnabled === "boolean"
+                ? discountEnabled
+                : (typeof prev?.discount?.enabled === "boolean" ? prev.discount.enabled : true);
+
+// SIEMPRE setearlos (para que nunca queden undefined)
+
+        $set["fiscal.enabled"] = currentFiscalEnabled;
+        $set["features.tax.enabled"] = currentTaxEnabled;
+        $set["features.tip.enabled"] = currentTipEnabled;
+        $set["features.discount.enabled"] = currentDiscountEnabled;
+
 
         const updated = await Tenant.findOneAndUpdate(
             { tenantId },
