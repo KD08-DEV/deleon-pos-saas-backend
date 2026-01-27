@@ -11,7 +11,10 @@ const {
     deleteDish,
     getDishRecipe,
     updateDishRecipe,
+    createIngredient,
+    listIngredients,
 } = require("../controllers/dishController");
+
 
 const router = express.Router();
 
@@ -60,5 +63,20 @@ router.put(
     requireRole("Owner", "Admin"),
     updateDishRecipe
 );
+
+// INGREDIENTS (NEW)
+router.post(
+    "/ingredients",
+    requireRole("Owner", "Admin"),
+    createIngredient
+);
+
+router.get(
+    "/ingredients",
+    requireRole("Owner", "Admin", "Cajera", "Camarero"),
+    listIngredients
+);
+
+
 
 module.exports = router;

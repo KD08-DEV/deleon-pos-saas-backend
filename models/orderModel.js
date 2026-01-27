@@ -25,29 +25,36 @@ const orderSchema = new mongoose.Schema(
         // 🔐 multi-tenant
         tenantId: { type: String, required: true, index: true },
         clientId: { type: String, required: true, index: true },
+        customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null },
+
 
         customerDetails: {
             name: { type: String, trim: true },
             phone: { type: String, default: "" },
-            guests: { type: Number, default: 0, min: 0 },
+            address: { type: String, default: "" },
+            guests: { type: Number, default: 1, min: 0 },
             rnc: String,
             rncCedula: String,
+
         },
         orderStatus: {
             type: String,
             enum: ["En Progreso", "Listo", "Completado", "Cancelado"], // ⟵ añadimos Cancelled
             default: "En Progreso",
         },
+        isDraft: { type: Boolean, default: true, index: true },
+
         invoicePath: { type: String, default: "" },
         invoiceUrl: { type: String, default: "" },
         orderSource: {
             type: String,
-            enum: ["DINE_IN", "TAKEOUT", "PEDIDOSYA", "UBEREATS"],
+            enum: ["DINE_IN", "TAKEOUT", "PEDIDOSYA", "UBEREATS", "DELIVERY"],
             default: "DINE_IN",
             index: true,
         },
 
-// Comisión congelada en el momento de crear/cambiar el canal
+
+    // Comisión congelada en el momento de crear/cambiar el canal
         commissionRate: { type: Number, default: 0 },     // 0.26, 0.22, etc
         commissionAmount: { type: Number, default: 0 },   // monto calculado
         netTotal: { type: Number, default: 0 },
@@ -67,6 +74,7 @@ const orderSchema = new mongoose.Schema(
             // ITBIS
             taxEnabled: { type: Boolean, default: true },
             tax: { type: Number, default: 0 },
+            deliveryFee: { type: Number, default: 0 },
 
             // total final
             totalWithTax: { type: Number, default: 0 },

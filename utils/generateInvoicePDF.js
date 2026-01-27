@@ -148,9 +148,17 @@ async function generateInvoicePDF(orderId, tenantId) {
             order?.customerRNC ||
             "";
 
+        const customerPhone =
+            order?.customerDetails?.phone ||
+            "";
+
+        const customerAddress =
+            order?.customerDetails?.address ||
+            "";
 
 
-    // ----- totals -----
+
+        // ----- totals -----
         const items = Array.isArray(order?.items) ? order.items : [];
         const computedSubtotal = items.reduce((acc, it) => acc + getLineNet(it), 0);
 
@@ -158,6 +166,8 @@ async function generateInvoicePDF(orderId, tenantId) {
         const discount = Number(order?.bills?.discount ?? 0);
         const tip = Number(order?.bills?.tipAmount ?? order?.bills?.tip ?? 0);
         const totalTax = Number(order?.bills?.tax ?? 0);
+        const deliveryFee = Number(order?.bills?.deliveryFee ?? 0);
+
 
         // ADD:
         const taxRate = getTaxRate(order);
@@ -221,6 +231,9 @@ async function generateInvoicePDF(orderId, tenantId) {
         doc.moveDown(0.5);
         doc.text(`Cliente: ${customerName}`);
         if (customerRnc) doc.text(`RNC/Cédula: ${customerRnc}`);
+        if (customerPhone) doc.text(`Teléfono: ${customerPhone}`);
+        if (customerAddress) doc.text(`Dirección: ${customerAddress}`);
+
 
         doc.moveDown(1);
 
@@ -272,6 +285,10 @@ async function generateInvoicePDF(orderId, tenantId) {
         if (discount > 0) doc.text(`Descuento: -${moneyRD(discount)}`);
         doc.text(`Subtotal: ${moneyRD(subtotal)}`);
         doc.text(`Propina: ${moneyRD(tip)}`);
+        if (deliveryFee > 0) {
+            doc.text(`Envío: ${moneyRD(deliveryFee)}`);
+        }
+
         doc.text(`ITBIS: ${moneyRD(totalTax)}`);
 
         if (isDelivery && commissionAmount > 0) {

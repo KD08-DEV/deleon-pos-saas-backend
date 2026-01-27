@@ -6,6 +6,8 @@ const Tenant = require("../models/tenantModel");
 const Dish = require("../models/dish"); // ajusta si el nombre es dishModel.js
 // const InventoryItem = require("../models/inventoryItemModel"); // DEPRECATED: Ya no se usa InventoryItem, solo Dish
 // const InventoryMovement = require("../models/inventoryMovementModel"); // DEPRECATED
+const Customer = require("../models/customerModel");
+
 
 // Impuesto por defecto (0.25% para coincidir con tu UI)
 const TAX_RATE = Number(process.env.TAX_RATE ?? 0.18);
@@ -14,7 +16,7 @@ const TAX_RATE = Number(process.env.TAX_RATE ?? 0.18);
 function round2(n) {
     return Math.round((Number(n) || 0) * 100) / 100;
 }
-const ORDER_SOURCES = ["DINE_IN", "TAKEOUT", "PEDIDOSYA", "UBEREATS"];
+const ORDER_SOURCES = ["DINE_IN", "TAKEOUT", "PEDIDOSYA", "UBEREATS", "DELIVERY"];
 function normalizeSource(v) {
     const s = String(v || "").trim().toUpperCase();
     if (!s) return "DINE_IN";
@@ -30,6 +32,11 @@ function getCommissionRateFromTenant(tenant, source) {
     if (source === "UBEREATS") {
         if (os?.uberEats?.enabled !== true) return { allowed: false, rate: 0 };
         return { allowed: true, rate: Number(os?.uberEats?.commissionRate ?? 0.22) };
+    }
+    // ADD:
+    if (source === "DELIVERY") {
+        if (os?.delivery?.enabled !== true) return { allowed: false, rate: 0 };
+        return { allowed: true, rate: 0 }; // delivery interno no tiene comisión
     }
     // DINE_IN / TAKEOUT por defecto sin comisión
     return { allowed: true, rate: 0 };
@@ -147,6 +154,7 @@ const addOrder = async (req, res, next) => {
         const clientId = req.clientId;
 
         const {
+            customerId = null,
             customerDetails = {},
             orderStatus,
             items = [],
@@ -200,6 +208,8 @@ const addOrder = async (req, res, next) => {
         const normItems = Array.isArray(items) && items.length
             ? normalizeAndPriceItems(items)
             : [];
+        const isDraft = normItems.length === 0;
+
 
         const features = tenant?.features || {};
 
@@ -211,6 +221,12 @@ const addOrder = async (req, res, next) => {
 
         tip = round2(tip);
 
+        // ADD: Envío
+        let deliveryFee = 0;
+        if (incomingBills.deliveryFee !== undefined) deliveryFee = Number(incomingBills.deliveryFee);
+        deliveryFee = round2(deliveryFee);
+        if (deliveryFee < 0) deliveryFee = 0;
+
 
         // Calcular totales
         const subtotal = round2(normItems.reduce((s, i) => s + i.price, 0));
@@ -221,23 +237,60 @@ const addOrder = async (req, res, next) => {
         const taxable = round2(subtotal - discountAmt);
         const tax = round2(taxable * TAX_RATE);
 
-        const totalBeforeTip = round2(taxable + tax);      // base para comisión (sin tip)
+        const baseBeforeTip = round2(taxable + tax);
+
+        const totalBeforeTip = round2(baseBeforeTip + deliveryFee);
+        // base para comisión (sin tip)
         const totalWithTax = round2(totalBeforeTip + tip);
-        const { commissionAmount, netTotal } = computeCommission(totalBeforeTip, totalWithTax, rate);
+        const { commissionAmount, netTotal } = computeCommission(baseBeforeTip, totalWithTax, rate);
 
 
 
         // Crear payload base
+        // ✅ Resolver customer (cliente final) si viene customerId
+        let resolvedCustomerId = null;
+
+        let resolvedCustomerDetails = {
+            name: String(customerDetails?.name ?? ""),
+            phone: String(customerDetails?.phone ?? ""),
+            address: String(customerDetails?.address ?? ""), // ✅ NUEVO
+            guests: Number(customerDetails?.guests ?? 0),
+        };
+
+        if (customerId) {
+            if (!mongoose.Types.ObjectId.isValid(customerId)) {
+                return next(createHttpError(400, "INVALID_CUSTOMER_ID"));
+            }
+
+            const found = await Customer.findOne({
+                _id: customerId,
+                tenantId,
+                clientId,
+                isActive: true,
+            }).lean();
+
+            if (!found) {
+                return next(createHttpError(404, "CUSTOMER_NOT_FOUND"));
+            }
+
+            resolvedCustomerId = found._id;
+            resolvedCustomerDetails = {
+                name: found.name || "",
+                phone: found.phone || "",
+                address: found.address || "",
+                guests: Number(customerDetails?.guests ?? 0), // guests es por orden, no por customer
+            };
+        }
+
+
 
         const payload = {
             tenantId,
             clientId,
-            customerDetails: {
-                name: String(customerDetails?.name ?? ""),
-                phone: String(customerDetails?.phone ?? ""),
-                guests: Number(customerDetails?.guests ?? 0),
-            },
+            customerId: resolvedCustomerId,            // ✅ NUEVO (si no hay, queda null)
+            customerDetails: resolvedCustomerDetails,  // ✅ NUEVO (snapshot)
             orderStatus: normalizedStatus,
+            isDraft,
             bills: {
                 subtotal,
                 total: subtotal,
@@ -246,6 +299,9 @@ const addOrder = async (req, res, next) => {
                 taxEnabled: true,
                 tip,
                 tipAmount: tip,
+
+                deliveryFee,
+
                 totalWithTax,
             },
             orderSource: source,
@@ -308,10 +364,26 @@ const getOrderById = async (req, res, next) => {
 
 const getOrders = async (req, res, next) => {
     try {
-        const orders = await Order.find({ tenantId: req.user.tenantId, clientId: req.clientId  })
+        const baseQuery = {
+            tenantId: req.user.tenantId,
+            clientId: req.clientId,
+        };
+
+        const includeDrafts = String(req.query.includeDrafts || "") === "1";
+
+        const query = includeDrafts
+            ? baseQuery
+            : {
+                ...baseQuery,
+                isDraft: { $ne: true },
+                "items.0": { $exists: true }, // extra seguridad: mínimo 1 item
+            };
+
+        const orders = await Order.find(query)
             .sort({ createdAt: -1, _id: -1 })
             .populate("table")
             .populate("user", "name email role");
+
 
         res.status(200).json({ data: orders });
     } catch (error) {
@@ -614,6 +686,10 @@ const updateOrder = async (req, res, next) => {
             safeUpdate.items = normalizeAndPriceItems(req.body.items);
         }
 
+        // Draft logic: si tiene al menos 1 item => ya no es borrador
+        const finalItems = Array.isArray(safeUpdate.items) ? safeUpdate.items : [];
+        safeUpdate.isDraft = finalItems.length === 0;
+
         // =========================
         // RECALCULO TOTALES
         // =========================
@@ -626,6 +702,10 @@ const updateOrder = async (req, res, next) => {
         }
 
         const incomingBills = req.body.bills || {};
+
+        let deliveryFee = Number(incomingBills.deliveryFee ?? safeUpdate.bills.deliveryFee ?? 0);
+        deliveryFee = round2(deliveryFee);
+        if (deliveryFee < 0) deliveryFee = 0;
 
         // Descuento
         let discount = 0;
@@ -675,8 +755,9 @@ const updateOrder = async (req, res, next) => {
         }
         tip = round2(tip);
 
-        const totalBeforeTip = round2(taxable + tax);      // base comisión (sin tip)
-        const totalWithTax = round2(totalBeforeTip + tip); // total final (con tip)
+        const baseBeforeTip = round2(taxable + tax);
+        const totalBeforeTip = round2(baseBeforeTip + deliveryFee);
+        const totalWithTax = round2(totalBeforeTip + tip);
 
 // =========================
 // CANAL / COMISION
@@ -704,7 +785,7 @@ const updateOrder = async (req, res, next) => {
             if (allowed) finalRate = Number(rate || 0);
         }
 
-        const { commissionAmount, netTotal } = computeCommission(totalBeforeTip, totalWithTax, finalRate);
+        const { commissionAmount, netTotal } = computeCommission(baseBeforeTip, totalWithTax, finalRate);
 
         safeUpdate.orderSource = finalSource;
         safeUpdate.commissionRate = round2(finalRate);
@@ -722,6 +803,7 @@ const updateOrder = async (req, res, next) => {
             tax,
             tipAmount: tip,
             tip,
+            deliveryFee,
             totalWithTax,
         };
 

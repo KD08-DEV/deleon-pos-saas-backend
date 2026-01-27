@@ -13,6 +13,7 @@ const dishSchema = new mongoose.Schema(
             default: null,
             index: true,
         },
+        isInventoryItem: { type: Boolean, default: false, index: true },
 
         imageUrl: { type: String },
 

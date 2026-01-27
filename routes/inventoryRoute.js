@@ -58,6 +58,23 @@ router.post("/movements", requireRole("Owner", "Admin"), inventoryController.cre
 router.get("/export/items.csv", requireRole("Owner", "Admin"), inventoryExportController.exportItemsCSV);
 router.get("/export/movements.csv", requireRole("Owner", "Admin"), inventoryExportController.exportMovementsCSV);
 router.get("/consumption", inventoryController.consumption);
+// Alias: merma = movement type "waste"
+router.post("/merma", requireRole("Owner", "Admin"), (req, res, next) => {
+    req.body = { ...(req.body || {}), type: "waste" };
+    return inventoryController.createMovement(req, res, next);
+});
+router.get("/merma/summary", requireRole("Owner", "Admin"), inventoryController.getMermaSummary);
+router.post("/merma/batches", requireRole("Owner", "Admin"), inventoryController.createMermaBatch);
+router.get("/merma/batches", requireRole("Owner", "Admin"), inventoryController.listMermaBatches);
+router.patch("/merma/batches/:id/close", requireRole("Owner", "Admin"), inventoryController.closeMermaBatch);
+router.patch(
+    "/merma/batches/:id",
+    verifyToken,
+    requireRole("Owner", "Admin"),
+    inventoryController.updateMermaBatch
+);
+
+
 
 
 module.exports = router;

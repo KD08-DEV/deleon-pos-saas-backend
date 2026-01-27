@@ -3,17 +3,38 @@ const mongoose = require("mongoose");
 const inventoryMovementSchema = new mongoose.Schema(
     {
         tenantId: { type: String, required: true, index: true },
-        itemId: { type: mongoose.Schema.Types.ObjectId, ref: "InventoryItem", required: true, index: true },
 
-        type: {
-            type: String,
-            enum: ["purchase", "adjustment", "waste", "sale"],
+        // ✅ IMPORTANTE: para cierres/reporte por sucursal/cliente
+        clientId: { type: String, default: "default", index: true },
+
+        // ✅ En tu sistema el inventario realmente está ligado a Dish (platos/productos)
+        itemId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Dish",
             required: true,
             index: true,
         },
 
-        qty: { type: Number, required: true }, // purchase/waste => positivo; adjustment => puede ser +/-.
-        unitCost: { type: Number, default: null }, // útil para compras
+        type: {
+            type: String,
+            enum: ["purchase", "adjustment", "waste", "sale", "conversion"],
+            required: true,
+            index: true,
+        },
+
+        // waste (merma) => positivo (qty perdida)
+        // adjustment => puede ser +/-.
+        qty: { type: Number, required: true },
+
+        unitCost: { type: Number, default: null },
+
+        // ✅ costo total del movimiento (para merma es clave)
+        costAmount: { type: Number, default: null },
+
+        // ✅ si es conversión crudo->cocido
+        fromItemId: { type: mongoose.Schema.Types.ObjectId, ref: "Dish", default: null },
+        toItemId: { type: mongoose.Schema.Types.ObjectId, ref: "Dish", default: null },
+        toQty: { type: Number, default: null },
 
         note: { type: String, default: "", trim: true },
 
@@ -25,6 +46,6 @@ const inventoryMovementSchema = new mongoose.Schema(
     { timestamps: true }
 );
 
-inventoryMovementSchema.index({ tenantId: 1, createdAt: -1 });
+inventoryMovementSchema.index({ tenantId: 1, clientId: 1, type: 1, createdAt: -1 });
 
 module.exports = mongoose.model("InventoryMovement", inventoryMovementSchema);

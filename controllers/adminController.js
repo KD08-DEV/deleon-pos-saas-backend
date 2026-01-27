@@ -6,14 +6,56 @@ const Dish = require("../models/dish");
 const Table = require("../models/tableModel");
 const Tenant = require("../models/tenantModel");
 const TIERS = require("../config/planTiers");
+const InventoryMovement = require("../models/inventoryMovementModel");
+
 
 
 // 🔹 Obtener reportes (ventas filtradas + resumen diario)
 exports.getReports = async (req, res) => {
     try {
-
         const { from, to, method, user } = req.query;
-        const filter = { tenantId: req.user.tenantId };
+
+        const getClientId = (req) => {
+            // prioridad: scope -> user -> headers (por si lo mandas)
+            return (
+                req.scope?.clientId ||
+                req.user?.clientId ||
+                req.user?.client?._id ||
+                req.headers["x-client-id"] ||
+                ""
+            );
+        };
+        const tenantId = req.user.tenantId;
+        const clientId = getClientId(req);
+
+        // ✅ MERMA (waste) por rango de fechas (costo y cantidad)
+        const mermaFilter = {
+            tenantId,
+            clientId,
+            type: "waste",
+        };
+
+        if (from && to) {
+            mermaFilter.createdAt = { $gte: new Date(from), $lte: new Date(to) };
+        }
+
+        const mermaAgg = await InventoryMovement.aggregate([
+            { $match: mermaFilter },
+            {
+                $group: {
+                    _id: null,
+                    mermaQty: { $sum: "$qty" },
+                    mermaCost: { $sum: { $ifNull: ["$costAmount", 0] } },
+                },
+            },
+        ]);
+
+        const mermaQty = Number(mermaAgg?.[0]?.mermaQty || 0);
+        const mermaCost = Number(mermaAgg?.[0]?.mermaCost || 0);
+
+
+
+        const filter = { tenantId, clientId };
 
         // Filtrar por rango de fechas
         if (from && to) {
@@ -60,6 +102,9 @@ exports.getReports = async (req, res) => {
             orderCount,
             totalCommission,
             totalNet,
+            mermaQty,
+            mermaCost,
+            netSales: Number((totalSales - mermaCost).toFixed(2)),
             avgTicket: Number(avgTicket.toFixed(2)),
             cashSales: orders
                 .filter((o) => o.paymentMethod === "Efectivo")
@@ -104,7 +149,6 @@ exports.getEmployees = async (req, res) => {
     try {
         const employees = await User.find({
             tenantId: req.user.tenantId,
-            role: { $ne: "Admin" },
         }).select("_id name email phone role");
         res.status(200).json({ success: true, data: employees });
     } catch (error) {
@@ -135,6 +179,7 @@ exports.updateEmployee = async (req, res) => {
         const { id } = req.params;
         const { name, email, phone, role, password } = req.body;
 
+
         // Verificar que el empleado existe y pertenece al mismo tenant
         const employee = await User.findOne({ _id: id, tenantId: req.user.tenantId });
         
@@ -144,8 +189,11 @@ exports.updateEmployee = async (req, res) => {
 
         // No permitir editar al Admin principal (puedes ajustar esta lógica)
         // Si quieres permitir editar admin, puedes remover esta validación
-        if (employee.role === "Admin" && role !== "Admin") {
-            return res.status(400).json({ success: false, message: "No se puede cambiar el rol del administrador principal" });
+        if (employee.role === "Admin" && role && role !== "Admin") {
+            return res.status(400).json({
+                success: false,
+                message: "No se puede cambiar el rol del administrador principal",
+            });
         }
 
         // Preparar campos a actualizar
@@ -173,6 +221,62 @@ exports.updateEmployee = async (req, res) => {
         if (role && ["Admin", "Camarero", "Cajera"].includes(role)) {
             updateData.role = role;
         }
+        // ✅ Enforce plan limits on role change
+        if (role && role !== employee.role) {
+            const tenantId = req.user.tenantId;
+
+            const tenant = await Tenant.findOne({ tenantId }).select("plan");
+            const tier = TIERS[tenant?.plan] || TIERS.emprendedor;
+            const limits = tier.limits || {};
+
+            // Excluir al usuario que estás editando del conteo
+            const base = { tenantId, status: "active", user: { $ne: employee._id } };
+
+            const isUnlimited = (v) => v === null || v === undefined;
+
+            if (role === "Admin") {
+                const adminsCount = await Membership.countDocuments({
+                    ...base,
+                    role: { $in: ["Owner", "Admin"] },
+                });
+
+                if (!isUnlimited(limits.maxAdmins) && adminsCount + 1 > limits.maxAdmins) {
+                    return res.status(409).json({
+                        success: false,
+                        message: `Límite de Admins alcanzado (${limits.maxAdmins}). Mejora el plan o cambia otro Admin de rol.`,
+                    });
+                }
+            }
+
+            if (role === "Cajera") {
+                const cashiersCount = await Membership.countDocuments({
+                    ...base,
+                    role: "Cajera",
+                });
+
+                if (!isUnlimited(limits.maxCashiers) && cashiersCount + 1 > limits.maxCashiers) {
+                    return res.status(409).json({
+                        success: false,
+                        message: `Límite de Cajeras alcanzado (${limits.maxCashiers}). Mejora el plan o cambia otro usuario de rol.`,
+                    });
+                }
+            }
+
+            if (role === "Camarero") {
+                const waitersCount = await Membership.countDocuments({
+                    ...base,
+                    role: "Camarero",
+                });
+
+                if (!isUnlimited(limits.maxWaiters) && waitersCount + 1 > limits.maxWaiters) {
+                    return res.status(409).json({
+                        success: false,
+                        message: `Límite de Camareros alcanzado (${limits.maxWaiters}). Mejora el plan o cambia otro usuario de rol.`,
+                    });
+                }
+            }
+        }
+
         // Actualizar contraseña si se proporciona
         if (password && password.trim()) {
             if (password.length < 6) {
@@ -265,6 +369,12 @@ exports.getFiscalConfig = async (req, res) => {
                         : false,
                     commissionRate: Number(f.orderSources?.uberEats?.commissionRate ?? 0.22),
                 },
+                delivery: {
+                    ...(f.orderSources?.delivery || {}),
+                    enabled: typeof f.orderSources?.delivery?.enabled === "boolean"
+                        ? f.orderSources.delivery.enabled
+                        : false,
+                },
             },
         };
 
@@ -318,6 +428,11 @@ exports.updateFiscalConfig = async (req, res) => {
                     u[`fiscal.ncfConfig.${type}.${k}`] = Math.floor(n);
                 }
             });
+            if (orderSources?.delivery) {
+                if (typeof orderSources.delivery.enabled === "boolean") {
+                    $set["features.orderSources.delivery.enabled"] = orderSources.delivery.enabled;
+                }
+            }
 
             if ("active" in data) u[`fiscal.ncfConfig.${type}.active`] = !!data.active;
 

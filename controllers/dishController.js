@@ -324,3 +324,80 @@ exports.deleteDish = async (req, res, next) => {
         next(error);
     }
 };
+// ✅ Ingredientes (inventario simple usando Dish)
+exports.createIngredient = async (req, res) => {
+    try {
+        const tenantId = req.user?.tenantId;
+        const clientId = req.clientId || "default";
+
+        const { name, category, sellMode, weightUnit, description } = req.body;
+
+        if (!tenantId) {
+            return res.status(401).json({ success: false, message: "TenantId no encontrado" });
+        }
+
+        // nombre puede ser opcional si tú quieres, pero para ingredientes conviene requerirlo.
+        if (!name || !String(name).trim()) {
+            return res.status(400).json({ success: false, message: "El nombre es requerido" });
+        }
+
+        // Evitar duplicados por tenant + client + name
+        const exists = await Dish.findOne({
+            tenantId,
+            clientId,
+            isInventoryItem: true,
+            name: String(name).trim(),
+        });
+
+        if (exists) {
+            return res.status(409).json({
+                success: false,
+                code: "INGREDIENT_ALREADY_EXISTS",
+                message: "Ya existe un ingrediente con ese nombre",
+                data: exists,
+            });
+        }
+
+        const ingredient = await Dish.create({
+            tenantId,
+            clientId,
+            name: String(name).trim(),
+            category: category || "Ingrediente",
+            price: 0, // importante: Dish requiere price
+            isInventoryItem: true,
+            sellMode: sellMode || "unit",
+            weightUnit: sellMode === "weight" ? (weightUnit || "lb") : undefined,
+            description: description || "",
+        });
+
+        return res.json({ success: true, data: ingredient });
+    } catch (err) {
+        console.error("[createIngredient]", err);
+        return res.status(500).json({ success: false, message: "Error creando ingrediente" });
+    }
+};
+
+exports.listIngredients = async (req, res) => {
+    try {
+        const tenantId = req.user?.tenantId;
+        const clientId = req.clientId || "default";
+
+        if (!tenantId) {
+            return res.status(401).json({ success: false, message: "TenantId no encontrado" });
+        }
+
+        const items = await Dish.find({
+            tenantId,
+            clientId,
+            isInventoryItem: true,
+        })
+            .sort({ name: 1 })
+            .select("_id name category sellMode weightUnit");
+
+        return res.json({ success: true, data: items });
+    } catch (err) {
+        console.error("[listIngredients]", err);
+        return res.status(500).json({ success: false, message: "Error listando ingredientes" });
+    }
+};
+

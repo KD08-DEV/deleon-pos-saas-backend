@@ -5,7 +5,14 @@ const requireScope = require("../middlewares/scope");
 const requireRole  = require("../middlewares/requireRole");
 const { exportAllInvoices } = require("../controllers/reportExportController");
 const { exportExcel } = require("../controllers/reportExportController");
-const { getCurrentCashSession, openCashSession } = require("../controllers/cashSessionController");
+const {
+    getCashSessionByDate,
+    getCurrentCashSession,
+    openCashSession,
+    addCashToSession,
+    adjustOpeningFloat,
+    getCashSessionsRange,
+} = require("../controllers/cashSessionController");
 
 
 
@@ -65,7 +72,7 @@ router.get(
 router.patch(
     "/fiscal-config",
     requireScope({ level: "tenant" }),
-    requireRole("Owner", "Admin"),
+    requireRole("Owner", "Admin", "Cajera", "Camarero"),
     updateFiscalConfig
 );
 
@@ -139,6 +146,35 @@ router.post("/cash-session/open",
     requireRole("Owner", "Admin", "Cajera"),
     openCashSession
 );
+
+router.get(
+    "/cash-session",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    getCashSessionByDate
+);
+router.get(
+    "/cash-session/range",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    getCashSessionsRange
+);
+
+
+router.post(
+    "/cash-session/add",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    addCashToSession
+);
+
+router.patch(
+    "/cash-session/adjust",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin"),
+    adjustOpeningFloat
+);
+
 
 
 module.exports = router;

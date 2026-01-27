@@ -71,6 +71,7 @@ const tenantSchema = new mongoose.Schema(
                 enabled: { type: Boolean, default: true },
                 allowToggle: { type: Boolean, default: true },
             },
+            // Dentro de features.orderSources
             orderSources: {
                 pedidosYa: {
                     enabled: { type: Boolean, default: false },
@@ -80,7 +81,14 @@ const tenantSchema = new mongoose.Schema(
                     enabled: { type: Boolean, default: false },
                     commissionRate: { type: Number, default: 0.22 },
                 },
+
+                // ADD:
+                delivery: {
+                    enabled: { type: Boolean, default: false },
+                    defaultFee: { type: Number, default: 0 },// canal "DELIVERY" interno
+                },
             },
+
         },
 
         status: {
