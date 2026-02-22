@@ -64,40 +64,112 @@ const deleteFromSupabase = async (imageUrl) => {
 };
 
 // --------------------------------------------
+// --------------------------------------------
 // CREATE
 exports.addDish = async (req, res, next) => {
     const clientId = req.clientId || "default";
     try {
-        const { name, price, category, inventoryCategoryId } = req.body;
+        const {
+            name,
+            price,
+            category,
+            inventoryCategoryId,
+            // ✅ nuevos campos
+            sellMode,
+            weightUnit,
+            pricePerLb,
+            unit,
+            isInventoryItem,
+        } = req.body;
 
+        // inventoryCategoryId (si viene)
         let invCatId = null;
-        if (inventoryCategoryId) {
+        if (inventoryCategoryId !== undefined && inventoryCategoryId !== null && inventoryCategoryId !== "") {
             if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
                 return next(createHttpError(400, "inventoryCategoryId inválido"));
             }
             invCatId = inventoryCategoryId;
         }
 
-        if (!name || !price || !category) {
-            return next(createHttpError(400, "Please provide name, price and category!"));
+        // ✅ Validaciones robustas (ojo: price=0 no debe fallar)
+        if (!name || !String(name).trim()) {
+            return next(createHttpError(400, "Please provide name!"));
+        }
+
+        // Si es inventario, permitimos no mandar category y la fijamos.
+        const isInv = String(isInventoryItem) === "true" || isInventoryItem === true;
+
+        // category solo obligatoria para platos de menú
+        const finalCategory = isInv ? "Inventario" : category;
+
+        if (!finalCategory || !String(finalCategory).trim()) {
+            return next(createHttpError(400, "Please provide category!"));
+        }
+
+        // price obligatorio para platos; para inventario lo dejamos en 0
+        const finalPrice = isInv ? 0 : Number(price);
+        if (!isInv) {
+            if (price === undefined || price === null || Number.isNaN(finalPrice) || finalPrice < 0) {
+                return next(createHttpError(400, "Please provide a valid price!"));
+            }
+        }
+
+        // ✅ sellMode / weightUnit / pricePerLb
+        const sm = sellMode !== undefined ? String(sellMode) : undefined;
+        if (sm !== undefined && !["unit", "weight"].includes(sm)) {
+            return next(createHttpError(400, "sellMode inválido"));
+        }
+
+        const wu = weightUnit !== undefined ? String(weightUnit) : undefined;
+        if (wu !== undefined && !["lb", "kg"].includes(wu)) {
+            return next(createHttpError(400, "weightUnit inválido"));
+        }
+
+        // Si es por peso, pricePerLb debe venir válido
+        let pplb = pricePerLb;
+        if ((sm === "weight") || (sm === undefined && false)) {
+            const n = Number(pplb);
+            if (!Number.isFinite(n) || n <= 0) {
+                return next(createHttpError(400, "pricePerLb inválido (requerido cuando sellMode=weight)"));
+            }
+            pplb = n;
+        } else if (pplb !== undefined) {
+            const n = Number(pplb);
+            if (!Number.isFinite(n) || n < 0) {
+                return next(createHttpError(400, "pricePerLb inválido"));
+            }
+            pplb = n;
+        }
+
+        // ✅ unit (si tu UI lo manda para inventario)
+        const u = unit !== undefined ? String(unit) : undefined;
+        if (u !== undefined && !["unidad", "lb", "kg"].includes(u)) {
+            return next(createHttpError(400, "unit inválido"));
         }
 
         let imageUrl = null;
-
         if (req.file) {
             const upload = await uploadToSupabase(req.user.tenantId, req.file);
             imageUrl = upload.publicUrl;
         }
 
         const newDish = await Dish.create({
-            name,
-            price,
-            category,
+            name: String(name).trim(),
+            price: finalPrice,
+            category: String(finalCategory).trim(),
             inventoryCategoryId: invCatId,
+            isInventoryItem: isInv,
             imageUrl,
+            // ✅ guardamos venta por peso desde creación
+            ...(sm !== undefined ? { sellMode: sm } : {}),
+            ...(wu !== undefined ? { weightUnit: wu } : {}),
+            ...(pplb !== undefined ? { pricePerLb: pplb } : {}),
+            ...(u !== undefined ? { unit: u } : {}),
+
             tenantId: req.user.tenantId,
             clientId: clientId,
         });
+
         res.status(201).json({
             success: true,
             message: "Dish added successfully!",
@@ -112,25 +184,49 @@ exports.addDish = async (req, res, next) => {
 // READ
 exports.getDishes = async (req, res, next) => {
     try {
-        const dishes = await Dish.find({ tenantId: req.user.tenantId });
-        res.status(200).json({ success: true, data: dishes });
+        const { includeInventory } = req.query;
+
+        const filter = {
+            tenantId: req.user.tenantId,
+            isArchived: { $ne: true },
+        };
+
+
+        // Por defecto NO incluye ingredientes/inventario puros
+        // (los platos del POS pueden ser inventario y deben seguir saliendo)
+        if (String(includeInventory) !== "true") {
+            filter.category = { $ne: "Inventario" };
+        }
+
+
+        const dishes = await Dish.find(filter).sort({ updatedAt: -1 });
+
+        res.status(200).json({
+            success: true,
+            data: dishes,
+        });
     } catch (error) {
         next(error);
     }
 };
+
 
 // --------------------------------------------
 // UPDATE
 exports.updateDish = async (req, res, next) => {
     try {
         const { id } = req.params;
+
         const {
             name,
             price,
-            category,
+            // category,  // <- YA NO LO USAMOS
             sellMode,
             weightUnit,
             pricePerLb,
+            inventoryCategoryId,
+            isInventoryItem,
+            unit,
         } = req.body;
 
         if (!mongoose.Types.ObjectId.isValid(id)) {
@@ -151,23 +247,66 @@ exports.updateDish = async (req, res, next) => {
             dish.imageUrl = upload.publicUrl;
         }
 
-        if (name !== undefined) dish.name = String(name);
-        if (category !== undefined) dish.category = String(category);
+        if (name !== undefined) dish.name = String(name).trim();
 
-            // >>> AQUI MISMO PEGA ESTO (inventoryCategoryId) <<<
-        const { inventoryCategoryId } = req.body;
-
+        // -----------------------------
+        // INVENTARIO: decidir si es inventario y forzar category
+        // Regla recomendada:
+        // - Si inventoryCategoryId viene con un valor => es inventario
+        // - Si inventoryCategoryId viene ""/null => NO es inventario
+        // - Si además viene isInventoryItem, lo respetamos, pero inventoryCategoryId manda.
+        let invCatId = undefined; // undefined = no tocar; null = limpiar; ObjectId = setear
         if (inventoryCategoryId !== undefined) {
             if (inventoryCategoryId === "" || inventoryCategoryId === null) {
-                dish.inventoryCategoryId = null;
+                invCatId = null;
             } else {
                 if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
                     return next(createHttpError(400, "inventoryCategoryId inválido"));
                 }
-                dish.inventoryCategoryId = inventoryCategoryId;
+                invCatId = inventoryCategoryId;
             }
         }
 
+        const isInvByCat =
+            invCatId !== undefined ? Boolean(invCatId) : Boolean(dish.inventoryCategoryId);
+
+        const isInvByFlag =
+            isInventoryItem !== undefined
+                ? (String(isInventoryItem) === "true" || isInventoryItem === true)
+                : Boolean(dish.isInventoryItem);
+
+        // Si tocaron categoría de inventario, esa decisión manda.
+        const isInv = inventoryCategoryId !== undefined ? isInvByCat : isInvByFlag;
+
+        dish.isInventoryItem = isInv;
+        dish.category = "Inventario"; // <- SIEMPRE "Inventario" según tu requerimiento
+
+        if (invCatId !== undefined) {
+            dish.inventoryCategoryId = invCatId; // null o ObjectId
+        }
+
+        // unit (opcional)
+        if (unit !== undefined) {
+            const u = String(unit);
+            if (!["unidad", "lb", "kg"].includes(u)) {
+                return next(createHttpError(400, "unit inválido"));
+            }
+            dish.unit = u;
+        }
+
+        // price: si es inventario lo forzamos a 0 para evitar inconsistencias
+        if (isInv) {
+            dish.price = 0;
+        } else if (price !== undefined) {
+            const p = Number(price);
+            if (!Number.isFinite(p) || p < 0) {
+                return next(createHttpError(400, "price inválido"));
+            }
+            dish.price = p;
+        }
+
+        // -----------------------------
+        // VENTA POR PESO
         if (sellMode !== undefined) {
             const sm = String(sellMode);
             if (!["unit", "weight"].includes(sm)) {
@@ -184,23 +323,23 @@ exports.updateDish = async (req, res, next) => {
             dish.weightUnit = wu;
         }
 
-        if (price !== undefined) {
-            const p = Number(price);
-            if (!Number.isFinite(p) || p < 0) {
-                return next(createHttpError(400, "price inválido"));
+        // Si es weight, pricePerLb debe ser válido (si lo mandan o si ya está en weight)
+        if (dish.sellMode === "weight") {
+            if (pricePerLb === undefined) {
+                // si no lo envían, permitimos conservar el existente, pero debe ser válido
+                if (dish.pricePerLb === null || dish.pricePerLb === undefined) {
+                    return next(createHttpError(400, "pricePerLb requerido cuando sellMode=weight"));
+                }
+            } else {
+                const pp = Number(pricePerLb);
+                if (!Number.isFinite(pp) || pp <= 0) {
+                    return next(createHttpError(400, "pricePerLb inválido"));
+                }
+                dish.pricePerLb = pp;
             }
-            dish.price = p;
-        }
-
-        if (pricePerLb !== undefined) {
-            const pp = Number(pricePerLb);
-            if (!Number.isFinite(pp) || pp < 0) {
-                return next(createHttpError(400, "pricePerLb inválido"));
-            }
-            dish.pricePerLb = pp;
-        } else if (dish.sellMode === "unit") {
-            // si vuelve a unit, limpia pricePerLb para evitar confusión
-            dish.pricePerLb = dish.pricePerLb ?? null;
+        } else {
+            // si vuelve a unit, limpiamos pricePerLb (aquí estaba tu bug)
+            dish.pricePerLb = null;
         }
 
         const updated = await dish.save();
@@ -214,6 +353,7 @@ exports.updateDish = async (req, res, next) => {
         next(error);
     }
 };
+
 
 exports.getDishRecipe = async (req, res) => {
     try {
@@ -280,8 +420,26 @@ exports.updateDishRecipe = async (req, res) => {
         if (sellMode === "weight" || dish.sellMode === "weight") {
             dish.pricePerLb = (pricePerLb === undefined ? dish.pricePerLb : Number(pricePerLb));
         }
+        if (Array.isArray(recipe)) {
+            for (const r of recipe) {
+                const id = r.ingredientDishId || r.dishId || r.inventoryItemId;
+                if (!id) {
+                    return res.status(400).json({ success: false, message: "Cada receta requiere dishId (o ingredientDishId)" });
+                }
+                const q = Number(r.qty);
+                if (!Number.isFinite(q) || q <= 0) {
+                    return res.status(400).json({ success: false, message: "Cada receta requiere qty > 0" });
+                }
+            }
+        }
 
-        if (Array.isArray(recipe)) dish.recipe = recipe;
+        if (Array.isArray(recipe)) {
+            dish.recipe = recipe.map((r) => ({
+                ingredientDishId: r.ingredientDishId || r.dishId || r.inventoryItemId,
+                qty: Number(r.qty),
+                unit: r.unit || "unidad",
+            }));
+        }
 
         await dish.save();
 
@@ -330,18 +488,136 @@ exports.createIngredient = async (req, res) => {
         const tenantId = req.user?.tenantId;
         const clientId = req.clientId || "default";
 
-        const { name, category, sellMode, weightUnit, description } = req.body;
+        const {
+            // modo "crear nuevo ingrediente"
+            name,
+            description,
+
+            // modo "basado en plato existente"
+            existingDishId,
+
+            // inventario
+            inventoryCategoryId,
+
+            // venta
+            sellMode,
+            weightUnit,
+        } = req.body;
 
         if (!tenantId) {
             return res.status(401).json({ success: false, message: "TenantId no encontrado" });
         }
 
-        // nombre puede ser opcional si tú quieres, pero para ingredientes conviene requerirlo.
+        // ----------------------------------------------------
+        // MODO A: Basado en plato existente -> NO CREAR OTRO
+        if (existingDishId) {
+            if (!mongoose.Types.ObjectId.isValid(existingDishId)) {
+                return res.status(400).json({ success: false, message: "existingDishId inválido" });
+            }
+
+            const dish = await Dish.findOne({
+                _id: existingDishId,
+                tenantId,
+                clientId,
+            });
+
+            if (!dish) {
+                return res.status(404).json({ success: false, message: "Plato base no encontrado" });
+            }
+
+            // Asignar categoría de inventario (opcional pero recomendado)
+            if (inventoryCategoryId !== undefined) {
+                if (inventoryCategoryId === "" || inventoryCategoryId === null) {
+                    dish.inventoryCategoryId = null;
+                } else {
+                    if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
+                        return res.status(400).json({ success: false, message: "inventoryCategoryId inválido" });
+                    }
+                    dish.inventoryCategoryId = inventoryCategoryId;
+                }
+            }
+
+            // IMPORTANTE: si tú quieres que este mismo dish sea “inventario”, márcalo.
+            // Si NO quieres que desaparezca del menú, entonces NO uses isInventoryItem para filtrar menú.
+            dish.isInventoryItem = dish.isInventoryItem ?? false; // o simplemente NO tocarlo
+            dish.category = "Inventario"; // según tu regla “solo categoría inventario”
+
+            // Mantener su precio (NO tocar dish.price)
+            // Actualizar sellMode/weightUnit si llega
+            if (sellMode !== undefined) {
+                const sm = String(sellMode);
+                if (!["unit", "weight"].includes(sm)) {
+                    return res.status(400).json({ success: false, message: "sellMode inválido" });
+                }
+                dish.sellMode = sm;
+            }
+
+            if (weightUnit !== undefined) {
+                const wu = String(weightUnit);
+                if (!["lb", "kg"].includes(wu)) {
+                    return res.status(400).json({ success: false, message: "weightUnit inválido" });
+                }
+                dish.weightUnit = wu;
+            }
+
+            if (description !== undefined) dish.description = String(description);
+
+            const updated = await dish.save();
+
+            return res.status(200).json({
+                success: true,
+                message: "Plato existente actualizado como artículo de inventario (sin duplicar).",
+                data: updated,
+                updatedExisting: true,
+            });
+        }
+
+        // ----------------------------------------------------
+        // MODO B: Crear ingrediente nuevo -> crear Dish inventario
         if (!name || !String(name).trim()) {
             return res.status(400).json({ success: false, message: "El nombre es requerido" });
         }
+        const trimmedName = String(name).trim();
 
-        // Evitar duplicados por tenant + client + name
+// 1) Si ya existe un Dish con ese nombre (aunque no sea inventario), ACTUALÍZALO
+        const existingAny = await Dish.findOne({
+            tenantId,
+            clientId,
+            name: trimmedName,
+            isArchived: { $ne: true },
+        });
+
+        if (existingAny) {
+            // Asignar inventoryCategoryId si llega
+            const { inventoryCategoryId } = req.body;
+
+            if (inventoryCategoryId !== undefined) {
+                if (inventoryCategoryId === "" || inventoryCategoryId === null) {
+                    existingAny.inventoryCategoryId = null;
+                } else {
+                    if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
+                        return res.status(400).json({ success: false, message: "inventoryCategoryId inválido" });
+                    }
+                    existingAny.inventoryCategoryId = inventoryCategoryId;
+                }
+            }
+
+            // NO cambies su precio si es plato de menú
+            // Y NO lo marques como isInventoryItem=true (para no esconderlo del menú)
+            existingAny.isInventoryItem = existingAny.isInventoryItem ?? false;
+
+            await existingAny.save();
+
+            return res.status(200).json({
+                success: true,
+                message: "Se usó el Dish existente (no se creó duplicado).",
+                data: existingAny,
+                updatedExistingByName: true,
+            });
+        }
+
+
+        // Evitar duplicados por tenant + client + name (solo inventario)
         const exists = await Dish.findOne({
             tenantId,
             clientId,
@@ -358,24 +634,51 @@ exports.createIngredient = async (req, res) => {
             });
         }
 
+        // Validación inventoryCategoryId
+        let invCatId = null;
+        if (inventoryCategoryId !== undefined && inventoryCategoryId !== null && inventoryCategoryId !== "") {
+            if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
+                return res.status(400).json({ success: false, message: "inventoryCategoryId inválido" });
+            }
+            invCatId = inventoryCategoryId;
+        }
+
+        // sellMode / weightUnit defaults
+        const sm = sellMode ? String(sellMode) : "unit";
+        if (!["unit", "weight"].includes(sm)) {
+            return res.status(400).json({ success: false, message: "sellMode inválido" });
+        }
+
+        const wu = weightUnit ? String(weightUnit) : "lb";
+        if (!["lb", "kg"].includes(wu)) {
+            return res.status(400).json({ success: false, message: "weightUnit inválido" });
+        }
+
         const ingredient = await Dish.create({
             tenantId,
             clientId,
             name: String(name).trim(),
-            category: category || "Ingrediente",
-            price: 0, // importante: Dish requiere price
+            description: description ? String(description) : "",
+            category: "Inventario",
             isInventoryItem: true,
-            sellMode: sellMode || "unit",
-            weightUnit: sellMode === "weight" ? (weightUnit || "lb") : undefined,
-            description: description || "",
+            inventoryCategoryId: invCatId,
+            sellMode: sm,
+            weightUnit: wu,
+            price: 0, // inventario no es precio de venta
         });
 
-        return res.json({ success: true, data: ingredient });
-    } catch (err) {
-        console.error("[createIngredient]", err);
-        return res.status(500).json({ success: false, message: "Error creando ingrediente" });
+        return res.status(201).json({
+            success: true,
+            message: "Ingrediente creado",
+            data: ingredient,
+            createdNew: true,
+        });
+    } catch (error) {
+        console.error("createIngredient error", error);
+        return res.status(500).json({ success: false, message: "Error interno creando ingrediente" });
     }
 };
+
 
 exports.listIngredients = async (req, res) => {
     try {
@@ -389,10 +692,13 @@ exports.listIngredients = async (req, res) => {
         const items = await Dish.find({
             tenantId,
             clientId,
+            isArchived: { $ne: true },
             isInventoryItem: true,
+            category: "Inventario",
         })
             .sort({ name: 1 })
-            .select("_id name category sellMode weightUnit");
+            .select("_id name category sellMode weightUnit inventoryCategoryId isInventoryItem");
+
 
         return res.json({ success: true, data: items });
     } catch (err) {
@@ -400,4 +706,5 @@ exports.listIngredients = async (req, res) => {
         return res.status(500).json({ success: false, message: "Error listando ingredientes" });
     }
 };
+
 

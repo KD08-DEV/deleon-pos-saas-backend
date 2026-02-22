@@ -7,6 +7,8 @@ const Dish = require("../models/dish"); // ajusta si el nombre es dishModel.js
 // const InventoryItem = require("../models/inventoryItemModel"); // DEPRECATED: Ya no se usa InventoryItem, solo Dish
 // const InventoryMovement = require("../models/inventoryMovementModel"); // DEPRECATED
 const Customer = require("../models/customerModel");
+const { deductInventoryForOrder, restoreInventoryForOrder } = require("../services/inventory/deductInventoryForOrder");
+
 
 
 // Impuesto por defecto (0.25% para coincidir con tu UI)
@@ -318,20 +320,12 @@ const addOrder = async (req, res, next) => {
         const order = await Order.create(payload);
 
         // Solo marcar la mesa si fue enviada
-        if (tableRef) {
-            await Table.findOneAndUpdate(
-                {
-                    _id: tableRef,
-                    tenantId,
-                    $or: [
-                        { clientId: req.clientId },
-                        { clientId: { $exists: false } },
-                        { clientId: "default" },
-                    ],
-                },
-                { status: "Ocupada", currentOrder: order._id }
-            );
-        }
+        // Solo marcar la mesa si fue enviada
+        // IMPORTANTE:
+// Al crear la orden desde click en mesa, NO tocamos la mesa.
+// La mesa solo se marca como Reservada/Ocupada cuando se presione "Actualizar orden" (updateOrder).
+
+
 
         return res.status(201).json({ success:true, message:"Order created!", data:order });
     } catch (error) {
@@ -519,6 +513,14 @@ async function allocateInternalSeq({ tenantId }) {
 
 
 const updateOrder = async (req, res, next) => {
+    console.log("[ORDER UPDATE] body =>", {
+        orderId: req.params.id,
+        orderStatus: req.body.orderStatus,
+        paymentStatus: req.body.paymentStatus,
+        paid: req.body.paid,
+        isPaid: req.body.isPaid,
+    });
+
     try {
         const { id } = req.params;
 
@@ -614,20 +616,6 @@ const updateOrder = async (req, res, next) => {
                 null;
             const expirationDate = normalizeMongoDate(expiresAtRaw);
             const expirationDateISO = expirationDate ? expirationDate.toISOString() : null;
-            console.log("[FISCAL] expiresAtRaw:", expiresAtRaw);
-            console.log("[FISCAL] expirationDate normalized:", expirationDateISO);
-
-            console.log("[FISCAL] assigned =>", {
-                tenantId,
-                type,
-                ncfNumber,
-                internalSeq,
-                internalNumber,
-                emissionPoint,
-                branchName,
-                expirationDate,
-            });
-            console.log("[FISCAL] tenant ncfConfig:", tenant?.fiscal?.ncfConfig);
 
             safeUpdate.ncfNumber = ncfNumber;
             safeUpdate.fiscal = {
@@ -838,23 +826,62 @@ const updateOrder = async (req, res, next) => {
         let order = await Order.findOneAndUpdate(orderScope, safeUpdate, { new: true })
             .populate("table", "tableNo status")
             .populate("user", "name email role");
+        // Si antes no tenía items y ahora sí tiene, ocupar la mesa
+        const prevCount = Array.isArray(current.items) ? current.items.length : 0;
+        const newCount = Array.isArray(order.items) ? order.items.length : 0;
+
+        if (order.table && prevCount === 0 && newCount > 0) {
+            const tableId = order.table?._id ? String(order.table._id) : String(order.table);
+
+            await Table.findOneAndUpdate(
+                {
+                    _id: tableId,
+                    tenantId,
+                    $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                },
+                { status: "Ocupada", currentOrder: order._id }
+            );
+        }
+
 
         const incomingStatus = normalizeOrderStatus(req.body.orderStatus ?? current.orderStatus);
 
         // ✅ Si se completó => generar PDF (no rompe la respuesta)
+        // ✅ Si se completó => descontar inventario (idempotente) + generar PDF
         if (incomingStatus === "Completado") {
             try {
-                const generateInvoicePDF = require("../utils/generateInvoicePDF");
-                const pdfUrl = await generateInvoicePDF(order._id.toString(), tenantId);
-                order.invoiceUrl = pdfUrl;
+                await deductInventoryForOrder(order._id, {
+                    userId: req.user?._id || null,
+                    allowNegativeStock: false,
+                });
+            } catch (e) {
+                console.error("INVENTORY DEDUCT ERROR =>", e);
 
-                // (si quieres, puedes dejar esto o quitarlo; ya no lo mostramos como “fecha impresión”)
-                order.fiscal = order.fiscal || {};
-                order.fiscal.printedAt = new Date();
+                // ✅ Bloquea completar si no pudo descontar
+                const msg =
+                    e?.statusCode === 409 || e?.status === 409
+                        ? (e?.message || "No hay stock suficiente para completar esta orden.")
+                        : "No se pudo descontar inventario. Orden no completada.";
 
-                await order.save();
-            } catch (err) {
-                console.error("PDF ERROR =>", err);
+                return res.status(e?.statusCode || e?.status || 500).json({
+                    success: false,
+                    code: e?.message?.includes("INSUFFICIENT_STOCK") ? "INSUFFICIENT_STOCK" : "INVENTORY_DEDUCT_FAILED",
+                    message: msg,
+                    details: e?.message || String(e),
+                });
+            }
+        }
+
+
+        // ✅ Si se canceló => devolver inventario (si ya se había descontado)
+        if (incomingStatus === "Cancelado") {
+            try {
+
+                await restoreInventoryForOrder(order._id, {
+                    userId: req.user?._id || null,
+                });
+            } catch (e) {
+                console.error("INVENTORY RESTORE ERROR =>", e);
             }
         }
 
@@ -899,18 +926,20 @@ const updateOrder = async (req, res, next) => {
                     { status: "Disponible", currentOrder: null }
                 );
             }
-
-            // Ocupa la nueva mesa (solo si la orden NO está cancelada/completada)
+            // Ocupa/Reserva la nueva mesa (según si la orden tiene items)
             if (incomingStatusNow !== "Cancelado" && incomingStatusNow !== "Completado") {
+                const nextStatus = safeUpdate.isDraft ? "Reservada" : "Ocupada";
+
                 await Table.findOneAndUpdate(
                     {
                         _id: nextTableId,
                         tenantId,
                         $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
                     },
-                    { status: "Ocupada", currentOrder: id } // id es el de la orden (req.params.id)
+                    { status: nextStatus, currentOrder: id }
                 );
             }
+
         }
 
 
@@ -950,10 +979,46 @@ const updateOrder = async (req, res, next) => {
         return next(createHttpError(500, "UPDATE_ORDER_FAILED"));
     }
 };
+const updatePaymentMethod = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { paymentMethod } = req.body;
+
+        if (!paymentMethod) {
+            return res.status(400).json({
+                success: false,
+                message: "paymentMethod es requerido",
+            });
+        }
+
+        const updated = await Order.findByIdAndUpdate(
+            id,
+            { $set: { paymentMethod } },
+            { new: true }
+        );
+
+        if (!updated) {
+            return res.status(404).json({
+                success: false,
+                message: "Orden no encontrada",
+            });
+        }
+
+        return res.json({
+            success: true,
+            data: updated,
+        });
+    } catch (err) {
+        console.error("updatePaymentMethod error:", err);
+        return res.status(500).json({
+            success: false,
+            message: "Error interno",
+        });
+    }
+};
 
 
 
 
 
-
-module.exports = { addOrder, getOrderById, getOrders, updateOrder, deleteOrder };
+module.exports = { addOrder, getOrderById, getOrders, updateOrder, deleteOrder,updatePaymentMethod };

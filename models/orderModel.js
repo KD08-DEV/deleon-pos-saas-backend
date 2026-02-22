@@ -97,6 +97,7 @@ const orderSchema = new mongoose.Schema(
         },
         inventoryDeducted: { type: Boolean, default: false },
         inventoryDeductedAt: { type: Date, default: null },
+        cogsTotal: { type: Number, default: 0 },
 
 // Opcional: duplicado top-level (útil para búsquedas rápidas)
         ncfNumber: { type: String, default: null },

@@ -14,7 +14,8 @@ const {
     getOrderById,
     addOrder,
     updateOrder,
-    deleteOrder
+    deleteOrder,
+    updatePaymentMethod
 } = require("../controllers/orderController");
 
 /**
@@ -51,7 +52,6 @@ router.get("/:orderId/invoice", verifyToken, async (req, res) => {
         // 3) Construir ruta exacta del PDF según Supabase
         const filePath = `tenant_${tenantId}/orders/invoice_${orderId}.pdf`;
 
-        console.log("[GET INVOICE] buscando archivo:", filePath);
 
         // 4) URL firmada
         const { data, error } = await supabase.storage
@@ -144,5 +144,7 @@ router.delete(
     tenantMiddleware,
     deleteOrder
 );
+router.patch("/:id/payment-method", verifyToken, tenantMiddleware, updatePaymentMethod);
+
 
 module.exports = router;

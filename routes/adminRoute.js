@@ -9,10 +9,13 @@ const {
     getCashSessionByDate,
     getCurrentCashSession,
     openCashSession,
+    closeCashSession,
     addCashToSession,
     adjustOpeningFloat,
     getCashSessionsRange,
+    adjustCashSessionClosing,
 } = require("../controllers/cashSessionController");
+const { getManagerCodeStatus, setManagerCode } = require("../controllers/adminController");
 
 
 
@@ -35,6 +38,11 @@ const {
     updateSupplier,
     deleteSupplier,
 } = require("../controllers/supplierController");
+const {
+    listPurchases,
+    createPurchase,
+    addPurchasePayment,
+} = require("../controllers/purchaseController");
 
 const {
     getCategories,
@@ -42,6 +50,26 @@ const {
     updateCategory,
     deleteCategory,
 } = require("../controllers/inventoryCategoryController");
+const {
+    listExpenseCategories,
+    createExpenseCategory,
+    updateExpenseCategory,
+    deleteExpenseCategory,
+    listExpenses,
+    createExpense,
+    updateExpense,
+    voidExpense,
+} = require("../controllers/expenseController");
+
+const {
+    listPayrollRuns,
+    getPayrollRun,
+    createPayrollRun,
+    updatePayrollRun,
+    postPayrollRun,
+} = require("../controllers/payrollController");
+
+const { getFinanceSummary } = require("../controllers/summaryController");
 
 // Panel admin: nivel tenant (no requiere clientId)
 router.use(verifyToken );
@@ -146,6 +174,13 @@ router.post("/cash-session/open",
     requireRole("Owner", "Admin", "Cajera"),
     openCashSession
 );
+router.post("/cash-session/close",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    closeCashSession
+);
+
+
 
 router.get(
     "/cash-session",
@@ -174,7 +209,67 @@ router.patch(
     requireRole("Owner", "Admin"),
     adjustOpeningFloat
 );
+router.patch(
+    "/cash-session/close-adjust",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin"),
+    adjustCashSessionClosing
+);
 
+router.get(
+    "/manager-code",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    getManagerCodeStatus
+);
+
+router.patch(
+    "/manager-code",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    setManagerCode
+);
+router.get(
+    "/purchases",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    listPurchases
+);
+
+router.post(
+    "/purchases",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    createPurchase
+);
+
+router.post(
+    "/purchases/:id/payments",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    addPurchasePayment
+);
+// Expense Categories (Owner/Admin)
+router.get("/expense-categories", requireScope({ level: "tenant" }), requireRole("Owner","Admin","Cajera"), listExpenseCategories);
+router.post("/expense-categories", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), createExpenseCategory);
+router.put("/expense-categories/:id", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), updateExpenseCategory);
+router.delete("/expense-categories/:id", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), deleteExpenseCategory);
+
+// Expenses (Owner/Admin/Cajera)
+router.get("/expenses", requireScope({ level: "tenant" }), requireRole("Owner","Admin","Cajera"), listExpenses);
+router.post("/expenses", requireScope({ level: "tenant" }), requireRole("Owner","Admin","Cajera"), createExpense);
+router.put("/expenses/:id", requireScope({ level: "tenant" }), requireRole("Owner","Admin","Cajera"), updateExpense);
+router.patch("/expenses/:id/void", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), voidExpense);
+
+// Payroll (Owner/Admin)
+router.get("/payroll/runs", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), listPayrollRuns);
+router.get("/payroll/runs/:id", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), getPayrollRun);
+router.post("/payroll/runs", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), createPayrollRun);
+router.put("/payroll/runs/:id", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), updatePayrollRun);
+router.post("/payroll/runs/:id/post", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), postPayrollRun);
+
+// Summary (Owner/Admin/Cajera)
+router.get("/summary", requireScope({ level: "tenant" }), requireRole("Owner","Admin","Cajera"), getFinanceSummary);
 
 
 module.exports = router;

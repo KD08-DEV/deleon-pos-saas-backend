@@ -86,14 +86,11 @@ const updateTable = async (req, res, next) => {
         }
 
         // 🔒 VALIDACIÓN CRÍTICA
-        if (status === "Ocupada" && !orderId) {
-            return next(
-                createHttpError(
-                    400,
-                    "No se puede marcar la mesa como reservada sin una orden"
-                )
-            );
+        if ((status === "Ocupada" || status === "Reservada") && !orderId) {
+            return next(createHttpError(400, "No se puede marcar la mesa como reservada/ocupada sin una orden"));
         }
+
+
 
         if (status === "Disponible") {
             // Liberar siempre
@@ -114,11 +111,14 @@ const updateTable = async (req, res, next) => {
         }
 
         // Ocupada + orderId válido
+        const nextStatus = status === "Reservada" ? "Reservada" : "Ocupada";
+
         const table = await Table.findOneAndUpdate(
             { _id: id, tenantId: req.user.tenantId },
-            { status: "Ocupada", currentOrder: orderId },
+            { status: nextStatus, currentOrder: orderId },
             { new: true }
         );
+
 
         res.status(200).json({
             success: true,

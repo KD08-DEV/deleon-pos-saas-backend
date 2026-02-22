@@ -19,17 +19,18 @@ const requirePlanOrSuper = (checkFn) => {
     };
 };
 
-// Requiere Premium (ajusta nombres si tu plan es "premiun" o "pro")
+// Requiere Premium (ajusta nombres si tu plan es "premium" o "pro")
 const requireInventoryPlan = requirePlanOrSuper((tenant) => {
-    const plan = (tenant.plan || "").toString().toLowerCase(); // viene de Tenant.plan
-
-    const ok = ["premium", "vip"].includes(plan); // Pro (Premium) + VIP
+    const plan = (tenant.plan || "").toString().toLowerCase();
+    const ok = ["premium", "vip"].includes(plan);
 
     return {
         ok,
         reason: "Este módulo requiere Plan Premium o VIP",
     };
 });
+const requireInventoryPremiumOrVip = requireInventoryPlan;
+
 
 
 // Base chain:
@@ -59,20 +60,18 @@ router.get("/export/items.csv", requireRole("Owner", "Admin"), inventoryExportCo
 router.get("/export/movements.csv", requireRole("Owner", "Admin"), inventoryExportController.exportMovementsCSV);
 router.get("/consumption", inventoryController.consumption);
 // Alias: merma = movement type "waste"
-router.post("/merma", requireRole("Owner", "Admin"), (req, res, next) => {
-    req.body = { ...(req.body || {}), type: "waste" };
-    return inventoryController.createMovement(req, res, next);
-});
-router.get("/merma/summary", requireRole("Owner", "Admin"), inventoryController.getMermaSummary);
+// MERMA simple (movimiento waste)
+router.post("/merma", requireRole("Owner", "Admin"), inventoryController.createMerma);
+
+// Lotes de merma (batch)
 router.post("/merma/batches", requireRole("Owner", "Admin"), inventoryController.createMermaBatch);
 router.get("/merma/batches", requireRole("Owner", "Admin"), inventoryController.listMermaBatches);
+router.patch("/merma/batches/:id", requireRole("Owner", "Admin"), inventoryController.updateMermaBatch);
 router.patch("/merma/batches/:id/close", requireRole("Owner", "Admin"), inventoryController.closeMermaBatch);
-router.patch(
-    "/merma/batches/:id",
-    verifyToken,
-    requireRole("Owner", "Admin"),
-    inventoryController.updateMermaBatch
-);
+
+router.get("/merma/summary", requireRole("Owner", "Admin"), inventoryController.getMermaSummary);
+router.post("/movements/yield", requireRole("Owner", "Admin"), inventoryController.processYield);
+
 
 
 

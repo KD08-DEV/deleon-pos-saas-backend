@@ -3,29 +3,32 @@ const mongoose = require("mongoose");
 const mermaBatchSchema = new mongoose.Schema(
     {
         tenantId: { type: String, required: true, index: true },
-        mermaBatchId: { type: mongoose.Schema.Types.ObjectId, ref: "MermaBatch" },
+        clientId: { type: String, default: "default", index: true },
 
-        clientId: { type: String, required: true, index: true },
+        supplierId: { type: mongoose.Schema.Types.ObjectId, ref: "Supplier", default: null, index: true },
+        purchaseId: { type: mongoose.Schema.Types.ObjectId, ref: "Purchase", default: null, index: true },
 
-        // Producto crudo (Dish)
-        rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "Dish", required: true },
+        rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "dish", required: true, index: true },
 
-        // Cantidad cruda registrada al inicio
+        steps: [
+            { label: { type: String, default: "", trim: true }, qtyAfter: { type: Number, required: true } },
+        ],
+
         rawQty: { type: Number, required: true },
-
-        // Cantidad final (lo que quedó) al cerrar el lote
-        finalQty: { type: Number, default: null },
-
-        // Merma calculada al cerrar: rawQty - finalQty
-        wasteQty: { type: Number, default: 0 },
-
-        // Costos opcionales
-        unitCost: { type: Number, default: null },
-        costAmount: { type: Number, default: 0 },
-
-        note: { type: String, default: "" },
+        unitCostOriginal: { type: Number, default: null },
+        totalCost: { type: Number, default: 0 },
 
         status: { type: String, enum: ["open", "closed"], default: "open", index: true },
+
+        finalQty: { type: Number, default: null },
+        wasteQty: { type: Number, default: 0 },
+
+        costPolicy: { type: String, enum: ["NONE", "EFFECTIVE_RECALC"], default: "EFFECTIVE_RECALC" },
+
+        effectiveUnitCost: { type: Number, default: null },
+        wasteCostOriginal: { type: Number, default: 0 },
+
+        note: { type: String, default: "", trim: true },
 
         createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
         closedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
@@ -33,5 +36,7 @@ const mermaBatchSchema = new mongoose.Schema(
     },
     { timestamps: true }
 );
+
+mermaBatchSchema.index({ tenantId: 1, clientId: 1, status: 1, createdAt: -1 });
 
 module.exports = mongoose.model("MermaBatch", mermaBatchSchema);

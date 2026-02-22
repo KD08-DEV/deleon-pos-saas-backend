@@ -7,6 +7,9 @@ const Table = require("../models/tableModel");
 const Tenant = require("../models/tenantModel");
 const TIERS = require("../config/planTiers");
 const InventoryMovement = require("../models/inventoryMovementModel");
+const createHttpError = require("http-errors");
+const bcrypt = require("bcrypt");
+const TenantSettings = require("../models/tenantSettingsModel");
 
 
 
@@ -595,5 +598,83 @@ exports.getUsage = async (req, res) => {
             message: "Error al obtener usage",
             error,
         });
+    }
+};
+exports.getManagerCodeStatus = async (req, res, next) => {
+    try {
+        const tenantId = req.tenantId || req.scope?.tenantId || req.user?.tenantId;
+        if (!tenantId) return next(createHttpError(400, "MISSING_TENANT_ID"));
+
+        const settings = await TenantSettings.findOne({ tenantId })
+            .populate("managerCodeUpdatedBy", "name role");
+
+        return res.json({
+            success: true,
+            data: {
+                enabled: !!settings?.managerCodeHash,
+                hint: settings?.managerCodeHint || "",
+                updatedAt: settings?.managerCodeUpdatedAt || null,
+                updatedBy: settings?.managerCodeUpdatedBy || null,
+            },
+        });
+    } catch (e) {
+        return next(createHttpError(500, "GET_MANAGER_CODE_STATUS_FAILED"));
+    }
+};
+
+exports.setManagerCode = async (req, res, next) => {
+    try {
+        const tenantId = req.tenantId || req.scope?.tenantId || req.user?.tenantId;
+        const userId = req.user?._id || null;
+
+        if (!tenantId) return next(createHttpError(400, "MISSING_TENANT_ID"));
+
+        const raw = String(req.body?.managerCode || "").trim();
+
+        // Permite “desactivar” si mandas managerCode = ""
+        if (!raw) {
+            const settings = await TenantSettings.findOneAndUpdate(
+                { tenantId },
+                {
+                    $set: {
+                        managerCodeHash: "",
+                        managerCodeHint: "",
+                        managerCodeUpdatedAt: new Date(),
+                        managerCodeUpdatedBy: userId,
+                    },
+                },
+                { upsert: true, new: true }
+            );
+
+            return res.json({ success: true, data: { enabled: false } });
+        }
+
+        // Validación: PIN 4-8 dígitos (ajústalo si quieres)
+        if (!/^\d{4,8}$/.test(raw)) {
+            return next(createHttpError(400, "INVALID_MANAGER_CODE_FORMAT"));
+        }
+
+        const hash = await bcrypt.hash(raw, 10);
+        const hint = `***${raw.slice(-2)}`;
+
+        const settings = await TenantSettings.findOneAndUpdate(
+            { tenantId },
+            {
+                $set: {
+                    managerCodeHash: hash,
+                    managerCodeHint: hint,
+                    managerCodeUpdatedAt: new Date(),
+                    managerCodeUpdatedBy: userId,
+                },
+            },
+            { upsert: true, new: true }
+        );
+
+        return res.json({
+            success: true,
+            data: { enabled: true, hint: settings.managerCodeHint, updatedAt: settings.managerCodeUpdatedAt },
+        });
+    } catch (e) {
+        return next(createHttpError(500, "SET_MANAGER_CODE_FAILED"));
     }
 };

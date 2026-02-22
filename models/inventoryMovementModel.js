@@ -3,43 +3,47 @@ const mongoose = require("mongoose");
 const inventoryMovementSchema = new mongoose.Schema(
     {
         tenantId: { type: String, required: true, index: true },
-
-        // ✅ IMPORTANTE: para cierres/reporte por sucursal/cliente
         clientId: { type: String, default: "default", index: true },
 
-        // ✅ En tu sistema el inventario realmente está ligado a Dish (platos/productos)
         itemId: {
             type: mongoose.Schema.Types.ObjectId,
-            ref: "Dish",
+            ref: "dish",
             required: true,
+            index: true,
+        },
+
+        mermaBatchId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "MermaBatch",
+            default: null,
             index: true,
         },
 
         type: {
             type: String,
-            enum: ["purchase", "adjustment", "waste", "sale", "conversion"],
+            enum: ["purchase", "sale", "waste", "adjust", "transfer", "conversion"],
             required: true,
             index: true,
         },
 
-        // waste (merma) => positivo (qty perdida)
-        // adjustment => puede ser +/-.
-        qty: { type: Number, required: true },
+        qty: { type: Number, required: true },      // siempre positiva
+        qtySigned: { type: Number, default: null }, // + / -
 
         unitCost: { type: Number, default: null },
-
-        // ✅ costo total del movimiento (para merma es clave)
         costAmount: { type: Number, default: null },
 
-        // ✅ si es conversión crudo->cocido
-        fromItemId: { type: mongoose.Schema.Types.ObjectId, ref: "Dish", default: null },
-        toItemId: { type: mongoose.Schema.Types.ObjectId, ref: "Dish", default: null },
+        fromItemId: { type: mongoose.Schema.Types.ObjectId, ref: "dish", default: null },
+        toItemId: { type: mongoose.Schema.Types.ObjectId, ref: "dish", default: null },
         toQty: { type: Number, default: null },
+
+        // NUEVO: trazabilidad (orden, compra, etc.)
+        sourceType: { type: String, default: null, index: true }, // "order" | "manual" | ...
+        sourceId: { type: String, default: null, index: true },
 
         note: { type: String, default: "", trim: true },
 
-        beforeStock: { type: Number, required: true },
-        afterStock: { type: Number, required: true },
+        beforeStock: { type: Number, default: 0 },
+        afterStock: { type: Number, default: 0 },
 
         createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     },
@@ -47,5 +51,6 @@ const inventoryMovementSchema = new mongoose.Schema(
 );
 
 inventoryMovementSchema.index({ tenantId: 1, clientId: 1, type: 1, createdAt: -1 });
+inventoryMovementSchema.index({ tenantId: 1, clientId: 1, itemId: 1, createdAt: -1 });
 
 module.exports = mongoose.model("InventoryMovement", inventoryMovementSchema);
