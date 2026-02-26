@@ -72,13 +72,16 @@ exports.addDish = async (req, res, next) => {
         const {
             name,
             price,
+
             category,
             inventoryCategoryId,
-            // ✅ nuevos campos
+
             sellMode,
             weightUnit,
             pricePerLb,
             unit,
+            avgCost,
+            lastCost,
             isInventoryItem,
         } = req.body;
 
@@ -152,6 +155,19 @@ exports.addDish = async (req, res, next) => {
             const upload = await uploadToSupabase(req.user.tenantId, req.file);
             imageUrl = upload.publicUrl;
         }
+        let avg = null;
+        if (avgCost !== undefined && avgCost !== null && avgCost !== "") {
+            const n = Number(avgCost);
+            if (!Number.isFinite(n) || n < 0) return next(createHttpError(400, "avgCost inválido"));
+            avg = n;
+        }
+
+        let last = null;
+        if (lastCost !== undefined && lastCost !== null && lastCost !== "") {
+            const n = Number(lastCost);
+            if (!Number.isFinite(n) || n < 0) return next(createHttpError(400, "lastCost inválido"));
+            last = n;
+        }
 
         const newDish = await Dish.create({
             name: String(name).trim(),
@@ -160,6 +176,8 @@ exports.addDish = async (req, res, next) => {
             inventoryCategoryId: invCatId,
             isInventoryItem: isInv,
             imageUrl,
+            avgCost: avg,
+            lastCost: last,
             // ✅ guardamos venta por peso desde creación
             ...(sm !== undefined ? { sellMode: sm } : {}),
             ...(wu !== undefined ? { weightUnit: wu } : {}),
@@ -169,6 +187,7 @@ exports.addDish = async (req, res, next) => {
             tenantId: req.user.tenantId,
             clientId: clientId,
         });
+
 
         res.status(201).json({
             success: true,
@@ -277,6 +296,7 @@ exports.updateDish = async (req, res, next) => {
 
         // Si tocaron categoría de inventario, esa decisión manda.
         const isInv = inventoryCategoryId !== undefined ? isInvByCat : isInvByFlag;
+
 
         dish.isInventoryItem = isInv;
         dish.category = "Inventario"; // <- SIEMPRE "Inventario" según tu requerimiento
@@ -635,12 +655,41 @@ exports.createIngredient = async (req, res) => {
         }
 
         // Validación inventoryCategoryId
-        let invCatId = null;
-        if (inventoryCategoryId !== undefined && inventoryCategoryId !== null && inventoryCategoryId !== "") {
-            if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
-                return res.status(400).json({ success: false, message: "inventoryCategoryId inválido" });
+// -----------------------------
+// INVENTORY CATEGORY (esto es SOLO la categoría para agrupar el plato)
+// NO debe decidir si el dish es inventario o no.
+        if (inventoryCategoryId !== undefined) {
+            if (inventoryCategoryId === "" || inventoryCategoryId === null) {
+                dish.inventoryCategoryId = null;
+            } else {
+                if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
+                    return next(createHttpError(400, "inventoryCategoryId inválido"));
+                }
+                dish.inventoryCategoryId = inventoryCategoryId;
             }
-            invCatId = inventoryCategoryId;
+        }
+
+// isInventoryItem = único flag que decide si es inventario
+        if (isInventoryItem !== undefined) {
+            dish.isInventoryItem = (String(isInventoryItem) === "true" || isInventoryItem === true);
+        }
+
+        const isInv = Boolean(dish.isInventoryItem);
+
+        if (isInv) {
+            dish.category = "Inventario";
+            dish.price = 0;
+        } else {
+            // si NO es inventario:
+            // - NO forzar category
+            // - permitir update de price
+            if (price !== undefined) {
+                const p = Number(price);
+                if (!Number.isFinite(p) || p < 0) {
+                    return next(createHttpError(400, "price inválido"));
+                }
+                dish.price = p;
+            }
         }
 
         // sellMode / weightUnit defaults

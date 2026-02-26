@@ -131,11 +131,16 @@ function normalizeAndPriceItems(items) {
         if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new Error(`Precio inválido para ${name}`);
 
         const price = Number((unitPrice * quantity).toFixed(2));
+        const presentation = (it.presentation || "Regular").toString().trim();
 
+
+        console.log("[normalizeAndPriceItems] keys =>", Object.keys(it || {}));
+        console.log("[normalizeAndPriceItems] presentation =>", it.presentation);
         return {
             dishId,
             name,
             qtyType,
+            presentation,
             weightUnit,
             quantity,
             unitPrice,
@@ -213,6 +218,9 @@ const addOrder = async (req, res, next) => {
         const isDraft = normItems.length === 0;
 
 
+        if (normItems.length === 0) {
+            return next(createHttpError(400, "EMPTY_ORDER_NOT_ALLOWED"));
+        }
         const features = tenant?.features || {};
 
         const incomingBills = req.body?.bills || {};
@@ -318,6 +326,26 @@ const addOrder = async (req, res, next) => {
         };
 
         const order = await Order.create(payload);
+        // ✅ Si la orden se creó con mesa Y ya tiene items, marcar la mesa como Ocupada y asociar currentOrder
+        if (tableRef && Array.isArray(payload.items) && payload.items.length > 0) {
+            await Table.updateOne(
+                {
+                    _id: tableRef,
+                    tenantId,
+                    $or: [
+                        { clientId: req.clientId },
+                        { clientId: { $exists: false } },
+                        { clientId: "default" },
+                    ],
+                },
+                {
+                    $set: {
+                        status: "Ocupada",
+                        currentOrder: order._id,
+                    },
+                }
+            );
+        }
 
         // Solo marcar la mesa si fue enviada
         // Solo marcar la mesa si fue enviada
@@ -848,28 +876,118 @@ const updateOrder = async (req, res, next) => {
 
         // ✅ Si se completó => generar PDF (no rompe la respuesta)
         // ✅ Si se completó => descontar inventario (idempotente) + generar PDF
-        if (incomingStatus === "Completado") {
-            try {
-                await deductInventoryForOrder(order._id, {
-                    userId: req.user?._id || null,
-                    allowNegativeStock: false,
-                });
-            } catch (e) {
-                console.error("INVENTORY DEDUCT ERROR =>", e);
+        // ✅ Congelar snapshot de items para reportes (category, unitCost, taxAmount)
+        try {
+            const Dish = require("../models/dish"); // ya lo tienes
+            const InventoryCategory = require("../models/inventoryCategoryModel"); // 👈 este es tu model
 
-                // ✅ Bloquea completar si no pudo descontar
-                const msg =
-                    e?.statusCode === 409 || e?.status === 409
-                        ? (e?.message || "No hay stock suficiente para completar esta orden.")
-                        : "No se pudo descontar inventario. Orden no completada.";
+            const items = Array.isArray(order.items) ? order.items : [];
+            const dishIds = items.map((it) => it.dishId).filter(Boolean);
 
-                return res.status(e?.statusCode || e?.status || 500).json({
-                    success: false,
-                    code: e?.message?.includes("INSUFFICIENT_STOCK") ? "INSUFFICIENT_STOCK" : "INVENTORY_DEDUCT_FAILED",
-                    message: msg,
-                    details: e?.message || String(e),
-                });
+            // 1) Buscar dishes (incluye inventoryCategoryId + recipe)
+            const dishes = await Dish.find({ _id: { $in: dishIds } })
+                .select("_id category inventoryCategoryId isInventoryItem avgCost lastCost recipe")
+                .lean();
+
+            const dishMap = new Map(dishes.map((d) => [String(d._id), d]));
+
+            // 2) Map de inventoryCategoryId -> name (para categoría “oficial”)
+            const invCatIds = dishes.map((d) => d.inventoryCategoryId).filter(Boolean);
+            const invCats = invCatIds.length
+                ? await InventoryCategory.find({
+                    _id: { $in: invCatIds },
+                    tenantId,
+                    $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                })
+                    .select("_id name")
+                    .lean()
+                : [];
+
+            const invCatMap = new Map(invCats.map((c) => [String(c._id), String(c.name || "").trim()]));
+
+            // 3) Para costear recetas: recolectar ingredientDishIds y buscar sus costos
+            const ingredientIds = [];
+            for (const d of dishes) {
+                if (Array.isArray(d.recipe) && d.recipe.length) {
+                    for (const r of d.recipe) {
+                        if (r?.ingredientDishId) ingredientIds.push(r.ingredientDishId);
+                    }
+                }
             }
+
+            const ingredientDishes = ingredientIds.length
+                ? await Dish.find({ _id: { $in: ingredientIds } })
+                    .select("_id avgCost lastCost unit")
+                    .lean()
+                : [];
+
+            const ingredientCostMap = new Map(
+                ingredientDishes.map((ing) => [
+                    String(ing._id),
+                    Number(ing.avgCost ?? ing.lastCost ?? 0) || 0,
+                ])
+            );
+
+            // 4) Impuestos: prorratear con base real = sum(items.price)
+            const taxTotal = Number(order?.bills?.tax || 0);
+            const baseTotal = items.reduce((acc, it) => acc + Number(it.price || 0), 0);
+
+            for (const it of items) {
+                const d = it.dishId ? dishMap.get(String(it.dishId)) : null;
+
+                // ✅ Categoría oficial: InventoryCategory.name si existe
+                const invCatName = d?.inventoryCategoryId
+                    ? invCatMap.get(String(d.inventoryCategoryId))
+                    : "";
+
+                it.category =
+                    (invCatName && invCatName.trim()) ||
+                    (d?.category && String(d.category).trim()) ||
+                    it.category ||
+                    "Sin categoría";
+
+                // ✅ Costo unitario (unitCost)
+                // Regla:
+                // - Si es inventario directo => avgCost/lastCost
+                // - Si tiene receta => suma( qty * costoIngrediente )
+                // - Si no tiene nada => 0
+                let unitCost = 0;
+
+                const hasRecipe = Array.isArray(d?.recipe) && d.recipe.length > 0;
+
+                if (d?.isInventoryItem === true && !hasRecipe) {
+                    unitCost = Number(d.avgCost ?? d.lastCost ?? 0) || 0;
+                } else if (hasRecipe) {
+                    let recipeCost = 0;
+                    for (const r of d.recipe) {
+                        const ingId = r?.ingredientDishId ? String(r.ingredientDishId) : null;
+                        const ingCost = ingId ? (ingredientCostMap.get(ingId) || 0) : 0;
+                        const qty = Number(r?.qty || 0);
+                        recipeCost += ingCost * qty;
+                    }
+                    unitCost = Number(recipeCost) || 0;
+                } else {
+                    // fallback: si el plato tiene avgCost/lastCost, lo usa (aunque sea menú)
+                    unitCost = Number(d?.avgCost ?? d?.lastCost ?? 0) || 0;
+                }
+
+                it.unitCost = Number(unitCost.toFixed(6)); // precisión por si hay pesos/recetas
+
+                // ✅ ITBIS prorrateado (mejor base: suma items.price)
+                const line = Number(it.price || 0);
+                if (baseTotal > 0 && taxTotal > 0 && line > 0) {
+                    it.taxAmount = Number((taxTotal * (line / baseTotal)).toFixed(2));
+                } else {
+                    it.taxAmount = 0;
+                }
+
+                // ✅ Presentación fallback
+                if (!it.presentation) it.presentation = "Regular";
+            }
+
+            await order.save();
+        } catch (e) {
+            console.error("SNAPSHOT ITEMS ERROR =>", e);
         }
 
 
@@ -1016,9 +1134,117 @@ const updatePaymentMethod = async (req, res) => {
         });
     }
 };
+// ✅ Reporte tipo “Químicos” pero para restaurante (por categoría/presentación/producto/método)
+const getSalesByProductReport = async (req, res) => {
+    try {
+        const tenantId = req.tenantId || req.user?.tenantId;
+        const clientId = req.clientId;
+
+        // query params
+        const { from, to, paymentMethod, category, presentation, orderSource } = req.query;
+
+        // rango por createdAt (si no mandan fechas, usa hoy)
+        const now = new Date();
+        const start = from ? new Date(from) : new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+        const end = to ? new Date(to) : new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
+
+        const match = {
+            tenantId,
+            $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+            orderStatus: "Completado",
+            createdAt: { $gte: start, $lte: end },
+        };
+
+        if (paymentMethod) match.paymentMethod = paymentMethod;
+        if (orderSource) match.orderSource = orderSource;
+
+        // filtros por item
+        const itemMatch = {};
+        if (category) itemMatch["items.category"] = category;
+        if (presentation) itemMatch["items.presentation"] = presentation;
+
+        const rows = await Order.aggregate([
+            { $match: match },
+            { $unwind: "$items" },
+            ...(Object.keys(itemMatch).length ? [{ $match: itemMatch }] : []),
+
+            {
+                $addFields: {
+                    _cat: { $ifNull: ["$items.category", "Sin categoría"] },
+                    _pres: { $ifNull: ["$items.presentation", "Regular"] },
+                    _prod: "$items.name",
+                    _pay: { $ifNull: ["$paymentMethod", "Desconocido"] },
+
+                    _qty: { $ifNull: ["$items.quantity", 0] },
+                    _revenue: { $ifNull: ["$items.price", 0] }, // line total
+                    _unitCost: { $ifNull: ["$items.unitCost", 0] },
+                    _tax: { $ifNull: ["$items.taxAmount", 0] },
+                },
+            },
+            {
+                $addFields: {
+                    _costTotal: { $multiply: ["$_qty", "$_unitCost"] },
+                },
+            },
+
+            // agrupar como reporte de químicos
+            {
+                $group: {
+                    _id: { category: "$_cat", presentation: "$_pres", product: "$_prod", paymentMethod: "$_pay" },
+                    qty: { $sum: "$_qty" },
+                    revenue: { $sum: "$_revenue" },
+                    costTotal: { $sum: "$_costTotal" },
+                    taxTotal: { $sum: "$_tax" },
+                },
+            },
+
+            // calcular promedios y %s
+            {
+                $addFields: {
+                    unitCost: { $cond: [{ $gt: ["$qty", 0] }, { $divide: ["$costTotal", "$qty"] }, 0] },
+                    unitPrice: { $cond: [{ $gt: ["$qty", 0] }, { $divide: ["$revenue", "$qty"] }, 0] },
+                    profit: { $subtract: ["$revenue", "$costTotal"] },
+                },
+            },
+            {
+                $addFields: {
+                    costPct: { $cond: [{ $gt: ["$revenue", 0] }, { $multiply: [{ $divide: ["$costTotal", "$revenue"] }, 100] }, 0] },
+                    profitPct: { $cond: [{ $gt: ["$revenue", 0] }, { $multiply: [{ $divide: ["$profit", "$revenue"] }, 100] }, 0] },
+                },
+            },
+
+            // salida final
+            {
+                $project: {
+                    _id: 0,
+                    category: "$_id.category",
+                    presentation: "$_id.presentation",
+                    product: "$_id.product",
+                    paymentMethod: "$_id.paymentMethod",
+
+                    qty: 1,
+                    unitCost: { $round: ["$unitCost", 2] },
+                    unitPrice: { $round: ["$unitPrice", 2] },
+                    revenue: { $round: ["$revenue", 2] },
+                    costTotal: { $round: ["$costTotal", 2] },
+                    profit: { $round: ["$profit", 2] },
+                    costPct: { $round: ["$costPct", 2] },
+                    profitPct: { $round: ["$profitPct", 2] },
+                    taxTotal: { $round: ["$taxTotal", 2] },
+                },
+            },
+            { $sort: { category: 1, presentation: 1, product: 1, paymentMethod: 1 } },
+        ]);
+
+        return res.json({ success: true, data: rows });
+    } catch (err) {
+        console.error("getSalesByProductReport error:", err);
+        return res.status(500).json({ success: false, message: "Error interno" });
+    }
+};
 
 
 
 
 
-module.exports = { addOrder, getOrderById, getOrders, updateOrder, deleteOrder,updatePaymentMethod };
+module.exports = { addOrder, getOrderById, getOrders, updateOrder, deleteOrder,updatePaymentMethod, getSalesByProductReport  };

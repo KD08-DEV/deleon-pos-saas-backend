@@ -71,6 +71,9 @@ const tenantSchema = new mongoose.Schema(
                 enabled: { type: Boolean, default: true },
                 allowToggle: { type: Boolean, default: true },
             },
+            preInvoice: {
+                enabled: { type: Boolean, default: false },
+            },
             // Dentro de features.orderSources
             orderSources: {
                 pedidosYa: {

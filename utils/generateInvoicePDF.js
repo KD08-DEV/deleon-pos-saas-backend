@@ -131,7 +131,15 @@ async function generateInvoicePDF(orderId, tenantId) {
             fiscal?.expiresAt ||
             fallbackExpiresAt;
 
-        const invoiceTitle = hasNCF ? "Factura con Comprobante Fiscal" : "Factura";
+        // ✅ PreFactura: se activa si viene en la orden o si el tenant lo tiene como default
+        const isPreInvoice =
+            Boolean(fiscal?.preInvoice) ||
+            Boolean(tenant?.features?.preInvoice?.enabled);
+
+        const invoiceTitle = hasNCF
+            ? "Factura con Comprobante Fiscal"
+            : (isPreInvoice ? "PreFactura" : "Factura para Consumidor Final");
+
         const ncfLabel = NCF_TYPE_LABEL[ncfType] ? `${ncfType} - ${NCF_TYPE_LABEL[ncfType]}` : ncfType;
 
 

@@ -5,6 +5,18 @@ const itemSchema = new mongoose.Schema(
         dishId: { type: mongoose.Schema.Types.ObjectId, ref: "dish", required: false },
 
         name: { type: String, required: true, trim: true },
+        // ✅ NUEVO: “Presentación” estilo reporte químicos (Regular / Grande / Combo / etc.)
+        presentation: { type: String, default: "Regular", trim: true },
+
+        // ✅ NUEVO: snapshot para reportes (no depende de cambios futuros)
+        category: { type: String, default: "", trim: true },
+
+        // ✅ NUEVO: costo unitario congelado (para COGS por ítem)
+        unitCost: { type: Number, default: 0 },
+
+        // ✅ NUEVO: ITBIS prorrateado por ítem (para reporte por producto)
+        taxAmount: { type: Number, default: 0 },
+
 
         qtyType: { type: String, enum: ["unit", "weight"], default: "unit" },
         weightUnit: { type: String, enum: ["lb", "kg"], default: "lb" },

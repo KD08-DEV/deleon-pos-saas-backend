@@ -15,7 +15,8 @@ const {
     addOrder,
     updateOrder,
     deleteOrder,
-    updatePaymentMethod
+    updatePaymentMethod,
+    getSalesByProductReport
 } = require("../controllers/orderController");
 
 /**
@@ -145,6 +146,12 @@ router.delete(
     deleteOrder
 );
 router.patch("/:id/payment-method", verifyToken, tenantMiddleware, updatePaymentMethod);
+router.get(
+    "/report/sales-by-product",
+    verifyToken,
+    tenantMiddleware,
+    getSalesByProductReport
+);
 
 
 module.exports = router;

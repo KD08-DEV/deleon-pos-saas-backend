@@ -356,6 +356,10 @@ exports.getFiscalConfig = async (req, res) => {
                 ...(f.discount || {}),
                 enabled: typeof f.discount?.enabled === "boolean" ? f.discount.enabled : true,
             },
+            preInvoice: {
+                ...(f.preInvoice || {}),
+                enabled: typeof f.preInvoice?.enabled === "boolean" ? f.preInvoice.enabled : false,
+            },
             orderSources: {
                 ...(f.orderSources || {}),
                 pedidosYa: {
@@ -409,12 +413,14 @@ exports.updateFiscalConfig = async (req, res) => {
         const tipEnabled = req.body?.features?.tip?.enabled;
         const discountEnabled = req.body?.features?.discount?.enabled;
         const orderSources = req.body?.features?.orderSources;
+        const preInvoiceEnabled = req.body?.features?.preInvoice?.enabled;
 
         // ✅ SOLO setear si viene boolean (para que false se guarde)
         if (typeof fiscalEnabled === "boolean") $set["fiscal.enabled"] = fiscalEnabled;
         if (typeof taxEnabled === "boolean") $set["features.tax.enabled"] = taxEnabled;
         if (typeof tipEnabled === "boolean") $set["features.tip.enabled"] = tipEnabled;
         if (typeof discountEnabled === "boolean") $set["features.discount.enabled"] = discountEnabled;
+        if (typeof preInvoiceEnabled === "boolean") $set["features.preInvoice.enabled"] = preInvoiceEnabled;
 
         const ncfConfig = req.body?.ncfConfig || {};
         const B01 = ncfConfig.B01;
@@ -500,6 +506,10 @@ exports.updateFiscalConfig = async (req, res) => {
             typeof discountEnabled === "boolean"
                 ? discountEnabled
                 : (typeof prev?.discount?.enabled === "boolean" ? prev.discount.enabled : true);
+        const currentPreInvoiceEnabled =
+            typeof preInvoiceEnabled === "boolean"
+                ? preInvoiceEnabled
+                : (typeof prev?.preInvoice?.enabled === "boolean" ? prev.preInvoice.enabled : false);
 
 // SIEMPRE setearlos (para que nunca queden undefined)
 
@@ -508,6 +518,8 @@ exports.updateFiscalConfig = async (req, res) => {
         $set["features.tip.enabled"] = currentTipEnabled;
         $set["features.discount.enabled"] = currentDiscountEnabled;
 
+
+        $set["features.preInvoice.enabled"] = currentPreInvoiceEnabled;
 
         const updated = await Tenant.findOneAndUpdate(
             { tenantId },
