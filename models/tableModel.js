@@ -6,6 +6,8 @@ const tableSchema = new mongoose.Schema(
         status: { type: String, default: "Disponible" },
         seats: { type: Number, required: true, min: 1 },
         currentOrder: { type: mongoose.Schema.Types.ObjectId, ref: "Order", default: null },
+        area: { type: String, default: "General", trim: true },
+
 
         // 🔐 multi-tenant
         tenantId: { type: String, required: true, index: true },
@@ -15,6 +17,5 @@ const tableSchema = new mongoose.Schema(
 );
 
 // Unicidad por empresa: cada tenant puede tener su propia Mesa 1, 2, …
-tableSchema.index({ tenantId: 1, tableNo: 1, clientId: 1 }, { unique: true });
-
+tableSchema.index({ tenantId: 1, clientId: 1, area: 1, tableNo: 1 }, { unique: true });
 module.exports = mongoose.model("Table", tableSchema);

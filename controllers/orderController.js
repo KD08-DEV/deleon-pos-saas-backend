@@ -123,8 +123,14 @@ function normalizeAndPriceItems(items) {
         const qtyType = (it.qtyType || "unit").toString();
         const weightUnit = (it.weightUnit || "lb").toString();
 
-        const quantity = Number(it.quantity);
-        const unitPrice = Number(it.unitPrice);
+        const quantity = Number(it.quantity ?? it.qty ?? 0);
+
+        const unitPrice = Number(
+            it.unitPrice ??
+            it.pricePerQuantity ??
+            it.price ??
+            0
+        );
 
         if (!name) throw new Error("Item sin name");
         if (!Number.isFinite(quantity) || quantity <= 0) throw new Error(`Cantidad inválida para ${name}`);
@@ -169,6 +175,7 @@ const addOrder = async (req, res, next) => {
             paymentMethod = "Efectivo",
             discount = 0,
             orderSource,
+            orderNote = "",
         } = req.body;
         const normalizedStatus = normalizeOrderStatus(orderStatus);
 
@@ -288,7 +295,7 @@ const addOrder = async (req, res, next) => {
                 name: found.name || "",
                 phone: found.phone || "",
                 address: found.address || "",
-                guests: Number(customerDetails?.guests ?? 0), // guests es por orden, no por customer
+                guests: Number(customerDetails?.guests ?? 0),
             };
         }
 
@@ -301,6 +308,7 @@ const addOrder = async (req, res, next) => {
             customerDetails: resolvedCustomerDetails,  // ✅ NUEVO (snapshot)
             orderStatus: normalizedStatus,
             isDraft,
+
             bills: {
                 subtotal,
                 total: subtotal,
@@ -310,10 +318,12 @@ const addOrder = async (req, res, next) => {
                 tip,
                 tipAmount: tip,
 
+
                 deliveryFee,
 
                 totalWithTax,
             },
+            orderNote: String(orderNote || "").trim(),
             orderSource: source,
             commissionRate: round2(rate),
             commissionAmount,
@@ -321,7 +331,7 @@ const addOrder = async (req, res, next) => {
 
             items: normItems,
             paymentMethod,
-            ...(tableRef ? { table: tableRef } : {}),          // ✅ solo pones mesa si existe
+            ...(tableRef ? { table: tableRef } : {}),
             ...(req.user?._id ? { user: req.user._id } : {}),
         };
 
@@ -398,6 +408,7 @@ const getOrders = async (req, res, next) => {
             : {
                 ...baseQuery,
                 isDraft: { $ne: true },
+                orderStatus: { $ne: "Cancelado" },
                 "items.0": { $exists: true }, // extra seguridad: mínimo 1 item
             };
 
@@ -600,6 +611,7 @@ const updateOrder = async (req, res, next) => {
                 ...(current.customerDetails || {}),
                 ...(req.body.customerDetails || {}),
             },
+            orderNote: req.body.orderNote ?? current.orderNote,
             items: req.body.items ?? current.items,
             table: req.body.table ?? current.table,
             paymentMethod: req.body.paymentMethod ?? current.paymentMethod,
@@ -1151,7 +1163,9 @@ const getSalesByProductReport = async (req, res) => {
         const match = {
             tenantId,
             $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
-            orderStatus: "Completado",
+            isDraft: { $ne: true },
+            orderStatus: { $ne: "Cancelado" },
+            "items.0": { $exists: true },
             createdAt: { $gte: start, $lte: end },
         };
 

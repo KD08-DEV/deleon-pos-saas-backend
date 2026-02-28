@@ -68,6 +68,7 @@ const deleteFromSupabase = async (imageUrl) => {
 // CREATE
 exports.addDish = async (req, res, next) => {
     const clientId = req.clientId || "default";
+    const { allowCustomPrice } = req.body;
     try {
         const {
             name,
@@ -86,6 +87,13 @@ exports.addDish = async (req, res, next) => {
         } = req.body;
 
         // inventoryCategoryId (si viene)
+        const allowCP = String(allowCustomPrice) === "true" || allowCustomPrice === true;
+        if (allowCP && isInv) {
+            return next(createHttpError(400, "allowCustomPrice no aplica a inventario"));
+        }
+        if (allowCP && sm === "weight") {
+            return next(createHttpError(400, "allowCustomPrice no aplica a venta por peso"));
+        }
         let invCatId = null;
         if (inventoryCategoryId !== undefined && inventoryCategoryId !== null && inventoryCategoryId !== "") {
             if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
@@ -177,13 +185,13 @@ exports.addDish = async (req, res, next) => {
             isInventoryItem: isInv,
             imageUrl,
             avgCost: avg,
+            allowCustomPrice: allowCP,
             lastCost: last,
             // ✅ guardamos venta por peso desde creación
             ...(sm !== undefined ? { sellMode: sm } : {}),
             ...(wu !== undefined ? { weightUnit: wu } : {}),
             ...(pplb !== undefined ? { pricePerLb: pplb } : {}),
             ...(u !== undefined ? { unit: u } : {}),
-
             tenantId: req.user.tenantId,
             clientId: clientId,
         });
@@ -195,6 +203,13 @@ exports.addDish = async (req, res, next) => {
             data: newDish,
         });
     } catch (error) {
+        if (error?.code === 11000) {
+            return res.status(409).json({
+                success: false,
+                code: "DISH_ALREADY_EXISTS",
+                message: "Ya existe un plato con ese nombre en esa categoría.",
+            });
+        }
         next(error);
     }
 };
@@ -239,7 +254,7 @@ exports.updateDish = async (req, res, next) => {
         const {
             name,
             price,
-            // category,  // <- YA NO LO USAMOS
+            category,
             sellMode,
             weightUnit,
             pricePerLb,
@@ -269,12 +284,10 @@ exports.updateDish = async (req, res, next) => {
         if (name !== undefined) dish.name = String(name).trim();
 
         // -----------------------------
-        // INVENTARIO: decidir si es inventario y forzar category
-        // Regla recomendada:
-        // - Si inventoryCategoryId viene con un valor => es inventario
-        // - Si inventoryCategoryId viene ""/null => NO es inventario
-        // - Si además viene isInventoryItem, lo respetamos, pero inventoryCategoryId manda.
-        let invCatId = undefined; // undefined = no tocar; null = limpiar; ObjectId = setear
+        // INVENTARIO (stock/control) VS INVENTARIO DIRECTO (isInventoryItem)
+
+        // 1) inventoryCategoryId: undefined = no tocar; null = limpiar; ObjectId = setear
+        let invCatId = undefined;
         if (inventoryCategoryId !== undefined) {
             if (inventoryCategoryId === "" || inventoryCategoryId === null) {
                 invCatId = null;
@@ -286,26 +299,27 @@ exports.updateDish = async (req, res, next) => {
             }
         }
 
-        const isInvByCat =
-            invCatId !== undefined ? Boolean(invCatId) : Boolean(dish.inventoryCategoryId);
+        // 2) Si el request manda isInventoryItem, lo aplicamos (esto define inventario directo)
+        if (isInventoryItem !== undefined) {
+            dish.isInventoryItem =
+                String(isInventoryItem) === "true" || isInventoryItem === true;
+        }
 
-        const isInvByFlag =
-            isInventoryItem !== undefined
-                ? (String(isInventoryItem) === "true" || isInventoryItem === true)
-                : Boolean(dish.isInventoryItem);
-
-        // Si tocaron categoría de inventario, esa decisión manda.
-        const isInv = inventoryCategoryId !== undefined ? isInvByCat : isInvByFlag;
-
-
-        dish.isInventoryItem = isInv;
-        dish.category = "Inventario"; // <- SIEMPRE "Inventario" según tu requerimiento
-
+        // 3) inventoryCategoryId SOLO afecta stock/control (NO cambia isInventoryItem)
         if (invCatId !== undefined) {
             dish.inventoryCategoryId = invCatId; // null o ObjectId
         }
 
-        // unit (opcional)
+        // 4) category del MENÚ:
+        // - Si NO es inventario directo, permitimos actualizar category.
+        // - Si es inventario directo, la forzamos a "Inventario" (si esa es tu convención)
+        if (dish.isInventoryItem) {
+            dish.category = "Inventario";
+        } else if (category !== undefined) {
+            dish.category = String(category).trim();
+        }
+
+        // 5) unit (opcional)
         if (unit !== undefined) {
             const u = String(unit);
             if (!["unidad", "lb", "kg"].includes(u)) {
@@ -314,8 +328,10 @@ exports.updateDish = async (req, res, next) => {
             dish.unit = u;
         }
 
-        // price: si es inventario lo forzamos a 0 para evitar inconsistencias
-        if (isInv) {
+        // 6) price:
+        // - Si es inventario directo => forzamos price = 0
+        // - Si NO es inventario directo => actualizamos si viene
+        if (dish.isInventoryItem) {
             dish.price = 0;
         } else if (price !== undefined) {
             const p = Number(price);
@@ -346,7 +362,6 @@ exports.updateDish = async (req, res, next) => {
         // Si es weight, pricePerLb debe ser válido (si lo mandan o si ya está en weight)
         if (dish.sellMode === "weight") {
             if (pricePerLb === undefined) {
-                // si no lo envían, permitimos conservar el existente, pero debe ser válido
                 if (dish.pricePerLb === null || dish.pricePerLb === undefined) {
                     return next(createHttpError(400, "pricePerLb requerido cuando sellMode=weight"));
                 }
@@ -358,7 +373,7 @@ exports.updateDish = async (req, res, next) => {
                 dish.pricePerLb = pp;
             }
         } else {
-            // si vuelve a unit, limpiamos pricePerLb (aquí estaba tu bug)
+            // si vuelve a unit, limpiamos pricePerLb
             dish.pricePerLb = null;
         }
 
@@ -373,7 +388,6 @@ exports.updateDish = async (req, res, next) => {
         next(error);
     }
 };
-
 
 exports.getDishRecipe = async (req, res) => {
     try {

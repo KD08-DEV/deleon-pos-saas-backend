@@ -45,6 +45,7 @@ const dishSchema = new mongoose.Schema(
         tenantId: { type: String, required: true, index: true },
         clientId: { type: String, required: true, index: true },
 
+        allowCustomPrice: { type: Boolean, default: false, index: true },
         recipe: [
             {
                 ingredientDishId: {
@@ -62,7 +63,7 @@ const dishSchema = new mongoose.Schema(
 
 // permitir mismo name para plato vs inventario
 dishSchema.index(
-    { tenantId: 1, clientId: 1, name: 1, isInventoryItem: 1 },
+    { tenantId: 1, clientId: 1, category: 1, name: 1, isInventoryItem: 1 },
     { unique: true }
 );
 
