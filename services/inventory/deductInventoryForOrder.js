@@ -172,6 +172,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                 const soldDish = await Dish.findOne({ _id: soldDishId, tenantId, clientId })
                     .select("_id recipe isInventoryItem inventoryCategoryId stockCurrent stockMin name")
                     .lean()
+
                     .session(session);
 
                 if (!soldDish) continue;
@@ -282,7 +283,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
             if (!soldDishId || !mongoose.Types.ObjectId.isValid(String(soldDishId))) continue;
 
             const soldDish = await Dish.findOne({ _id: soldDishId, tenantId, clientId })
-                .select("_id recipe isInventoryItem inventoryCategoryId")
+                .select("_id recipe isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")
                 .lean();
 
             if (!soldDish) continue;
@@ -348,7 +349,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
 
                     await deductOne(ingId, qtyToDeduct);
                 }
-            } else if (soldDish.isInventoryItem === true || soldDish.inventoryCategoryId != null) {
+            } else if (shouldTrackStock(soldDish)) {
                 await deductOne(soldDish._id, Number(soldAmount.toFixed(6)));
             }
         }
@@ -458,7 +459,7 @@ async function restoreInventoryForOrder(orderId, opts = {}) {
                 if (!soldDishId || !mongoose.Types.ObjectId.isValid(String(soldDishId))) continue;
 
                 const soldDish = await Dish.findOne({ _id: soldDishId, tenantId, clientId })
-                    .select("_id recipe isInventoryItem inventoryCategoryId")
+                    .select("_id recipe isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")
                     .lean()
                     .session(session);
 
@@ -481,7 +482,7 @@ async function restoreInventoryForOrder(orderId, opts = {}) {
 
                         await addBackOne(ingId, qtyToAdd);
                     }
-                } else if (soldDish.isInventoryItem === true || soldDish.inventoryCategoryId != null) {
+                } else if (shouldTrackStock(soldDish)) {
                     await addBackOne(soldDish._id, Number(soldAmount.toFixed(6)));
                 }
             }
@@ -492,14 +493,6 @@ async function restoreInventoryForOrder(orderId, opts = {}) {
 
             result = { skipped: false, orderId: String(orderId), movementsCreated };
 
-        });
-
-        dbg("soldDish loaded", {
-            soldDishId: String(soldDishId),
-            found: Boolean(soldDish),
-            recipeLen: soldDish?.recipe?.length || 0,
-            isInventoryItem: soldDish?.isInventoryItem,
-            inventoryCategoryId: soldDish?.inventoryCategoryId ? String(soldDish.inventoryCategoryId) : null,
         });
         return result;
     } catch (e) {

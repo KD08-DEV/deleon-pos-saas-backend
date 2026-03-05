@@ -113,6 +113,7 @@ const orderSchema = new mongoose.Schema(
 
 // Opcional: duplicado top-level (útil para búsquedas rápidas)
         ncfNumber: { type: String, default: null },
+        operationNumber: { type: Number, index: true },
         orderNote: { type: String, default: "", trim: true },
         items: { type: [itemSchema], default: [] },
         table: {

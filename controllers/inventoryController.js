@@ -258,7 +258,7 @@ exports.listItems = async (req, res, next) => {
         }
 
         const items = await Dish.find(filter)
-            .select("_id name unit stockCurrent stockMin lastCost avgCost inventoryCategoryId supplierId updatedAt isArchived")
+            .select("_id name category isInventoryItem unit stockCurrent stockMin lastCost avgCost inventoryCategoryId supplierId updatedAt isArchived")
             .populate({ path: "supplierId", select: "name companyName" })
             .sort({ updatedAt: -1 })
             .lean();
@@ -320,11 +320,25 @@ exports.createItem = async (req, res, next) => {
 
             // Para platos vendibles NO usamos isInventoryItem=true (eso lo escondería del menú).
             // “Habilitar inventario” se logra con inventoryCategoryId != null.
+// Para platos vendibles NO usamos isInventoryItem=true (eso lo escondería del menú).
+// “Habilitar inventario” se logra con inventoryCategoryId != null.
             dish.isInventoryItem = dish.isInventoryItem === true ? true : false;
 
-            // NO tocar dish.category ni dish.price (para que siga siendo vendible en el POS)
+// NO tocar dish.category ni dish.price (para que siga siendo vendible en el POS)
             if (unit !== undefined) dish.unit = String(unit);
-            if (stockMin !== undefined) dish.stockMin = Number(stockMin || 0);
+
+// ✅ Si vienes de un plato del menú, puede tener stockCurrent/stockMin en null.
+// Al habilitar inventario propio, debe empezar como número (0 si no lo definiste).
+            if (!Number.isFinite(Number(dish.stockCurrent))) {
+                dish.stockCurrent = 0;
+            }
+
+// Si viene stockMin explícito lo respetamos, si no y está null, lo ponemos en 0
+            if (stockMin !== undefined) {
+                dish.stockMin = Number(stockMin || 0);
+            } else if (!Number.isFinite(Number(dish.stockMin))) {
+                dish.stockMin = 0;
+            }
 
             if (inventoryCategoryId !== undefined) {
                 if (!inventoryCategoryId) {

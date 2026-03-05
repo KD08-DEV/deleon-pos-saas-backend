@@ -32,8 +32,8 @@ const dishSchema = new mongoose.Schema(
         isArchived: { type: Boolean, default: false, index: true },
 
         // Stock y costos
-        stockCurrent: { type: Number, default: 0 },
-        stockMin: { type: Number, default: 0 },
+        stockCurrent: { type: Number, default: null },
+        stockMin: { type: Number, default: null },
         lastCost: { type: Number, default: null },
         avgCost: { type: Number, default: null },
 

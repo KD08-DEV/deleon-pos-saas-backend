@@ -1003,10 +1003,28 @@ const updateOrder = async (req, res, next) => {
         }
 
 
-        // ✅ Si se canceló => devolver inventario (si ya se había descontado)
+// ✅ Inventario real:
+// - Al completar => descontar (idempotente por order.inventoryDeducted)
+// - Al cancelar => restaurar (si ya se había descontado)
+        const allowNegativeStock = Boolean(
+            tenant?.features?.inventory?.allowNegativeStock ??
+            tenant?.inventory?.allowNegativeStock ??
+            false
+        );
+
+        if (incomingStatus === "Completado") {
+            try {
+                await deductInventoryForOrder(order._id, {
+                    allowNegativeStock,
+                    userId: req.user?._id || null,
+                });
+            } catch (e) {
+                console.error("INVENTORY DEDUCT ERROR =>", e);
+            }
+        }
+
         if (incomingStatus === "Cancelado") {
             try {
-
                 await restoreInventoryForOrder(order._id, {
                     userId: req.user?._id || null,
                 });
@@ -1015,9 +1033,9 @@ const updateOrder = async (req, res, next) => {
             }
         }
 
-        // ✅ Liberar mesa si cancelada/completada
+// ✅ Liberar mesa si cancelada/completada
         if (
-            (incomingStatus === "Cancelado" || incomingStatus=== "Completado") &&
+            (incomingStatus === "Cancelado" || incomingStatus === "Completado") &&
             current.table
         ) {
             const tableId = current.table?._id ? current.table._id : current.table;
