@@ -24,14 +24,9 @@ function dbg(...args) {
 }
 function shouldTrackStock(dish) {
     if (!dish) return false;
-    if (dish.isInventoryItem === true) return true;
 
-    // Compatibilidad con tu data actual: algunos inventariables no tienen isInventoryItem=true
-    const hasInvCat = dish.inventoryCategoryId != null;
-    const hasStock = Number.isFinite(Number(dish.stockCurrent));
-    const hasMin = Number.isFinite(Number(dish.stockMin));
-
-    return hasInvCat && hasStock && hasMin;
+    // Solo descontar inventario directo si el producto está marcado explícitamente
+    return dish.isInventoryItem === true;
 }
 // Detecta si la línea es por peso (lb) o por quantity
 function getSoldAmount(orderItem) {
@@ -60,15 +55,7 @@ async function applyDeduction({
         tenantId,
         clientId,
         isArchived: { $ne: true },
-        $or: [
-            { isInventoryItem: true },
-            { $and: [
-                    { inventoryCategoryId: { $ne: null } },
-                    { stockCurrent: { $type: "number" } },
-                    { stockMin: { $type: "number" } },
-                ]
-            },
-        ],
+        isInventoryItem: true,
     }).session(session);
 
     dbg("applyDeduction()", {
@@ -297,10 +284,10 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                     tenantId,
                     clientId,
                     isArchived: { $ne: true },
-                    $or: [{ isInventoryItem: true }, { inventoryCategoryId: { $ne: null } }],
+                    isInventoryItem: true,
                 });
 
-                if (!dish) throw createHttpError(404, "INVENTORY_INGREDIENT_NOT_FOUND");
+                if (!dish) return { skipped: true };
 
                 const beforeStock = num(dish.stockCurrent, 0);
                 const afterStock = beforeStock - qtyToDeduct;
@@ -355,12 +342,19 @@ async function deductInventoryForOrder(orderId, opts = {}) {
         }
 
         order.cogsTotal = Number((cogsTotal || 0).toFixed(2));
-        order.inventoryDeducted = true;
-        order.inventoryDeductedAt = new Date();
+
+        if (movementsCreated > 0) {
+            order.inventoryDeducted = true;
+            order.inventoryDeductedAt = new Date();
+        } else {
+            order.inventoryDeducted = false;
+            order.inventoryDeductedAt = null;
+        }
+
         await order.save();
 
         return {
-            skipped: false,
+            skipped: movementsCreated === 0,
             orderId: String(orderId),
             movementsCreated,
             cogsTotal: order.cogsTotal,
@@ -408,12 +402,8 @@ async function restoreInventoryForOrder(orderId, opts = {}) {
                     tenantId,
                     clientId,
                     isArchived: { $ne: true },
-                    $or: [
-                        { isInventoryItem: true },
-                        { inventoryCategoryId: { $ne: null } }, // <- permitir inventario por categoría
-                    ],
+                    isInventoryItem: true,
                 }).session(session);
-
 
                 if (!dish) return;
 
