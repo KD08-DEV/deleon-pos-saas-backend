@@ -499,3 +499,30 @@ exports.printNetworkInvoice = async (req, res) => {
         });
     }
 };
+exports.getPrintersByCategory = async (req, res, next) => {
+    try {
+        const { category } = req.params;
+
+        const tenantId = req.user?.tenantId || req.tenantId;
+        const clientId = req.headers["x-client-id"] || "default";
+
+        const query = {
+            tenantId,
+            clientId,
+            isActive: true,
+        };
+
+        if (category && category !== "all") {
+            query.category = category;
+        }
+
+        const printers = await Printer.find(query).sort({ createdAt: -1 });
+
+        return res.status(200).json({
+            success: true,
+            data: printers,
+        });
+    } catch (error) {
+        next(error);
+    }
+};

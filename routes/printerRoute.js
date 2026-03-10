@@ -13,6 +13,7 @@ const {
     testNetworkPrinter,
     printNetworkTicket,
     printNetworkInvoice,
+    getPrintersByCategory,
 } = require("../controllers/tenantPrintingController");
 
 router.get("/", verifyToken, listPrinters);
@@ -21,6 +22,7 @@ router.post("/", verifyToken, createPrinter);
 router.patch("/:id", verifyToken, updatePrinter);
 router.delete("/:id", verifyToken, deletePrinter);
 router.patch("/:id/default", verifyToken, setDefaultPrinter);
+router.get("/category/:category", verifyToken, getPrintersByCategory);
 
 router.post("/:id/test-network", verifyToken, testNetworkPrinter);
 router.post("/:id/print-ticket", verifyToken, printNetworkTicket);
