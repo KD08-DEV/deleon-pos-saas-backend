@@ -229,12 +229,12 @@ async function generateInvoicePDF(orderId, tenantId) {
 
         if (hasNCF) {
             doc.text(`Factura No.: ${internalNumber || "N/A"}`);
-            doc.text(`Sucursal: ${branchName} · Punto de emisión: ${emissionPoint}`);
+            doc.text(`Sucursal: ${branchName} · Punto de emision: ${emissionPoint}`);
         }
 
         doc.text(`Order ID: ${String(order?._id || "")}`);
         doc.text(`Fecha/Hora: ${formatDateTimeDO(order?.createdAt)}`);
-        if (hasNCF) doc.text(`Vence (NCF): ${formatDateUTC(expirationDate)}`);
+        if (hasNCF) doc.text(`Fecha de Vencimiento: ${formatDateUTC(expirationDate)}`);
 
         doc.moveDown(0.5);
         doc.text(`Cliente: ${customerName}`);

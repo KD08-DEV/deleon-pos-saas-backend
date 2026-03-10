@@ -140,8 +140,7 @@ function normalizeAndPriceItems(items) {
         const presentation = (it.presentation || "Regular").toString().trim();
 
 
-        console.log("[normalizeAndPriceItems] keys =>", Object.keys(it || {}));
-        console.log("[normalizeAndPriceItems] presentation =>", it.presentation);
+
         return {
             dishId,
             name,
@@ -630,6 +629,13 @@ const updateOrder = async (req, res, next) => {
 
         const incomingFiscal = req.body.fiscal;
         // ✅ NCF: si lo pidió y aún no tiene NCF, asignar
+        console.log("[ORDER UPDATE][FISCAL DEBUG]", {
+            tenantId,
+            fiscalFeatureEnabled,
+            incomingFiscal: req.body.fiscal,
+            currentFiscal: current?.fiscal,
+            tenantFiscal: tenant?.fiscal,
+        });
         const alreadyHasNCF = current?.fiscal?.ncfNumber || current?.ncfNumber;
 
         if (fiscalFeatureEnabled && incomingFiscal?.requested === true && !alreadyHasNCF) {
@@ -694,18 +700,8 @@ const updateOrder = async (req, res, next) => {
             expirationDate: safeUpdate.fiscal.expirationDate || expirationDateISO,
         };
     }
-    else if (!fiscalFeatureEnabled) {
-            safeUpdate.fiscal = {
-                ...(safeUpdate.fiscal || {}),
-                requested: false,
-                ncfNumber: undefined,
-                ncfType: undefined,
-                issuedAt: undefined,
-                expirationDate: undefined,
-                internalSeq: undefined,
-                internalNumber: undefined,
-            };
-            safeUpdate.ncfNumber = undefined;
+        if (incomingFiscal?.requested === true && !fiscalFeatureEnabled) {
+            return next(createHttpError(400, "FISCAL_NOT_ENABLED_FOR_TENANT"));
         }
 
 

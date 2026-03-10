@@ -288,12 +288,16 @@ exports.updateEmployee = async (req, res) => {
             updateData.password = password.trim();
         }
 
-        // Actualizar usuario
-        const updatedEmployee = await User.findByIdAndUpdate(
-            id,
-            { $set: updateData },
-            { new: true, runValidators: true }
-        ).select("name email phone role");
+        // Actualizar usuario de forma segura para que el password pase por pre("save")
+        if (updateData.name !== undefined) employee.name = updateData.name;
+        if (updateData.email !== undefined) employee.email = updateData.email;
+        if (updateData.phone !== undefined) employee.phone = updateData.phone;
+        if (updateData.role !== undefined) employee.role = updateData.role;
+        if (updateData.password !== undefined) employee.password = updateData.password;
+
+        await employee.save();
+
+        const updatedEmployee = await User.findById(employee._id).select("name email phone role");
 
         // Actualizar membership si el rol cambió
         if (role && role !== employee.role) {

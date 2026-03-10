@@ -12,6 +12,9 @@ const http = require("http");
 const { Server } = require("socket.io");
 const server = http.createServer(app);
 const customerRoute = require("./routes/customerRoute");
+const printerRoute = require("./routes/printerRoute");
+
+
 
 
 // ❌ ELIMINAR ESTO (ROMPE TODO): import orderRoute from "./routes/orderRoute.js";
@@ -128,7 +131,7 @@ app.use("/api/invoice", require("./routes/invoiceRoute"));
 app.use("/api/dgii", dgiiRoute);
 app.use("/api/inventory", require("./routes/inventoryRoute"));
 app.use("/api/customer", customerRoute);
-// Global Error Handler
+app.use("/api/printers", printerRoute);// Global Error Handler
 app.use(globalErrorHandler);
 
 // Server
