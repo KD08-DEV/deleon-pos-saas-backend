@@ -2,7 +2,7 @@ const mongoose = require("mongoose");
 
 const cashMovementSchema = new mongoose.Schema(
     {
-        type: { type: String, enum: ["OPEN", "ADD", "ADJUST", "CLOSE", "CLOSE_ADJUST"], required: true },
+        type: { type: String, enum: ["OPEN", "ADD", "ADD_AFTER_CLOSE", "ADJUST", "CLOSE", "CLOSE_ADJUST"], required: true },
         amount: { type: Number, required: true },
         by: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
         at: { type: Date, default: Date.now },

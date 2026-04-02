@@ -199,7 +199,7 @@ router.get(
 router.post(
     "/cash-session/add",
     requireScope({ level: "client" }),
-    requireRole("Owner", "Admin", "Cajera"),
+    requireRole("Owner", "Admin"),
     addCashToSession
 );
 

@@ -106,14 +106,26 @@ exports.listExpenses = async (req, res, next) => {
     try {
         const { tenantId, clientId } = getScope(req);
         if (!tenantId) return next(createHttpError(400, "MISSING_TENANT_ID"));
-
-        const { from, to, categoryId, supplierId, includeVoided } = req.query;
+        const { from, to, categoryId, supplierId, includeVoided, sourceType } = req.query;
 
         const filter = { tenantId, clientId };
+
         if (includeVoided !== "true") filter.status = "posted";
         if (from && to) filter.dateYMD = { $gte: String(from), $lte: String(to) };
         if (categoryId && mongoose.Types.ObjectId.isValid(categoryId)) filter.categoryId = categoryId;
         if (supplierId && mongoose.Types.ObjectId.isValid(supplierId)) filter.supplierId = supplierId;
+
+        if (sourceType === "manual") {
+            filter.$or = [
+                { source: { $exists: false } },
+                { source: null },
+                { "source.type": { $exists: false } },
+            ];
+        }
+
+        if (sourceType === "payroll") {
+            filter["source.type"] = "payroll";
+        }
 
         const rows = await Expense.find(filter)
             .populate("categoryId", "name systemKey")
@@ -243,6 +255,10 @@ exports.voidExpense = async (req, res, next) => {
 
         const doc = await Expense.findOne({ _id: id, tenantId, clientId });
         if (!doc) return next(createHttpError(404, "EXPENSE_NOT_FOUND"));
+
+        if (doc?.source?.type === "payroll") {
+            return next(createHttpError(409, "PAYROLL_EXPENSE_VOID_FROM_PAYROLL_MODULE"));
+        }
 
         doc.status = "void";
         doc.voidedAt = new Date();

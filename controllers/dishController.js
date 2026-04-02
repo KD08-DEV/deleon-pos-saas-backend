@@ -2,6 +2,12 @@ const Dish = require("../models/dish");
 const createHttpError = require("http-errors");
 const mongoose = require("mongoose");
 const { supabase } = require("../config/supabaseClient");
+const VALID_PRODUCTION_AREAS = ["kitchen", "bar", "other"];
+
+const normalizeProductionArea = (value) => {
+    const v = String(value || "kitchen").trim().toLowerCase();
+    return VALID_PRODUCTION_AREAS.includes(v) ? v : "kitchen";
+};
 
 const uploadToSupabase = async (tenantId, file) => {
     const ext = file.originalname.split(".").pop();
@@ -68,7 +74,7 @@ const deleteFromSupabase = async (imageUrl) => {
 // CREATE
 exports.addDish = async (req, res, next) => {
     const clientId = req.clientId || "default";
-    const { allowCustomPrice } = req.body;
+
     try {
         const {
             name,
@@ -76,6 +82,7 @@ exports.addDish = async (req, res, next) => {
 
             category,
             inventoryCategoryId,
+            productionArea,
 
             sellMode,
             weightUnit,
@@ -84,7 +91,10 @@ exports.addDish = async (req, res, next) => {
             avgCost,
             lastCost,
             isInventoryItem,
+            allowCustomPrice,
         } = req.body;
+
+        const normalizedProductionArea = normalizeProductionArea(productionArea);
 
         // inventoryCategoryId (si viene)
 // Flags base (evita usar variables antes de declararlas)
@@ -188,6 +198,7 @@ exports.addDish = async (req, res, next) => {
             name: String(name).trim(),
             price: finalPrice,
             category: String(finalCategory).trim(),
+            productionArea: normalizedProductionArea,
             inventoryCategoryId: invCatId,
             isInventoryItem: isInv,
             imageUrl,
@@ -225,26 +236,59 @@ exports.addDish = async (req, res, next) => {
 // READ
 exports.getDishes = async (req, res, next) => {
     try {
-        const { includeInventory } = req.query;
+        const {
+            includeInventory,
+            page = 1,
+            limit = 12,
+            search = "",
+            category = "",
+        } = req.query;
+
+        const pageNum = Math.max(Number(page) || 1, 1);
+        const limitNum = Math.max(Number(limit) || 12, 1);
+        const skip = (pageNum - 1) * limitNum;
 
         const filter = {
             tenantId: req.user.tenantId,
             isArchived: { $ne: true },
         };
 
-
-        // Por defecto NO incluye ingredientes/inventario puros
-        // (los platos del POS pueden ser inventario y deben seguir saliendo)
         if (String(includeInventory) !== "true") {
             filter.category = { $ne: "Inventario" };
         }
 
+        const searchTrimmed = String(search || "").trim();
+        if (searchTrimmed) {
+            filter.$or = [
+                { name: { $regex: searchTrimmed, $options: "i" } },
+                { category: { $regex: searchTrimmed, $options: "i" } },
+            ];
+        }
 
-        const dishes = await Dish.find(filter).sort({ updatedAt: -1 });
+        const categoryTrimmed = String(category || "").trim();
+        if (categoryTrimmed) {
+            filter.category = categoryTrimmed;
+        }
+
+        const [items, total] = await Promise.all([
+            Dish.find(filter)
+                .sort({ updatedAt: -1 })
+                .skip(skip)
+                .limit(limitNum),
+            Dish.countDocuments(filter),
+        ]);
+
+        const totalPages = Math.max(Math.ceil(total / limitNum), 1);
 
         res.status(200).json({
             success: true,
-            data: dishes,
+            data: {
+                items,
+                page: pageNum,
+                limit: limitNum,
+                total,
+                totalPages,
+            },
         });
     } catch (error) {
         next(error);
@@ -262,6 +306,7 @@ exports.updateDish = async (req, res, next) => {
             name,
             price,
             category,
+            productionArea,
             sellMode,
             weightUnit,
             pricePerLb,
@@ -382,6 +427,9 @@ exports.updateDish = async (req, res, next) => {
         } else {
             // si vuelve a unit, limpiamos pricePerLb
             dish.pricePerLb = null;
+        }
+        if (productionArea !== undefined) {
+            dish.productionArea = normalizeProductionArea(productionArea);
         }
 
         const updated = await dish.save();

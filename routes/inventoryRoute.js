@@ -52,6 +52,7 @@ router.get("/low-stock", requireRole("Owner", "Admin", "Cajera", "Camarero"), in
 router.post("/items", requireRole("Owner", "Admin"), inventoryController.createItem);
 router.put("/items/:id", requireRole("Owner", "Admin"), inventoryController.updateItem);
 router.delete("/items/:id", requireRole("Owner", "Admin"), inventoryController.archiveItem);
+router.patch("/items/:id/unarchive", requireRole("Owner", "Admin"), inventoryController.unarchiveItem);
 
 router.post("/movements", requireRole("Owner", "Admin"), inventoryController.createMovement);
 

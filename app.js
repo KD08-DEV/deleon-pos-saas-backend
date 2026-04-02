@@ -16,7 +16,6 @@ const printerRoute = require("./routes/printerRoute");
 
 
 
-
 // ❌ ELIMINAR ESTO (ROMPE TODO): import orderRoute from "./routes/orderRoute.js";
 
 

@@ -110,71 +110,97 @@ function buildTicketText({
                              total,
                              paymentMethod,
                              showTotals = false,
+                             showItemPrices = false,
+                             paperSize = "80mm",
                          }) {
-    const width = 42;
+    const width = getPaperWidth(paperSize);
     const lines = [];
+
+    const normalizedTitle = String(title || "").trim().toUpperCase();
+    const isProductionCommand =
+        normalizedTitle === "BAR" ||
+        normalizedTitle === "COCINA" ||
+        normalizedTitle === "PRODUCCION";
+
+    const effectiveShowItemPrices =
+        isProductionCommand ? false : showItemPrices === true;
+
+    const effectiveShowTotals =
+        isProductionCommand ? false : showTotals === true;
 
     if (businessName) lines.push(centerText(businessName, width));
     if (rnc) lines.push(centerText(`RNC: ${safe(rnc)}`, width));
     if (address) wrapText(address, width).forEach((line) => lines.push(centerText(line, width)));
     if (phone) lines.push(centerText(`Tel: ${safe(phone)}`, width));
 
-    lines.push(divider(width, "-"));
-
-    if (orderId) lines.push(`${padRight("Operación:", 12)} ${safe(orderId)}`);
-    if (mesa !== undefined) lines.push(`${padRight("Mesa:", 12)} ${safe(mesa || "N/A")}`);
-    if (fecha) lines.push(`${padRight("Fecha:", 12)} ${safe(fecha)}`);
-    if (mesero !== undefined) lines.push(`${padRight("Mesero:", 12)} ${safe(mesero || "N/A")}`);
-    if (salaArea !== undefined) lines.push(`${padRight("Sala/Área:", 12)} ${safe(salaArea || "N/A")}`);
-
-    lines.push(divider(width, "-"));
+    lines.push(hr(width, "="));
 
     if (title && safe(title).trim()) {
         lines.push(centerText(safe(title).toUpperCase(), width));
-        lines.push(divider(width, "-"));
+        lines.push(hr(width, "-"));
     }
+
+    if (orderId) lines.push(twoCols("Orden:", safe(orderId), width));
+    if (mesa !== undefined) lines.push(twoCols("Mesa:", safe(mesa || "N/A"), width));
+    if (fecha) lines.push(twoCols("Fecha:", safe(fecha), width));
+    if (mesero !== undefined) lines.push(twoCols("Mesero:", safe(mesero || "N/A"), width));
+    if (salaArea !== undefined) lines.push(twoCols("Sala/Area:", safe(salaArea || "N/A"), width));
+
+    lines.push(hr(width, "-"));
 
     for (const item of items) {
         const qty = item?.qty ?? item?.quantity ?? item?.amount ?? item?.cant ?? 1;
         const name = item?.name ?? item?.title ?? item?.description ?? "ITEM";
 
-        lines.push(`x${safe(qty)} ${safe(name).toUpperCase()}`);
+        if (isProductionCommand) {
+            wrapText(`${safe(qty)} x ${String(name).toUpperCase()}`, width).forEach((line) =>
+                lines.push(line)
+            );
+        } else {
+            const rawAmount =
+                item?.total ??
+                item?.price ??
+                item?.unitPrice ??
+                null;
+
+            const amount =
+                effectiveShowItemPrices && rawAmount !== null && rawAmount !== undefined
+                    ? `RD$${toMoney(rawAmount)}`
+                    : "";
+
+            wrapItemLine(String(name).toUpperCase(), `x${safe(qty)}`, amount, width).forEach((line) =>
+                lines.push(line)
+            );
+        }
 
         if (Array.isArray(item?.modifiers) && item.modifiers.length) {
             for (const mod of item.modifiers) {
                 const modName = mod?.name ?? mod?.title ?? mod?.description ?? "Modificador";
-                wrapText(`• ${modName}`, width - 2).forEach((line) => lines.push(`  ${line}`));
+                wrapText(`+ ${modName}`, width - 2).forEach((line) => lines.push(` ${line}`));
             }
         }
 
         lines.push("");
     }
 
-    lines.push(divider(width, "-"));
+    if (!isProductionCommand && effectiveShowTotals) {
+        lines.push(hr(width, "-"));
 
-    if (orderNote && safe(orderNote).trim()) {
-        lines.push("NOTA DEL PEDIDO");
-        wrapText(orderNote, width).forEach((line) => lines.push(line));
-        lines.push(divider(width, "-"));
-    }
-
-    if (showTotals) {
         if (subtotal !== undefined && subtotal !== null) {
-            lines.push(`${padRight("Subtotal", 24)}${padLeft(toMoney(subtotal), 18)}`);
+            lines.push(moneyLine("Subtotal", subtotal, width));
         }
         if (tax !== undefined && tax !== null) {
-            lines.push(`${padRight("ITBIS", 24)}${padLeft(toMoney(tax), 18)}`);
+            lines.push(moneyLine("ITBIS", tax, width));
         }
         if (total !== undefined && total !== null) {
-            lines.push(`${padRight("Total", 24)}${padLeft(toMoney(total), 18)}`);
+            lines.push(moneyLine("TOTAL", total, width));
         }
         if (paymentMethod) {
-            lines.push(`${padRight("Pago", 24)}${padLeft(safe(paymentMethod), 18)}`);
+            lines.push(twoCols("Pago", safe(paymentMethod), width));
         }
-        lines.push(divider(width, "-"));
     }
 
-    lines.push(centerText("FIN PEDIDO", width));
+    lines.push(hr(width, "="));
     lines.push(centerText("Gracias por su compra", width));
 
     return lines.join("\n");
@@ -216,9 +242,11 @@ function buildInvoiceText({
                               showShipping = false,
                               shippingFee = 0,
                               totalToPay = 0,
+                              paperSize = "80mm",
                           }) {
-    const width = 42;
+    const width = getPaperWidth(paperSize);
     const lines = [];
+
 
     if (businessName) lines.push(centerText(businessName, width));
     if (rnc) lines.push(centerText(`RNC: ${safe(rnc)}`, width));
@@ -229,95 +257,96 @@ function buildInvoiceText({
 
     if (headerTitle) {
         wrapText(headerTitle, width).forEach((line) => lines.push(centerText(line, width)));
-    } else if (isFiscal) {
-        lines.push(centerText("FACTURA CON COMPROBANTE FISCAL", width));
     } else if (isPreInvoice) {
         lines.push(centerText("PREFACTURA", width));
+    } else if (isFiscal) {
+        lines.push(centerText("FACTURA CON COMPROBANTE FISCAL", width));
     } else {
-        lines.push(centerText("FACTURA PARA CONSUMIDOR FINAL", width));
+        lines.push(centerText("FACTURA CONSUMIDOR FINAL", width));
     }
+
+
 
     if (isFiscal) {
         if (ncfType) lines.push(centerText(`Tipo NCF: ${safe(ncfType)}`, width));
         if (ncfNumber) lines.push(centerText(`NCF: ${safe(ncfNumber)}`, width));
+        if (expirationDate) lines.push(centerText(`Vence: ${safe(expirationDate)}`, width));
     }
 
-    lines.push(centerText("Gracias por su compra", width));
-    lines.push(divider(width, "-"));
+    lines.push(hr(width, "="));
 
-    if (facturaNo) lines.push(`Factura No.: ${safe(facturaNo)}`);
-    if (mesa && mesa !== "N/A") lines.push(`Mesa: ${safe(mesa)}`);
-    if (mesero && mesero !== "N/A") lines.push(`Mesero: ${safe(mesero)}`);
-    if (salaArea && salaArea !== "N/A") lines.push(`Sala/Área: ${safe(salaArea)}`);
+    if (facturaNo) lines.push(twoCols("Factura:", safe(facturaNo), width));
+    if (orderId) lines.push(twoCols("Orden:", safe(orderId), width));
+    if (mesa && mesa !== "N/A") lines.push(twoCols("Mesa:", safe(mesa), width));
+    if (mesero && mesero !== "N/A") lines.push(twoCols("Mesero:", safe(mesero), width));
+    if (salaArea && salaArea !== "N/A") lines.push(twoCols("Sala/Area:", safe(salaArea), width));
+    if (fechaHora) lines.push(twoCols("Fecha:", safe(fechaHora), width));
 
     if (branchName || emissionPoint) {
-        lines.push(`Sucursal: ${safe(branchName || "Principal")}`);
-        lines.push(`Punto emision: ${safe(emissionPoint || "001")}`);
+        lines.push(twoCols("Sucursal:", safe(branchName || "Principal"), width));
+        lines.push(twoCols("Pto.Emision:", safe(emissionPoint || "001"), width));
     }
 
-    if (orderId) lines.push(`Order ID: ${safe(orderId)}`);
-    if (fechaHora) lines.push(`Fecha/Hora: ${safe(fechaHora)}`);
-
-    if (isFiscal) {
-        lines.push(`Fecha de Vencimiento: ${safe(expirationDate || "N/A")}`);
+    if (isFiscal && expirationDate) {
+        lines.push(twoCols("Vence:", safe(expirationDate), width));
     }
 
+    lines.push(hr(width, "-"));
     lines.push(`Cliente: ${safe(clientName || "Consumidor Final")}`);
-    if (clientPhone) lines.push(`Teléfono: ${safe(clientPhone)}`);
+    if (clientPhone) lines.push(`Tel: ${safe(clientPhone)}`);
+    if (clientRnc) lines.push(`RNC/Cedula: ${safe(clientRnc)}`);
     if (clientAddress) {
-        lines.push("Dirección:");
-        wrapText(clientAddress, width).forEach((line) => lines.push(line));
+        wrapText(`Dir: ${clientAddress}`, width).forEach((line) => lines.push(line));
     }
-    if (clientRnc) lines.push(`RNC/Cédula: ${safe(clientRnc)}`);
 
-    lines.push(divider(width, "-"));
-    lines.push("DETALLE DE CONSUMO");
-    lines.push(divider(width, "-"));
+    lines.push(hr(width, "-"));
+    lines.push(twoCols("Descripcion", "Cant   Valor", width));
+    lines.push(hr(width, "-"));
 
     for (const item of items) {
         const name = safe(item?.name || "Producto");
-        const qty = Number(item?.qty || 1);
-        const unitPrice = Number(item?.unitPrice || 0);
-        const itemTax = Number(item?.tax || 0);
+        const qty = Number(item?.qty || item?.quantity || 1);
+        const amount =
+            Number(item?.total ?? item?.price ?? item?.unitPrice ?? 0);
 
-        wrapText(name, width).forEach((line) => lines.push(line));
-        lines.push(`Cant: ${qty}`);
+        wrapItemLine(name, `${qty}`, `RD$${toMoney(amount)}`, width).forEach((line) =>
+            lines.push(line)
+        );
 
-        if (taxEnabled) {
-            lines.push(`${padRight("ITBIS:", 10)}${padLeft(`RD$${toMoney(itemTax)}`, width - 10)}`);
+        if (taxEnabled && Number(item?.tax || 0) > 0) {
+            lines.push(twoCols("  ITBIS", `RD$${toMoney(item.tax)}`, width));
         }
 
-        lines.push(`${padRight("Valor:", 10)}${padLeft(`RD$${toMoney(unitPrice)}`, width - 10)}`);
         lines.push("");
     }
 
-    lines.push(divider(width, "-"));
-    lines.push(`${padRight("Subtotal:", 18)}${padLeft(`RD$${toMoney(subtotal)}`, width - 18)}`);
+    lines.push(hr(width, "-"));
+    lines.push(moneyLine("Subtotal", subtotal, width));
 
     if (Number(discount) > 0) {
-        lines.push(`${padRight("Descuento:", 18)}${padLeft(`-RD$${toMoney(discount)}`, width - 18)}`);
+        lines.push(moneyLine("Descuento", -Math.abs(Number(discount)), width));
     }
     if (Number(tip) > 0) {
-        lines.push(`${padRight("Propina Legal:", 18)}${padLeft(`RD$${toMoney(tip)}`, width - 18)}`);
+        lines.push(moneyLine("Propina", tip, width));
     }
     if (taxEnabled && Number(tax) > 0) {
-        lines.push(`${padRight("ITBIS:", 18)}${padLeft(`RD$${toMoney(tax)}`, width - 18)}`);
+        lines.push(moneyLine("ITBIS", tax, width));
     }
     if (isAppDelivery && Number(commissionAmount) > 0) {
-        lines.push(
-            `${padRight(`Comisión (${safe(commissionPct)}%):`, 18)}${padLeft(`RD$${toMoney(commissionAmount)}`, width - 18)}`
-        );
+        lines.push(moneyLine(`Comision ${safe(commissionPct)}%`, commissionAmount, width));
     }
     if (showShipping && Number(shippingFee) > 0) {
-        lines.push(`${padRight("Envío:", 18)}${padLeft(`RD$${toMoney(shippingFee)}`, width - 18)}`);
+        lines.push(moneyLine("Envio", shippingFee, width));
     }
 
-    lines.push(divider(width, "-"));
-    lines.push(`${padRight("TOTAL A PAGAR:", 18)}${padLeft(`RD$${toMoney(totalToPay)}`, width - 18)}`);
-
+    lines.push(hr(width, "="));
+    lines.push(moneyLine("TOTAL A PAGAR", totalToPay, width));
     if (paymentMethod) {
-        lines.push(`${padRight("Método pago:", 18)}${padLeft(safe(paymentMethod), width - 18)}`);
+        lines.push(twoCols("Metodo:", safe(paymentMethod), width));
     }
+
+    lines.push(hr(width, "="));
+    lines.push(centerText("Gracias por su compra", width));
 
     return lines.join("\n");
 }

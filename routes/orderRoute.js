@@ -16,7 +16,8 @@ const {
     updateOrder,
     deleteOrder,
     updatePaymentMethod,
-    getSalesByProductReport
+    getSalesByProductReport,
+    sendOrderToProduction,
 } = require("../controllers/orderController");
 
 /**
@@ -27,6 +28,12 @@ router.get(
     verifyToken,
     tenantMiddleware,
     getOrders
+);
+router.post(
+    "/:id/send-to-production",
+    verifyToken,
+    tenantMiddleware,
+    sendOrderToProduction
 );
 router.get("/:orderId/invoice", verifyToken, async (req, res) => {
     try {

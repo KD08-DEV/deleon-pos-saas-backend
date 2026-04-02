@@ -199,33 +199,50 @@ exports.updateEmployee = async (req, res) => {
             });
         }
 
-        // Preparar campos a actualizar
+// Guardar rol anterior antes de modificar nada
+        const previousRole = employee.role;
+
+// Preparar campos a actualizar
         const updateData = {};
         if (name && name.trim()) updateData.name = name.trim();
+
         if (email && email.trim()) {
+            const normalizedEmail = email.trim().toLowerCase();
+
             // Verificar que el email no esté en uso por otro usuario del mismo tenant
-            const existingUser = await User.findOne({ 
-                tenantId: req.user.tenantId, 
-                email: email.trim(),
+            const existingUser = await User.findOne({
+                tenantId: req.user.tenantId,
+                email: normalizedEmail,
                 _id: { $ne: id }
             });
+
             if (existingUser) {
-                return res.status(400).json({ success: false, message: "El email ya está en uso por otro empleado" });
+                return res.status(400).json({
+                    success: false,
+                    message: "El email ya está en uso por otro empleado"
+                });
             }
-            updateData.email = email.trim();
+
+            updateData.email = normalizedEmail;
         }
+
         if (phone) {
             const phoneNum = Number(phone);
             if (isNaN(phoneNum) || phoneNum.toString().length !== 10) {
-                return res.status(400).json({ success: false, message: "El teléfono debe ser un número de 10 dígitos" });
+                return res.status(400).json({
+                    success: false,
+                    message: "El teléfono debe ser un número de 10 dígitos"
+                });
             }
             updateData.phone = phoneNum;
         }
+
         if (role && ["Admin", "Camarero", "Cajera"].includes(role)) {
             updateData.role = role;
         }
-        // ✅ Enforce plan limits on role change
-        if (role && role !== employee.role) {
+
+// ✅ Enforce plan limits on role change
+        if (role && role !== previousRole) {
             const tenantId = req.user.tenantId;
 
             const tenant = await Tenant.findOne({ tenantId }).select("plan");
@@ -281,7 +298,7 @@ exports.updateEmployee = async (req, res) => {
         }
 
         // Actualizar contraseña si se proporciona
-        if (password && password.trim()) {
+        if (typeof password === "string" && password.trim().length > 0) {
             if (password.length < 6) {
                 return res.status(400).json({ success: false, message: "La contraseña debe tener al menos 6 caracteres" });
             }
@@ -299,21 +316,20 @@ exports.updateEmployee = async (req, res) => {
 
         const updatedEmployee = await User.findById(employee._id).select("name email phone role");
 
-        // Actualizar membership si el rol cambió
-        if (role && role !== employee.role) {
+// Actualizar membership si el rol cambió
+        if (role && role !== previousRole) {
             const Membership = require("../models/membershipModel");
             const membershipRoleMap = {
-                "Admin": "Admin",
-                "Cajera": "Cajera",
-                "Camarero": "Camarero"
+                Admin: "Admin",
+                Cajera: "Cajera",
+                Camarero: "Camarero",
             };
-            
+
             await Membership.updateMany(
                 { user: id, tenantId: req.user.tenantId },
                 { $set: { role: membershipRoleMap[role] || role } }
             );
         }
-
         res.status(200).json({ 
             success: true, 
             message: "Empleado actualizado exitosamente", 

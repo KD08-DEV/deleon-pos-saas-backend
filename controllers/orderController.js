@@ -8,6 +8,8 @@ const Dish = require("../models/dish"); // ajusta si el nombre es dishModel.js
 // const InventoryMovement = require("../models/inventoryMovementModel"); // DEPRECATED
 const Customer = require("../models/customerModel");
 const { deductInventoryForOrder, restoreInventoryForOrder } = require("../services/inventory/deductInventoryForOrder");
+const Printer = require("../models/printerModel");
+const networkPrintService = require("../services/networkPrintService");
 
 
 
@@ -100,7 +102,173 @@ function normalizeOrderStatus(s) {
 
     return map[v] || "En Progreso";
 }
+const VALID_PRODUCTION_AREAS = ["kitchen", "bar", "other"];
 
+function normalizeProductionArea(value = "kitchen") {
+    const v = String(value || "kitchen").trim().toLowerCase();
+    return VALID_PRODUCTION_AREAS.includes(v) ? v : "kitchen";
+}
+
+function makeLineId() {
+    return new mongoose.Types.ObjectId().toString();
+}
+
+function cloneArray(value) {
+    return Array.isArray(value) ? JSON.parse(JSON.stringify(value)) : [];
+}
+
+function normalizeToken(value = "") {
+    return String(value || "").trim().toLowerCase();
+}
+
+function stableTokens(arr = []) {
+    return cloneArray(arr)
+        .map((x) => {
+            if (typeof x === "string") return x.trim().toLowerCase();
+            return (
+                x?.name ||
+                x?.label ||
+                x?.title ||
+                x?.value ||
+                JSON.stringify(x)
+            )
+                .trim?.()
+                ?.toLowerCase?.() ?? String(x).trim().toLowerCase();
+        })
+        .sort();
+}
+
+function buildOrderItemComparableKey(item = {}) {
+    const productRef = item?.dishId
+        ? String(item.dishId)
+        : `name:${normalizeToken(item?.name)}`;
+
+    const qtyType = String(item?.qtyType || "unit");
+    const weightUnit = qtyType === "weight" ? String(item?.weightUnit || "lb") : "";
+
+    return JSON.stringify({
+        productRef,
+        name: normalizeToken(item?.name),
+        qtyType,
+        weightUnit,
+        note: normalizeToken(item?.note || item?.comment || item?.specialInstructions || ""),
+        addons: stableTokens(
+            item?.addons ||
+            item?.addOns ||
+            item?.extras ||
+            item?.extraIngredients ||
+            item?.selectedExtras ||
+            []
+        ),
+        modifiers: stableTokens(
+            item?.modifiers ||
+            item?.selectedOptions ||
+            item?.options ||
+            []
+        ),
+    });
+}
+
+function buildProductionModifiers(item = {}) {
+    const out = [];
+
+    const note = String(item?.note || "").trim();
+    if (note) out.push({ name: note });
+
+    const addons = Array.isArray(item?.addons) ? item.addons : [];
+    for (const a of addons) {
+        const name = a?.name || a?.label || a?.title || String(a || "").trim();
+        if (String(name).trim()) out.push({ name: String(name).trim() });
+    }
+
+    const modifiers = Array.isArray(item?.modifiers) ? item.modifiers : [];
+    for (const m of modifiers) {
+        const name = m?.name || m?.label || m?.title || String(m || "").trim();
+        if (String(name).trim()) out.push({ name: String(name).trim() });
+    }
+
+    return out;
+}
+
+async function hydrateOrderItems({ items, tenantId, clientId, currentItems = [] }) {
+    const normalized = normalizeAndPriceItems(items);
+
+    const validDishIds = [
+        ...new Set(
+            normalized
+                .map((it) => String(it.dishId || ""))
+                .filter((id) => mongoose.Types.ObjectId.isValid(id))
+        ),
+    ];
+
+    const dishes = validDishIds.length
+        ? await Dish.find({
+            _id: { $in: validDishIds },
+            tenantId,
+            $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+        })
+            .select("_id productionArea")
+            .lean()
+        : [];
+
+    const dishAreaMap = new Map(
+        dishes.map((d) => [String(d._id), normalizeProductionArea(d.productionArea)])
+    );
+
+    const currentByLineId = new Map(
+        (currentItems || [])
+            .filter((it) => it?.lineId)
+            .map((it) => [String(it.lineId), it])
+    );
+
+    const buckets = new Map();
+    for (const existing of currentItems || []) {
+        const key = buildOrderItemComparableKey(existing);
+        if (!buckets.has(key)) buckets.set(key, []);
+        buckets.get(key).push(existing);
+    }
+
+    return normalized.map((item) => {
+        let matched = null;
+
+        if (item.lineId && currentByLineId.has(String(item.lineId))) {
+            matched = currentByLineId.get(String(item.lineId));
+        }
+
+        if (!matched) {
+            const key = buildOrderItemComparableKey(item);
+            const bucket = buckets.get(key) || [];
+            matched = bucket.length ? bucket.shift() : null;
+
+            if (bucket.length) buckets.set(key, bucket);
+            else buckets.delete(key);
+        }
+
+        const quantity = Number(item.quantity || 0);
+        const prevPrintedQty = Number(matched?.printedQty || 0);
+
+        return {
+            ...item,
+            lineId: matched?.lineId || item.lineId || makeLineId(),
+            productionArea: normalizeProductionArea(
+                item.productionArea ||
+                matched?.productionArea ||
+                dishAreaMap.get(String(item.dishId || "")) ||
+                "kitchen"
+            ),
+            printedQty: Math.max(0, Math.min(prevPrintedQty, quantity)),
+        };
+    });
+}
+
+async function findActiveProductionPrinter({ tenantId, clientId, category }) {
+    return Printer.findOne({
+        tenantId,
+        clientId,
+        category,
+        isActive: true,
+    }).sort({ isDefault: -1, createdAt: -1 });
+}
 
 
 
@@ -118,11 +286,9 @@ function normalizeAndPriceItems(items) {
 
     return items.map((it) => {
         const dishId = it.dishId || null;
-
         const name = (it.name || "").toString().trim();
         const qtyType = (it.qtyType || "unit").toString();
         const weightUnit = (it.weightUnit || "lb").toString();
-
         const quantity = Number(it.quantity ?? it.qty ?? 0);
 
         const unitPrice = Number(
@@ -133,13 +299,15 @@ function normalizeAndPriceItems(items) {
         );
 
         if (!name) throw new Error("Item sin name");
-        if (!Number.isFinite(quantity) || quantity <= 0) throw new Error(`Cantidad inválida para ${name}`);
-        if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new Error(`Precio inválido para ${name}`);
+        if (!Number.isFinite(quantity) || quantity <= 0) {
+            throw new Error(`Cantidad inválida para ${name}`);
+        }
+        if (!Number.isFinite(unitPrice) || unitPrice < 0) {
+            throw new Error(`Precio inválido para ${name}`);
+        }
 
         const price = Number((unitPrice * quantity).toFixed(2));
         const presentation = (it.presentation || "Regular").toString().trim();
-
-
 
         return {
             dishId,
@@ -150,6 +318,26 @@ function normalizeAndPriceItems(items) {
             quantity,
             unitPrice,
             price,
+
+            note: String(it?.note || it?.comment || it?.specialInstructions || "").trim(),
+            addons: cloneArray(
+                it?.addons ||
+                it?.addOns ||
+                it?.extras ||
+                it?.extraIngredients ||
+                it?.selectedExtras ||
+                []
+            ),
+            modifiers: cloneArray(
+                it?.modifiers ||
+                it?.selectedOptions ||
+                it?.options ||
+                []
+            ),
+
+            lineId: it?.lineId || null,
+            productionArea: normalizeProductionArea(it?.productionArea || "kitchen"),
+            printedQty: Number(it?.printedQty || 0),
         };
     });
 }
@@ -170,11 +358,12 @@ const addOrder = async (req, res, next) => {
             customerDetails = {},
             orderStatus,
             items = [],
-            table = null, // ✅ ahora puede ser null
+            table = null,
             paymentMethod = "Efectivo",
             discount = 0,
             orderSource,
             orderNote = "",
+            fiscal: incomingFiscal = null,
         } = req.body;
         const normalizedStatus = normalizeOrderStatus(orderStatus);
 
@@ -207,6 +396,58 @@ const addOrder = async (req, res, next) => {
         }
         const tenant = await Tenant.findOne({ tenantId }).lean();
         if (!tenant) return next(createHttpError(404, "TENANT_NOT_FOUND"));
+        const fiscalFeatureEnabled = tenant?.fiscal?.enabled === true;
+
+        let fiscalPayload = {
+            requested: false,
+            ncfType: "B02",
+        };
+
+        let topLevelNcfNumber = null;
+
+        if (incomingFiscal?.requested === true) {
+            if (!fiscalFeatureEnabled) {
+                return next(createHttpError(400, "FISCAL_NOT_ENABLED_FOR_TENANT"));
+            }
+
+            const requestedType = incomingFiscal?.ncfType || "B02";
+
+            const { type, ncfNumber } = await allocateNCF({
+                tenantId,
+                ncfType: requestedType,
+            });
+
+            const { internalSeq, internalNumber } = await allocateInternalSeq({ tenantId });
+
+            const emissionPoint =
+                String(tenant?.fiscal?.emissionPoint || "001").trim() || "001";
+
+            const branchName =
+                String(tenant?.fiscal?.branchName || "Principal").trim() || "Principal";
+
+            const expiresAtRaw =
+                tenant?.fiscal?.ncfConfig?.[type]?.expiresAt ??
+                tenant?.fiscal?.ncfConfig?.[type]?.expirationDate ??
+                tenant?.fiscal?.expiresAt ??
+                null;
+
+            const expirationDate = normalizeMongoDate(expiresAtRaw);
+            const expirationDateISO = expirationDate ? expirationDate.toISOString() : null;
+
+            fiscalPayload = {
+                requested: true,
+                ncfType: type,
+                ncfNumber,
+                issuedAt: new Date(),
+                expirationDate: expirationDateISO,
+                internalSeq,
+                internalNumber,
+                emissionPoint,
+                branchName,
+            };
+
+            topLevelNcfNumber = ncfNumber;
+        }
 
         // Canal / comisión (ya con tenant disponible)
         const source = normalizeSource(orderSource);
@@ -219,8 +460,14 @@ const addOrder = async (req, res, next) => {
 
         // Validar que existan items solo si vienen desde el menú
         const normItems = Array.isArray(items) && items.length
-            ? normalizeAndPriceItems(items)
+            ? await hydrateOrderItems({
+                items,
+                tenantId,
+                clientId,
+                currentItems: [],
+            })
             : [];
+
         const isDraft = normItems.length === 0;
 
 
@@ -269,8 +516,10 @@ const addOrder = async (req, res, next) => {
         let resolvedCustomerDetails = {
             name: String(customerDetails?.name ?? ""),
             phone: String(customerDetails?.phone ?? ""),
-            address: String(customerDetails?.address ?? ""), // ✅ NUEVO
+            address: String(customerDetails?.address ?? ""),
             guests: Number(customerDetails?.guests ?? 0),
+            rnc: String(customerDetails?.rnc ?? customerDetails?.rncCedula ?? ""),
+            rncCedula: String(customerDetails?.rncCedula ?? customerDetails?.rnc ?? ""),
         };
 
         if (customerId) {
@@ -295,6 +544,8 @@ const addOrder = async (req, res, next) => {
                 phone: found.phone || "",
                 address: found.address || "",
                 guests: Number(customerDetails?.guests ?? 0),
+                rnc: String(customerDetails?.rnc ?? customerDetails?.rncCedula ?? found?.rnc ?? found?.rncCedula ?? ""),
+                rncCedula: String(customerDetails?.rncCedula ?? customerDetails?.rnc ?? found?.rncCedula ?? found?.rnc ?? ""),
             };
         }
 
@@ -303,8 +554,8 @@ const addOrder = async (req, res, next) => {
         const payload = {
             tenantId,
             clientId,
-            customerId: resolvedCustomerId,            // ✅ NUEVO (si no hay, queda null)
-            customerDetails: resolvedCustomerDetails,  // ✅ NUEVO (snapshot)
+            customerId: resolvedCustomerId,
+            customerDetails: resolvedCustomerDetails,
             orderStatus: normalizedStatus,
             isDraft,
 
@@ -316,12 +567,13 @@ const addOrder = async (req, res, next) => {
                 taxEnabled: true,
                 tip,
                 tipAmount: tip,
-
-
                 deliveryFee,
-
                 totalWithTax,
             },
+
+            fiscal: fiscalPayload,
+            ...(topLevelNcfNumber ? { ncfNumber: topLevelNcfNumber } : {}),
+
             orderNote: String(orderNote || "").trim(),
             orderSource: source,
             commissionRate: round2(rate),
@@ -678,8 +930,24 @@ const updateOrder = async (req, res, next) => {
                 branchName,
             };
         } else if (fiscalFeatureEnabled && incomingFiscal?.requested === true && alreadyHasNCF) {
-        // Backfill por si la orden vieja tiene NCF pero le faltan campos
-        const currentType = current?.fiscal?.ncfType || incomingFiscal?.ncfType || "B02";
+            // Backfill por si la orden vieja tiene NCF pero le faltan campos
+            const existingNcfNumber = String(
+                current?.fiscal?.ncfNumber ||
+                current?.ncfNumber ||
+                safeUpdate?.fiscal?.ncfNumber ||
+                ""
+            ).trim().toUpperCase();
+
+            const inferredTypeFromNumber =
+                existingNcfNumber.startsWith("B01") ? "B01" :
+                    existingNcfNumber.startsWith("B02") ? "B02" :
+                        null;
+
+            const currentType =
+                inferredTypeFromNumber ||
+                current?.fiscal?.ncfType ||
+                incomingFiscal?.ncfType ||
+                "B02";
 
         const expiresAtRaw =
             tenant?.fiscal?.ncfConfig?.[currentType]?.expiresAt ??
@@ -690,15 +958,34 @@ const updateOrder = async (req, res, next) => {
         const expirationDate = normalizeMongoDate(expiresAtRaw);
         const expirationDateISO = expirationDate ? expirationDate.toISOString() : null;
 
-        safeUpdate.fiscal = {
-            ...(safeUpdate.fiscal || {}),
-            requested: true,
-            ncfType: currentType,
-            // si ya existe, lo conserva; si falta, lo rellena
-            branchName: safeUpdate.fiscal.branchName || String(tenant?.fiscal?.branchName || "Principal").trim() || "Principal",
-            emissionPoint: safeUpdate.fiscal.emissionPoint || String(tenant?.fiscal?.emissionPoint || "001").trim() || "001",
-            expirationDate: safeUpdate.fiscal.expirationDate || expirationDateISO,
-        };
+            safeUpdate.ncfNumber =
+                current?.fiscal?.ncfNumber ||
+                current?.ncfNumber ||
+                safeUpdate?.fiscal?.ncfNumber ||
+                safeUpdate?.ncfNumber ||
+                null;
+
+            safeUpdate.fiscal = {
+                ...(safeUpdate.fiscal || {}),
+                requested: true,
+                ncfType: currentType,
+                ncfNumber:
+                    current?.fiscal?.ncfNumber ||
+                    current?.ncfNumber ||
+                    safeUpdate?.fiscal?.ncfNumber ||
+                    null,
+                branchName:
+                    safeUpdate.fiscal.branchName ||
+                    String(tenant?.fiscal?.branchName || "Principal").trim() ||
+                    "Principal",
+                emissionPoint:
+                    safeUpdate.fiscal.emissionPoint ||
+                    String(tenant?.fiscal?.emissionPoint || "001").trim() ||
+                    "001",
+                expirationDate:
+                    safeUpdate.fiscal.expirationDate ||
+                    expirationDateISO,
+            };
     }
         if (incomingFiscal?.requested === true && !fiscalFeatureEnabled) {
             return next(createHttpError(400, "FISCAL_NOT_ENABLED_FOR_TENANT"));
@@ -707,7 +994,12 @@ const updateOrder = async (req, res, next) => {
 
         // ✅ Normalizar items si vienen del front
         if (req.body.items) {
-            safeUpdate.items = normalizeAndPriceItems(req.body.items);
+            safeUpdate.items = await hydrateOrderItems({
+                items: req.body.items,
+                tenantId,
+                clientId,
+                currentItems: current.items || [],
+            });
         }
 
         // Draft logic: si tiene al menos 1 item => ya no es borrador
@@ -894,7 +1186,7 @@ const updateOrder = async (req, res, next) => {
 
             // 1) Buscar dishes (incluye inventoryCategoryId + recipe)
             const dishes = await Dish.find({ _id: { $in: dishIds } })
-                .select("_id category inventoryCategoryId isInventoryItem avgCost lastCost recipe")
+                .select("_id category inventoryCategoryId isInventoryItem avgCost lastCost recipe productionArea")
                 .lean();
 
             const dishMap = new Map(dishes.map((d) => [String(d._id), d]));
@@ -943,6 +1235,13 @@ const updateOrder = async (req, res, next) => {
             for (const it of items) {
                 const d = it.dishId ? dishMap.get(String(it.dishId)) : null;
 
+                it.productionArea = normalizeProductionArea(it.productionArea || d?.productionArea || "kitchen");
+
+                if (!it.lineId) it.lineId = makeLineId();
+                if (!Number.isFinite(Number(it.printedQty))) it.printedQty = 0;
+                if (!it.note) it.note = "";
+                if (!Array.isArray(it.addons)) it.addons = [];
+                if (!Array.isArray(it.modifiers)) it.modifiers = [];
                 // ✅ Categoría oficial: InventoryCategory.name si existe
                 const invCatName = d?.inventoryCategoryId
                     ? invCatMap.get(String(d.inventoryCategoryId))
@@ -1270,9 +1569,205 @@ const getSalesByProductReport = async (req, res) => {
         return res.status(500).json({ success: false, message: "Error interno" });
     }
 };
+const sendOrderToProduction = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return next(createHttpError(404, "Invalid id!"));
+        }
+
+        const tenantId = req.tenantId || req.user?.tenantId;
+        if (!tenantId) {
+            return next(createHttpError(401, "TENANT_NOT_FOUND"));
+        }
+
+        const clientId = req.clientId;
+
+        const order = await Order.findOne({
+            _id: id,
+            tenantId,
+            $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+        })
+            .populate("table", "tableNo name area")
+            .populate("user", "name");
+
+        if (!order) {
+            return next(createHttpError(404, "Order not found!"));
+        }
+
+        const tenant = await Tenant.findOne({ tenantId }).lean();
+
+        const pendingByArea = {};
+
+        for (const item of order.items || []) {
+            const quantity = Number(item?.quantity || 0);
+            const printedQty = Number(item?.printedQty || 0);
+            const pendingQty = Number((quantity - printedQty).toFixed(3));
+
+            if (pendingQty <= 0) continue;
+
+            const area = normalizeProductionArea(item?.productionArea || "kitchen");
+
+            if (!pendingByArea[area]) pendingByArea[area] = [];
+            pendingByArea[area].push({
+                lineId: item.lineId,
+                item,
+                pendingQty,
+            });
+        }
+
+        const areas = Object.keys(pendingByArea);
+
+        if (!areas.length) {
+            return res.status(200).json({
+                success: true,
+                message: "NO_PENDING_ITEMS_FOR_PRODUCTION",
+                data: {
+                    printed: [],
+                    skipped: [],
+                },
+            });
+        }
+
+        const printed = [];
+        const skipped = [];
+
+        for (const area of areas) {
+            const printer = await findActiveProductionPrinter({
+                tenantId,
+                clientId,
+                category: area,
+            });
+
+            if (!printer) {
+                skipped.push({
+                    area,
+                    reason: "PRINTER_NOT_FOUND",
+                });
+                continue;
+            }
+
+            if (printer.mode !== "network") {
+                skipped.push({
+                    area,
+                    reason: "PRINTER_IS_NOT_NETWORK_MODE",
+                    printerId: printer._id,
+                    alias: printer.alias,
+                });
+                continue;
+            }
+
+            const areaItems = pendingByArea[area] || [];
+
+            const title =
+                area === "bar"
+                    ? "BAR"
+                    : area === "kitchen"
+                        ? "COCINA"
+                        : "PRODUCCION";
+
+            const text = networkPrintService.buildTicketText({
+                businessName: tenant?.business?.name || tenant?.name || "",
+                rnc: tenant?.business?.rnc || tenant?.fiscal?.rnc || "",
+                address: tenant?.business?.address || "",
+                phone: tenant?.business?.phone || "",
+                title,
+                orderId:
+                    order?.operationNumber ||
+                    order?._id?.toString()?.slice(-6)?.toUpperCase() ||
+                    "N/A",
+                mesa:
+                    order?.table?.tableNo
+                        ? `Mesa ${order.table.tableNo}`
+                        : order?.table?.name || "N/A",
+                mesero: order?.user?.name || "N/A",
+                fecha: new Date().toLocaleString("es-DO"),
+                salaArea: order?.table?.area || "N/A",
+                orderNote: order?.orderNote || "",
+                items: areaItems.map(({ item, pendingQty }) => ({
+                    name: item?.name || "Producto",
+                    qty: pendingQty,
+                    modifiers: buildProductionModifiers(item),
+                })),
+                showTotals: false,
+            });
+
+            const payload = networkPrintService.buildEscPosText(text);
+
+            try {
+                const result = await networkPrintService.sendToNetworkPrinter({
+                    ip: printer.ip,
+                    port: printer.port || 9100,
+                    payload,
+                });
+
+                for (const { lineId, pendingQty } of areaItems) {
+                    const target = (order.items || []).find((it) => String(it.lineId) === String(lineId));
+                    if (!target) continue;
+
+                    const nextPrintedQty = Number(target.printedQty || 0) + Number(pendingQty || 0);
+                    target.printedQty = Number(nextPrintedQty.toFixed(3));
+                }
+
+                printed.push({
+                    area,
+                    printerId: printer._id,
+                    alias: printer.alias,
+                    items: areaItems.map(({ item, pendingQty }) => ({
+                        lineId: item.lineId,
+                        name: item.name,
+                        qty: pendingQty,
+                    })),
+                    result,
+                });
+            } catch (err) {
+                skipped.push({
+                    area,
+                    reason: err?.message || "NETWORK_PRINT_FAILED",
+                    printerId: printer._id,
+                    alias: printer.alias,
+                    items: areaItems.map(({ item, pendingQty }) => ({
+                        lineId: item.lineId,
+                        name: item.name,
+                        qty: pendingQty,
+                    })),
+                });
+            }
+        }
+
+        await order.save();
+
+        return res.status(200).json({
+            success: skipped.length === 0,
+            message:
+                printed.length && skipped.length
+                    ? "PRODUCTION_PRINT_PARTIAL"
+                    : printed.length
+                        ? "PRODUCTION_PRINT_OK"
+                        : "PRODUCTION_PRINT_SKIPPED",
+            data: {
+                printed,
+                skipped,
+                orderId: order._id,
+            },
+        });
+    } catch (error) {
+        console.error("[sendOrderToProduction] error:", error);
+        return next(createHttpError(500, "SEND_TO_PRODUCTION_FAILED"));
+    }
+};
 
 
 
 
-
-module.exports = { addOrder, getOrderById, getOrders, updateOrder, deleteOrder,updatePaymentMethod, getSalesByProductReport  };
+module.exports = {
+    addOrder,
+    getOrderById,
+    getOrders,
+    updateOrder,
+    deleteOrder,
+    updatePaymentMethod,
+    getSalesByProductReport,
+    sendOrderToProduction,
+};

@@ -8,6 +8,13 @@ const dishSchema = new mongoose.Schema(
         price: { type: Number, required: true, min: 0 },
         category: { type: String, required: true, trim: true },
 
+        productionArea: {
+            type: String,
+            enum: ["kitchen", "bar", "other"],
+            default: "kitchen",
+            index: true,
+        },
+
         // Inventario
         inventoryCategoryId: {
             type: mongoose.Schema.Types.ObjectId,

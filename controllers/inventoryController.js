@@ -1035,6 +1035,34 @@ exports.updateMermaBatch = async (req, res) => {
         return res.status(500).json({ success: false, message: "Error actualizando lote." });
     }
 };
+exports.unarchiveItem = async (req, res, next) => {
+    try {
+        const { tenantId, clientId } = getScope(req);
+        if (!tenantId) return next(createHttpError(401, "TENANT_NOT_FOUND"));
+
+        const { id } = req.params;
+        if (!isObjId(id)) return next(createHttpError(400, "INVALID_ITEM_ID"));
+
+        const updated = await Dish.findOneAndUpdate(
+            {
+                _id: id,
+                tenantId,
+                clientId,
+                $or: [
+                    { isInventoryItem: true },
+                    { inventoryCategoryId: { $ne: null, $exists: true } },
+                ],
+            },
+            { $set: { isArchived: false } },
+            { new: true }
+        ).lean();
+
+        if (!updated) return next(createHttpError(404, "ITEM_NOT_FOUND"));
+        return res.json({ success: true, item: updated });
+    } catch (e) {
+        next(e);
+    }
+};
 exports.processYield = async (req, res, next) => {
     const session = await mongoose.startSession();
 

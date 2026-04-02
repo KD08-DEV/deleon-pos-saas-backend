@@ -107,8 +107,8 @@ const updateTable = async (req, res, next) => {
         if (area !== undefined) update.area = String(area || "General").trim();
 
         // Solo valida orderId cuando status quiere ser Ocupada/Reservada
-        if ((status === "Ocupada" || status === "Reservada") && !orderId) {
-            return next(createHttpError(400, "No se puede marcar la mesa como reservada/ocupada sin una orden"));
+        if (status === "Reservada" && !orderId) {
+            return next(createHttpError(400, "No se puede marcar la mesa como reservada sin una orden"));
         }
 
         if (status === "Disponible") {
@@ -122,7 +122,12 @@ const updateTable = async (req, res, next) => {
             );
 
             const io = req.app?.get?.("io");
-            io?.to?.(req.user.tenantId)?.emit?.("tenant:tablesUpdated", { tenantId: req.user.tenantId });
+            io?.to?.(`tenant:${req.user.tenantId}`)?.emit?.("tenant:tablesUpdated", {
+                tenantId: req.user.tenantId,
+                tableId: String(table?._id || id),
+                orderId: null,
+                status: "Disponible",
+            });
 
             return res.status(200).json({
                 success: true,
@@ -133,13 +138,21 @@ const updateTable = async (req, res, next) => {
 
         const nextStatus = status === "Reservada" ? "Reservada" : "Ocupada";
         update.status = nextStatus;
-        update.currentOrder = orderId;
+        update.currentOrder = orderId || null;
 
         const table = await Table.findOneAndUpdate(
             { _id: id, tenantId: req.user.tenantId, clientId },
             update,
             { new: true }
         );
+
+        const io = req.app?.get?.("io");
+        io?.to?.(`tenant:${req.user.tenantId}`)?.emit?.("tenant:tablesUpdated", {
+            tenantId: req.user.tenantId,
+            tableId: String(table?._id || id),
+            orderId: update.currentOrder ? String(update.currentOrder) : null,
+            status: nextStatus,
+        });
 
         return res.status(200).json({
             success: true,

@@ -2,31 +2,38 @@ const mongoose = require("mongoose");
 
 const itemSchema = new mongoose.Schema(
     {
+        lineId: { type: String, required: true, trim: true },
+
         dishId: { type: mongoose.Schema.Types.ObjectId, ref: "dish", required: false },
 
         name: { type: String, required: true, trim: true },
-        // ✅ NUEVO: “Presentación” estilo reporte químicos (Regular / Grande / Combo / etc.)
+
         presentation: { type: String, default: "Regular", trim: true },
 
-        // ✅ NUEVO: snapshot para reportes (no depende de cambios futuros)
         category: { type: String, default: "", trim: true },
 
-        // ✅ NUEVO: costo unitario congelado (para COGS por ítem)
         unitCost: { type: Number, default: 0 },
 
-        // ✅ NUEVO: ITBIS prorrateado por ítem (para reporte por producto)
         taxAmount: { type: Number, default: 0 },
-
 
         qtyType: { type: String, enum: ["unit", "weight"], default: "unit" },
         weightUnit: { type: String, enum: ["lb", "kg"], default: "lb" },
 
         unitPrice: { type: Number, required: true, min: 0 },
-
-        // ahora soporta 0.75 lb, 1.25 lb, etc.
         quantity: { type: Number, required: true, min: 0.001 },
-
         price: { type: Number, required: true, min: 0 },
+
+        note: { type: String, default: "", trim: true },
+        addons: { type: [mongoose.Schema.Types.Mixed], default: [] },
+        modifiers: { type: [mongoose.Schema.Types.Mixed], default: [] },
+
+        productionArea: {
+            type: String,
+            enum: ["kitchen", "bar", "other"],
+            default: "kitchen",
+        },
+
+        printedQty: { type: Number, default: 0, min: 0 },
     },
     { _id: false }
 );
@@ -94,18 +101,20 @@ const orderSchema = new mongoose.Schema(
         // --- FACTURACIÓN FISCAL (NCF) ---
         fiscal: {
             requested: { type: Boolean, default: false },
-            ncfType: { type: String, default: "B02" },     // B01, B02, etc.
-            ncfNumber: { type: String, default: null },    // B0200000001 (B02 + 8 dígitos)
+            ncfType: { type: String, default: "B02" },
+            ncfNumber: { type: String, default: null },
             issuedAt: { type: Date, default: null },
 
-            // NUEVO: secuencial interno de empresa/registradora (no es el OrderId)
+            expirationDate: { type: Date, default: null },
+
             internalSeq: { type: Number, default: null },
+            internalNumber: { type: String, default: null },
 
-            // NUEVO: punto de emisión / sucursal (simple)
-            emissionPoint: { type: String, default: "001" }, // ej: 001
+            emissionPoint: { type: String, default: "001" },
+            branchName: { type: String, default: "Principal" },
 
-            // NUEVO: fecha de impresión (cuando se genera el PDF)
             printedAt: { type: Date, default: null },
+            preInvoice: { type: Boolean, default: false },
         },
         inventoryDeducted: { type: Boolean, default: false },
         inventoryDeductedAt: { type: Date, default: null },

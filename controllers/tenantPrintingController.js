@@ -376,11 +376,9 @@ exports.printNetworkTicket = async (req, res) => {
             mesa,
             mesero,
             fecha,
+            salaArea,
+            orderNote,
             items,
-            subtotal,
-            tax,
-            total,
-            paymentMethod,
         } = req.body || {};
 
         if (!Array.isArray(items) || items.length === 0) {
@@ -390,23 +388,52 @@ exports.printNetworkTicket = async (req, res) => {
             });
         }
 
-        const text = networkPrintService.buildTicketText({
-            businessName,
-            rnc,
-            address,
-            phone,
-            title: title || "TICKET",
-            orderId,
-            mesa,
-            mesero,
-            fecha,
-            items,
-            subtotal,
-            tax,
-            total,
-            paymentMethod,
-        });
+        const normalizedItems = items.map((item) => ({
+            name: String(
+                item?.name ||
+                item?.title ||
+                item?.description ||
+                item?.dishName ||
+                "ITEM"
+            ).trim(),
+            qty: Number(item?.qty ?? item?.quantity ?? item?.amount ?? item?.cant ?? 1) || 1,
+            modifiers: Array.isArray(item?.modifiers)
+                ? item.modifiers.map((mod) => ({
+                    name: String(
+                        mod?.name ||
+                        mod?.title ||
+                        mod?.description ||
+                        ""
+                    ).trim(),
+                })).filter((mod) => mod.name)
+                : [],
+        }));
 
+        const normalizedTitle = String(title || "TICKET").trim().toUpperCase();
+
+        const text = networkPrintService.buildTicketText({
+            businessName: String(businessName || "").trim(),
+            rnc: String(rnc || "").trim(),
+            address: String(address || "").trim(),
+            phone: String(phone || "").trim(),
+            title: normalizedTitle,
+            orderId: String(orderId || "").trim(),
+            mesa: String(mesa || "N/A").trim(),
+            mesero: String(mesero || "N/A").trim(),
+            fecha: String(fecha || "").trim(),
+            salaArea: String(salaArea || "N/A").trim(),
+            orderNote: String(orderNote || "").trim(),
+            items: normalizedItems,
+
+            subtotal: undefined,
+            tax: undefined,
+            total: undefined,
+            paymentMethod: "",
+            showTotals: false,
+            showItemPrices: false,
+
+            paperSize: printer.paperSize || "80mm",
+        });
         const payload = networkPrintService.buildEscPosText(text);
 
         const result = await networkPrintService.sendToNetworkPrinter({
@@ -470,7 +497,143 @@ exports.printNetworkInvoice = async (req, res) => {
             });
         }
 
-        const text = networkPrintService.buildInvoiceText(req.body || {});
+        const body = req.body || {};
+        const fiscal = body.fiscal || {};
+        const customer = body.customerDetails || {};
+
+        const resolvedNcfType =
+            body.ncfType ||
+            fiscal.ncfType ||
+            null;
+
+        const resolvedNcfNumber =
+            body.ncfNumber ||
+            fiscal.ncfNumber ||
+            fiscal.ncf ||
+            null;
+
+        const resolvedExpirationDate =
+            body.expirationDate ||
+            fiscal.expirationDate ||
+            fiscal.expiresAt ||
+            null;
+
+        const resolvedFacturaNo =
+            body.facturaNo ||
+            fiscal.invoiceNumber ||
+            fiscal.facturaNo ||
+            fiscal.internalNumber ||
+            fiscal.internalSeq ||
+            null;
+
+        const resolvedIsPreInvoice =
+            Boolean(body.isPreInvoice) ||
+            Boolean(fiscal.preInvoice);
+
+        const resolvedIsFiscal =
+            !resolvedIsPreInvoice &&
+            Boolean(
+                body.isFiscal ||
+                fiscal.requested ||
+                resolvedNcfType ||
+                resolvedNcfNumber
+            );
+
+        const resolvedHeaderTitle =
+            body.headerTitle ||
+            (resolvedIsPreInvoice
+                ? "PREFACTURA"
+                : resolvedIsFiscal
+                    ? "FACTURA CON COMPROBANTE FISCAL"
+                    : "FACTURA CONSUMIDOR FINAL");
+
+        const normalizedItems = items.map((item) => {
+            const qty = Number(item?.qty ?? item?.quantity ?? 1) || 1;
+            const unitPrice = Number(item?.unitPrice ?? item?.pricePerQuantity ?? 0) || 0;
+            const explicitLineTotal = Number(item?.total ?? item?.price ?? 0) || 0;
+            const lineTotal = explicitLineTotal > 0 ? explicitLineTotal : unitPrice * qty;
+
+            return {
+                name: String(
+                    item?.name ||
+                    item?.title ||
+                    item?.description ||
+                    item?.dishName ||
+                    "Producto"
+                ).trim(),
+                qty,
+                price: Number(lineTotal.toFixed(2)),
+                tax: Number(item?.tax || 0) || 0,
+            };
+        });
+
+        const text = networkPrintService.buildInvoiceText({
+            businessName: String(body.businessName || "").trim(),
+            rnc: String(body.rnc || "").trim(),
+            address: String(body.address || "").trim(),
+            phone: String(body.phone || "").trim(),
+
+            headerTitle: resolvedHeaderTitle,
+            isFiscal: resolvedIsFiscal,
+            isPreInvoice: resolvedIsPreInvoice,
+            ncfType: resolvedNcfType,
+            ncfNumber: resolvedNcfNumber,
+            expirationDate: resolvedExpirationDate || "",
+            facturaNo: resolvedFacturaNo,
+
+            branchName: String(body.branchName || "Principal").trim(),
+            emissionPoint: String(body.emissionPoint || "001").trim(),
+
+            orderId: String(body.orderId || "").trim(),
+            fechaHora: String(body.fechaHora || body.fecha || "").trim(),
+            mesa: String(body.mesa || "").trim(),
+            mesero: String(body.mesero || "").trim(),
+            salaArea: String(body.salaArea || "").trim(),
+
+            clientName:
+                String(
+                    body.clientName ||
+                    customer.name ||
+                    "Consumidor Final"
+                ).trim(),
+            clientPhone:
+                String(
+                    body.clientPhone ||
+                    customer.phone ||
+                    ""
+                ).trim(),
+            clientAddress:
+                String(
+                    body.clientAddress ||
+                    customer.address ||
+                    ""
+                ).trim(),
+            clientRnc:
+                String(
+                    body.clientRnc ||
+                    customer.rnc ||
+                    customer.rncCedula ||
+                    ""
+                ).trim(),
+
+            taxEnabled: body.taxEnabled !== false,
+            paymentMethod: String(body.paymentMethod || "").trim(),
+
+            items: normalizedItems,
+            subtotal: Number(body.subtotal || 0) || 0,
+            discount: Number(body.discount || 0) || 0,
+            tip: Number(body.tip || 0) || 0,
+            tax: Number(body.tax || 0) || 0,
+
+            isAppDelivery: Boolean(body.isAppDelivery),
+            commissionPct: Number(body.commissionPct || 0) || 0,
+            commissionAmount: Number(body.commissionAmount || 0) || 0,
+            showShipping: Boolean(body.showShipping),
+            shippingFee: Number(body.shippingFee || 0) || 0,
+            totalToPay: Number(body.totalToPay || 0) || 0,
+
+            paperSize: printer.paperSize || "80mm",
+        });
         const payload = networkPrintService.buildEscPosText(text);
 
         const result = await networkPrintService.sendToNetworkPrinter({

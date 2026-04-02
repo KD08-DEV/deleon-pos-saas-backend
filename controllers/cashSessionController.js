@@ -441,13 +441,41 @@ const addCashToSession = async (req, res, next) => {
             return next(createHttpError(404, "SESSION_NOT_FOUND"));
         }
 
-        if (session.status === "CLOSED") return next(createHttpError(409, "SESSION_CLOSED"));
+        const isAdmin = role === "Admin" || role === "Owner";
+
+        if (session.status === "CLOSED" && !isAdmin) {
+            return next(createHttpError(409, "SESSION_CLOSED"));
+        }
 
         session.addedFloatTotal = safeNumber(session.addedFloatTotal) + amount;
-        session.movements.push({ type: "ADD", amount, by: userId });
+
+        session.movements.push({
+            type: session.status === "CLOSED" ? "ADD_AFTER_CLOSE" : "ADD",
+            amount,
+            by: userId,
+            note: session.status === "CLOSED"
+                ? "Dinero agregado por admin después del cierre"
+                : "",
+        });
+
+// si estaba cerrada y el admin agrega dinero, recalcula el cierre esperado
+        if (session.status === "CLOSED" && session.closing) {
+            const openingInitial = Number(session.openingFloatInitial || 0);
+            const addedTotal = Number(session.addedFloatTotal || 0);
+            const expectedCashSales = Number(session.closing.expectedCashSales || 0);
+            const countedTotal = Number(session.closing.countedTotal || 0);
+
+            const expectedInRegister = Number((openingInitial + addedTotal + expectedCashSales).toFixed(2));
+            const difference = Number((countedTotal - expectedInRegister).toFixed(2));
+
+            session.closing.expectedInRegister = expectedInRegister;
+            session.closing.difference = difference;
+        }
 
         await session.save();
         return res.status(200).json({ success: true, data: session });
+
+
     } catch (err) {
         dbg("[POST add] ERROR", err);
         return next(createHttpError(500, "ADD_CASH_FAILED"));
