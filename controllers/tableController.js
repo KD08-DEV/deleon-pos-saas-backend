@@ -56,16 +56,63 @@ const addTable = async (req, res, next) => {
 };
 const getTables = async (req, res, next) => {
     try {
-        // Trae todas las mesas y su orden actual (si existe)
         const clientId = req.clientId || "default";
+        const tenantId = req.tenantId || req.user?.tenantId;
 
         const tables = await Table.find({
-            tenantId: req.user.tenantId,
+            tenantId,
             clientId,
-        }).populate({ path: "currentOrder", model: "Order", select: "_id customerDetails orderStatus total" });
+        })
+            .populate({
+                path: "currentOrder",
+                model: "Order",
+                select: "_id customerDetails orderStatus total createdAt",
+            })
+            .lean();
 
+        const staleTableIds = [];
 
-        res.status(200).json({ success: true, data: tables });
+        const sanitizedTables = tables.map((table) => {
+            const currentOrder = table?.currentOrder || null;
+            const currentOrderStatus = String(currentOrder?.orderStatus || "").trim();
+
+            const hasClosedOrder =
+                Boolean(currentOrder?._id) &&
+                ["Cancelado", "Completado"].includes(currentOrderStatus);
+
+            if (hasClosedOrder) {
+                staleTableIds.push(table._id);
+
+                return {
+                    ...table,
+                    status: "Disponible",
+                    currentOrder: null,
+                };
+            }
+
+            return table;
+        });
+
+        if (staleTableIds.length > 0) {
+            await Table.updateMany(
+                {
+                    _id: { $in: staleTableIds },
+                    tenantId,
+                    clientId,
+                },
+                {
+                    $set: {
+                        status: "Disponible",
+                        currentOrder: null,
+                    },
+                }
+            );
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: sanitizedTables,
+        });
     } catch (error) {
         console.error("Error en getTables:", error);
         next(error);

@@ -647,29 +647,54 @@ const getOrderById = async (req, res, next) => {
 
 const getOrders = async (req, res, next) => {
     try {
-        const baseQuery = {
-            tenantId: req.user.tenantId,
-            clientId: req.clientId,
-        };
+        const tenantId = req.tenantId || req.user?.tenantId;
+        const clientId = req.clientId;
+
+        if (!tenantId) {
+            return next(createHttpError(401, "TENANT_NOT_FOUND"));
+        }
 
         const includeDrafts = String(req.query.includeDrafts || "") === "1";
+        const includeCancelled = String(req.query.includeCancelled || "1") === "1";
 
-        const query = includeDrafts
-            ? baseQuery
+        const clientScope = clientId
+            ? {
+                $or: [
+                    { clientId },
+                    { clientId: { $exists: false } },
+                    { clientId: "default" },
+                ],
+            }
             : {
-                ...baseQuery,
-                isDraft: { $ne: true },
-                orderStatus: { $ne: "Cancelado" },
-                "items.0": { $exists: true }, // extra seguridad: mínimo 1 item
+                $or: [
+                    { clientId: { $exists: false } },
+                    { clientId: "default" },
+                ],
             };
+
+        const query = {
+            tenantId,
+            ...clientScope,
+        };
+
+        if (!includeDrafts) {
+            query.isDraft = { $ne: true };
+            query["items.0"] = { $exists: true };
+        }
+
+        if (!includeCancelled) {
+            query.orderStatus = { $ne: "Cancelado" };
+        }
 
         const orders = await Order.find(query)
             .sort({ createdAt: -1, _id: -1 })
             .populate("table")
             .populate("user", "name email role");
 
-
-        res.status(200).json({ data: orders });
+        return res.status(200).json({
+            success: true,
+            data: orders,
+        });
     } catch (error) {
         next(error);
     }
@@ -851,7 +876,25 @@ const updateOrder = async (req, res, next) => {
         const prevStatus = current.orderStatus;
         const existingBills = current.bills || {};
 
-        // ---- construir safeUpdate ----
+        const userRole = String(req.user?.role || "").trim().toLowerCase();
+        const isAdminUser = userRole === "admin";
+
+        const currentStatusNormalized = normalizeOrderStatus(current.orderStatus);
+        const requestedStatusNormalized = normalizeOrderStatus(
+            req.body.orderStatus ?? current.orderStatus
+        );
+
+        const isReopeningCancelledOrder =
+            currentStatusNormalized === "Cancelado" &&
+            requestedStatusNormalized !== "Cancelado";
+
+        if (isReopeningCancelledOrder && !isAdminUser) {
+            return next(
+                createHttpError(403, "ONLY_ADMIN_CAN_CHANGE_CANCELLED_ORDER_STATUS")
+            );
+        }
+
+// ---- construir safeUpdate ----
         const fiscalFromClient = req.body.fiscal || {};
         const fiscalSafeFromClient = {
             requested: fiscalFromClient.requested,
@@ -866,7 +909,7 @@ const updateOrder = async (req, res, next) => {
             items: req.body.items ?? current.items,
             table: req.body.table ?? current.table,
             paymentMethod: req.body.paymentMethod ?? current.paymentMethod,
-            orderStatus: normalizeOrderStatus(req.body.orderStatus ?? current.orderStatus),
+            orderStatus: requestedStatusNormalized,
             bills: { ...existingBills },
             fiscal: {
                 ...(current.fiscal || {}),
@@ -1172,8 +1215,7 @@ const updateOrder = async (req, res, next) => {
         }
 
 
-        const incomingStatus = normalizeOrderStatus(req.body.orderStatus ?? current.orderStatus);
-
+        const incomingStatus = requestedStatusNormalized;
         // ✅ Si se completó => generar PDF (no rompe la respuesta)
         // ✅ Si se completó => descontar inventario (idempotente) + generar PDF
         // ✅ Congelar snapshot de items para reportes (category, unitCost, taxAmount)
