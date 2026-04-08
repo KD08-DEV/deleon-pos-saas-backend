@@ -21,8 +21,8 @@ const printerRoute = require("./routes/printerRoute");
 
 const orderRoute = require("./routes/orderRoute"); // ✅ CommonJS correcto
 
-const PORT = config.port;
-connectDB();
+const PORT = process.env.PORT || config.port || 8000;
+
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
     .split(",")
     .map(s => s.trim())
@@ -134,6 +134,23 @@ app.use("/api/printers", printerRoute);// Global Error Handler
 app.use(globalErrorHandler);
 
 // Server
-server.listen(PORT, () => {
-    console.log(`☑️ POS Server is listening on port ${PORT}`);
-});
+// Server bootstrap
+(async () => {
+    try {
+        console.log("🚀 Starting POS backend...");
+        console.log(`🌍 NODE_ENV: ${config.nodeEnv}`);
+        console.log(`🔌 PORT: ${PORT}`);
+        console.log("🗄️ Connecting to MongoDB...");
+
+        await connectDB();
+
+        console.log("✅ MongoDB ready. Starting HTTP server...");
+
+        server.listen(PORT, "0.0.0.0", () => {
+            console.log(`☑️ POS Server is listening on port ${PORT}`);
+        });
+    } catch (error) {
+        console.error("❌ Failed to bootstrap app:", error);
+        process.exit(1);
+    }
+})();
