@@ -350,7 +350,6 @@ const addOrder = async (req, res, next) => {
             return next(createHttpError(401, "TENANT_NOT_FOUND"));
         }
 
-
         const clientId = req.clientId;
 
         const {
@@ -365,17 +364,17 @@ const addOrder = async (req, res, next) => {
             orderNote = "",
             fiscal: incomingFiscal = null,
         } = req.body;
+
         const normalizedStatus = normalizeOrderStatus(orderStatus);
-
-
         customerDetails.name = customerDetails.name || "";
 
-        // ⚠️ Ya no es obligatorio que tenga mesa
+        // Mesa opcional
         let tableRef = null;
 
-        if (table) {                                   // ✅ solo si realmente se envió una mesa
-            if (!mongoose.Types.ObjectId.isValid(table))
+        if (table) {
+            if (!mongoose.Types.ObjectId.isValid(table)) {
                 return next(createHttpError(400, "INVALID_TABLE_ID"));
+            }
 
             tableRef = new mongoose.Types.ObjectId(String(table));
 
@@ -389,13 +388,18 @@ const addOrder = async (req, res, next) => {
                 ],
             }).select("_id isVirtual virtualType");
 
-
             if (!sameTenantTable) {
                 return next(createHttpError(403, "TABLE_DOES_NOT_BELONG_TO_TENANT"));
             }
         }
+
         const tenant = await Tenant.findOne({ tenantId }).lean();
         if (!tenant) return next(createHttpError(404, "TENANT_NOT_FOUND"));
+
+        const features = tenant?.features || {};
+        const taxFeatureEnabled = features?.tax?.enabled !== false;
+        const tipFeatureEnabled = features?.tip?.enabled !== false;
+        const discountFeatureEnabled = features?.discount?.enabled !== false;
         const fiscalFeatureEnabled = tenant?.fiscal?.enabled === true;
 
         let fiscalPayload = {
@@ -449,7 +453,7 @@ const addOrder = async (req, res, next) => {
             topLevelNcfNumber = ncfNumber;
         }
 
-        // Canal / comisión (ya con tenant disponible)
+        // Canal / comisión
         const source = normalizeSource(orderSource);
         const { allowed, rate } = getCommissionRateFromTenant(tenant, source);
 
@@ -457,8 +461,7 @@ const addOrder = async (req, res, next) => {
             return next(createHttpError(400, `SOURCE_DISABLED_${source}`));
         }
 
-
-        // Validar que existan items solo si vienen desde el menú
+        // Normalizar items
         const normItems = Array.isArray(items) && items.length
             ? await hydrateOrderItems({
                 items,
@@ -470,47 +473,84 @@ const addOrder = async (req, res, next) => {
 
         const isDraft = normItems.length === 0;
 
-
         if (normItems.length === 0) {
             return next(createHttpError(400, "EMPTY_ORDER_NOT_ALLOWED"));
         }
-        const features = tenant?.features || {};
 
         const incomingBills = req.body?.bills || {};
-        let tip = 0;
 
-        if (incomingBills.tipAmount !== undefined) tip = Number(incomingBills.tipAmount);
-        else if (incomingBills.tip !== undefined) tip = Number(incomingBills.tip);
-
-        tip = round2(tip);
-
-        // ADD: Envío
-        let deliveryFee = 0;
-        if (incomingBills.deliveryFee !== undefined) deliveryFee = Number(incomingBills.deliveryFee);
+        // Delivery fee
+        let deliveryFee = Number(incomingBills.deliveryFee ?? 0);
         deliveryFee = round2(deliveryFee);
         if (deliveryFee < 0) deliveryFee = 0;
 
+        // Subtotal
+        const subtotal = round2(normItems.reduce((s, i) => s + Number(i.price || 0), 0));
 
-        // Calcular totales
-        const subtotal = round2(normItems.reduce((s, i) => s + i.price, 0));
-        let discountAmt = round2(Number(discount) || 0);
-        if (discountAmt < 0) discountAmt = 0;
-        if (discountAmt > subtotal) discountAmt = subtotal;
+        // Discount
+        let discountAmt = 0;
+        if (discountFeatureEnabled) {
+            discountAmt = round2(Number(incomingBills.discount ?? discount) || 0);
+            if (discountAmt < 0) discountAmt = 0;
+            if (discountAmt > subtotal) discountAmt = subtotal;
+        }
 
-        const taxable = round2(subtotal - discountAmt);
-        const tax = round2(taxable * TAX_RATE);
+        // Tax enabled
+        let taxEnabled;
+        if (incomingBills.taxEnabled !== undefined) {
+            taxEnabled = Boolean(incomingBills.taxEnabled);
+        } else if (incomingBills.tax !== undefined) {
+            taxEnabled = Number(incomingBills.tax) > 0;
+        } else {
+            taxEnabled = true;
+        }
+
+        taxEnabled = taxFeatureEnabled ? taxEnabled : false;
+
+        // Tip enabled
+        let tipEnabled;
+        if (incomingBills.tipEnabled !== undefined) {
+            tipEnabled = Boolean(incomingBills.tipEnabled);
+        } else if (incomingBills.tipAmount !== undefined) {
+            tipEnabled = Number(incomingBills.tipAmount) > 0;
+        } else if (incomingBills.tip !== undefined) {
+            tipEnabled = Number(incomingBills.tip) > 0;
+        } else {
+            tipEnabled = tipFeatureEnabled;
+        }
+
+        tipEnabled = tipFeatureEnabled ? tipEnabled : false;
+
+        // Tip
+        let tip = 0;
+        if (tipEnabled) {
+            if (incomingBills.tipAmount !== undefined) {
+                tip = Number(incomingBills.tipAmount);
+            } else if (incomingBills.tip !== undefined) {
+                tip = Number(incomingBills.tip);
+            }
+        }
+        tip = round2(tip);
+        if (tip < 0) tip = 0;
+
+        // Tax
+        const taxable = round2(Math.max(subtotal - discountAmt, 0));
+        const effectiveTaxRate = taxEnabled
+            ? Number(tenant?.features?.tax?.rate ?? TAX_RATE)
+            : 0;
+        const tax = round2(taxable * effectiveTaxRate);
 
         const baseBeforeTip = round2(taxable + tax);
-
         const totalBeforeTip = round2(baseBeforeTip + deliveryFee);
-        // base para comisión (sin tip)
         const totalWithTax = round2(totalBeforeTip + tip);
-        const { commissionAmount, netTotal } = computeCommission(baseBeforeTip, totalWithTax, rate);
 
+        const { commissionAmount, netTotal } = computeCommission(
+            baseBeforeTip,
+            totalWithTax,
+            rate
+        );
 
-
-        // Crear payload base
-        // ✅ Resolver customer (cliente final) si viene customerId
+        // Resolver customer
         let resolvedCustomerId = null;
 
         let resolvedCustomerDetails = {
@@ -544,12 +584,22 @@ const addOrder = async (req, res, next) => {
                 phone: found.phone || "",
                 address: found.address || "",
                 guests: Number(customerDetails?.guests ?? 0),
-                rnc: String(customerDetails?.rnc ?? customerDetails?.rncCedula ?? found?.rnc ?? found?.rncCedula ?? ""),
-                rncCedula: String(customerDetails?.rncCedula ?? customerDetails?.rnc ?? found?.rncCedula ?? found?.rnc ?? ""),
+                rnc: String(
+                    customerDetails?.rnc ??
+                    customerDetails?.rncCedula ??
+                    found?.rnc ??
+                    found?.rncCedula ??
+                    ""
+                ),
+                rncCedula: String(
+                    customerDetails?.rncCedula ??
+                    customerDetails?.rnc ??
+                    found?.rncCedula ??
+                    found?.rnc ??
+                    ""
+                ),
             };
         }
-
-
 
         const payload = {
             tenantId,
@@ -563,8 +613,9 @@ const addOrder = async (req, res, next) => {
                 subtotal,
                 total: subtotal,
                 discount: discountAmt,
+                taxEnabled,
                 tax,
-                taxEnabled: true,
+                tipEnabled,
                 tip,
                 tipAmount: tip,
                 deliveryFee,
@@ -587,7 +638,8 @@ const addOrder = async (req, res, next) => {
         };
 
         const order = await Order.create(payload);
-        // ✅ Si la orden se creó con mesa Y ya tiene items, marcar la mesa como Ocupada y asociar currentOrder
+
+        // Si la orden se creó con mesa y ya tiene items, marcar mesa ocupada
         if (tableRef && Array.isArray(payload.items) && payload.items.length > 0) {
             await Table.updateOne(
                 {
@@ -608,20 +660,17 @@ const addOrder = async (req, res, next) => {
             );
         }
 
-        // Solo marcar la mesa si fue enviada
-        // Solo marcar la mesa si fue enviada
-        // IMPORTANTE:
-// Al crear la orden desde click en mesa, NO tocamos la mesa.
-// La mesa solo se marca como Reservada/Ocupada cuando se presione "Actualizar orden" (updateOrder).
-
-
-
-        return res.status(201).json({ success:true, message:"Order created!", data:order });
+        return res.status(201).json({
+            success: true,
+            message: "Order created!",
+            data: order,
+        });
     } catch (error) {
         console.error("[addOrder] error:", error?.message);
         return next(createHttpError(500, "ADD_ORDER_FAILED"));
     }
 };
+
 
 
 const getOrderById = async (req, res, next) => {
@@ -858,6 +907,7 @@ const updateOrder = async (req, res, next) => {
         const features = tenant?.features || {};
         const taxFeatureEnabled = features?.tax?.enabled !== false; // default true
         const discountFeatureEnabled = features?.discount?.enabled !== false; // default true
+        const tipFeatureEnabled = features?.tip?.enabled !== false; // default true
 
         // ✅ fiscalFeatureEnabled viene del tenant.fiscal.enabled
         const fiscalFeatureEnabled = tenant?.fiscal?.enabled === true;
@@ -1096,23 +1146,46 @@ const updateOrder = async (req, res, next) => {
         taxEnabled = taxFeatureEnabled ? taxEnabled : false;
 
         const taxable = round2(Math.max(subtotal - discount, 0));
-        const effectiveTaxRate = taxEnabled ? TAX_RATE : 0;
+        const effectiveTaxRate = taxEnabled
+            ? Number(tenant?.features?.tax?.rate ?? TAX_RATE)
+            : 0;
         const tax = round2(taxable * effectiveTaxRate);
 
-        // Tip
-        let tip = 0;
-        if (incomingBills.tipEnabled === false) {
-            tip = 0;
+// Tip enabled
+        let tipEnabled;
+        if (incomingBills.tipEnabled !== undefined) {
+            tipEnabled = Boolean(incomingBills.tipEnabled);
+        } else if (safeUpdate.bills.tipEnabled !== undefined) {
+            tipEnabled = Boolean(safeUpdate.bills.tipEnabled);
         } else if (incomingBills.tipAmount !== undefined) {
-            tip = Number(incomingBills.tipAmount);
+            tipEnabled = Number(incomingBills.tipAmount) > 0;
         } else if (incomingBills.tip !== undefined) {
-            tip = Number(incomingBills.tip);
+            tipEnabled = Number(incomingBills.tip) > 0;
         } else if (safeUpdate.bills.tipAmount !== undefined) {
-            tip = Number(safeUpdate.bills.tipAmount);
+            tipEnabled = Number(safeUpdate.bills.tipAmount) > 0;
         } else if (safeUpdate.bills.tip !== undefined) {
-            tip = Number(safeUpdate.bills.tip);
+            tipEnabled = Number(safeUpdate.bills.tip) > 0;
+        } else {
+            tipEnabled = tipFeatureEnabled;
+        }
+
+        tipEnabled = tipFeatureEnabled ? tipEnabled : false;
+
+// Tip
+        let tip = 0;
+        if (tipEnabled) {
+            if (incomingBills.tipAmount !== undefined) {
+                tip = Number(incomingBills.tipAmount);
+            } else if (incomingBills.tip !== undefined) {
+                tip = Number(incomingBills.tip);
+            } else if (safeUpdate.bills.tipAmount !== undefined) {
+                tip = Number(safeUpdate.bills.tipAmount);
+            } else if (safeUpdate.bills.tip !== undefined) {
+                tip = Number(safeUpdate.bills.tip);
+            }
         }
         tip = round2(tip);
+        if (tip < 0) tip = 0;
 
         const baseBeforeTip = round2(taxable + tax);
         const totalBeforeTip = round2(baseBeforeTip + deliveryFee);
@@ -1160,6 +1233,7 @@ const updateOrder = async (req, res, next) => {
             discount,
             taxEnabled,
             tax,
+            tipEnabled,
             tipAmount: tip,
             tip,
             deliveryFee,

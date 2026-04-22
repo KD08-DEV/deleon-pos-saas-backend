@@ -85,6 +85,7 @@ const orderSchema = new mongoose.Schema(
             total: { type: Number, default: 0 },
 
             discount: { type: Number, default: 0 },
+            tipEnabled: { type: Boolean, default: true },
 
             // propina (guardamos ambos por compatibilidad)
             tip: { type: Number, default: 0 },
