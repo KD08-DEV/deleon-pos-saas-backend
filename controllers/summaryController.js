@@ -108,8 +108,16 @@ exports.getFinanceSummary = async (req, res, next) => {
 
         const totalCosts = purchasesTotal + expensesTotal + payrollTotal + mermaTotal;
         const net = salesTotal - totalCosts;
+        const cogsMatch = {
+            tenantId,
+            type: "sale",
+            createdAt: { $gte: start, $lte: end },
+        };
+
+        if (!useAllClients) cogsMatch.clientId = effectiveClientId;
+
         const cogsAgg = await InventoryMovement.aggregate([
-            { $match: { tenantId, clientId, type: "sale", createdAt: { $gte: start, $lte: end } } },
+            { $match: cogsMatch },
             { $group: { _id: null, cogsTotal: { $sum: { $ifNull: ["$costAmount", 0] } } } }
         ]);
 
