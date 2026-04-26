@@ -62,6 +62,17 @@ const orderSchema = new mongoose.Schema(
             default: "En Progreso",
         },
         isDraft: { type: Boolean, default: true, index: true },
+        paymentStatus: {
+            type: String,
+            enum: ["Pendiente", "Pagado", "Anulado"],
+            default: "Pendiente",
+            index: true,
+        },
+        invoicedAt: {
+            type: Date,
+            default: null,
+            index: true,
+        },
 
         invoicePath: { type: String, default: "" },
         invoiceUrl: { type: String, default: "" },
@@ -72,6 +83,10 @@ const orderSchema = new mongoose.Schema(
             index: true,
         },
 
+        registerId: { type: String, default: "MAIN", index: true },
+        paidAt: { type: Date, default: null, index: true },
+        paidBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+        cashSessionId: { type: mongoose.Schema.Types.ObjectId, ref: "CashSession", default: null, index: true },
 
     // Comisión congelada en el momento de crear/cambiar el canal
         commissionRate: { type: Number, default: 0 },     // 0.26, 0.22, etc

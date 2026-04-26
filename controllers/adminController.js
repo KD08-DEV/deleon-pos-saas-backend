@@ -13,10 +13,131 @@ const TenantSettings = require("../models/tenantSettingsModel");
 
 
 
+function parseReportBoundary(value, endOfDay = false) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+
+    // Caso ideal: YYYY-MM-DD
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+        return new Date(`${raw}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}`);
+    }
+
+    // Fallback: cualquier fecha parseable por JS
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return null;
+
+    if (endOfDay) d.setHours(23, 59, 59, 999);
+    else d.setHours(0, 0, 0, 0);
+
+    return d;
+}
+function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, endDate }) {
+    const rawRegister = registerId ? String(registerId).trim().toUpperCase() : "";
+    const normalizeReg =
+        !rawRegister || rawRegister === "__ALL_REGISTERS__" || rawRegister === "ALL"
+            ? ""
+            : rawRegister;
+
+    const baseClient = {
+        tenantId,
+        clientId,
+    };
+
+    const withRegister = normalizeReg ? { registerId: normalizeReg } : {};
+    const withDatesPaid =
+        startDate && endDate ? { paidAt: { $gte: startDate, $lte: endDate } } : {};
+    const withDatesCreated =
+        startDate && endDate ? { createdAt: { $gte: startDate, $lte: endDate } } : {};
+
+    const modernPaid = {
+        ...baseClient,
+        ...withRegister,
+        paymentStatus: "Pagado",
+        ...withDatesPaid,
+    };
+
+    const legacyCompleted = {
+        ...baseClient,
+        ...withRegister,
+        $or: [
+            { paymentStatus: { $exists: false } },
+            { paymentStatus: null },
+            { paymentStatus: "" },
+            { paymentStatus: "Pendiente" },
+        ],
+        orderStatus: "Completado",
+        ...withDatesCreated,
+    };
+
+    const legacyFiscal = {
+        ...baseClient,
+        ...withRegister,
+        $or: [
+            { paymentStatus: { $exists: false } },
+            { paymentStatus: null },
+            { paymentStatus: "" },
+            { paymentStatus: "Pendiente" },
+        ],
+        "fiscal.requested": true,
+        ...withDatesCreated,
+    };
+
+    const legacyInProgress = {
+        ...baseClient,
+        ...withRegister,
+        $or: [
+            { paymentStatus: { $exists: false } },
+            { paymentStatus: null },
+            { paymentStatus: "" },
+            { paymentStatus: "Pendiente" },
+        ],
+        orderStatus: "En Progreso",
+        isDraft: { $ne: true },
+        "items.0": { $exists: true },
+        "bills.totalWithTax": { $gt: 0 },
+        ...withDatesCreated,
+    };
+
+    if (!normalizeReg) {
+        return {
+            $or: [
+                modernPaid,
+                legacyCompleted,
+                legacyFiscal,
+                legacyInProgress,
+                {
+                    ...baseClient,
+                    registerId: { $exists: false },
+                    orderStatus: "Completado",
+                    ...withDatesCreated,
+                },
+                {
+                    ...baseClient,
+                    registerId: { $exists: false },
+                    "fiscal.requested": true,
+                    ...withDatesCreated,
+                },
+                {
+                    ...baseClient,
+                    registerId: { $exists: false },
+                    orderStatus: "En Progreso",
+                    isDraft: { $ne: true },
+                    "items.0": { $exists: true },
+                    "bills.totalWithTax": { $gt: 0 },
+                    ...withDatesCreated,
+                },
+            ],
+        };
+    }
+
+    return {
+        $or: [modernPaid, legacyCompleted, legacyFiscal, legacyInProgress],
+    };
+}
 // 🔹 Obtener reportes (ventas filtradas + resumen diario)
 exports.getReports = async (req, res) => {
     try {
-        const { from, to, method, user } = req.query;
+        const { from, to, method, user, registerId } = req.query;
 
         const getClientId = (req) => {
             // prioridad: scope -> user -> headers (por si lo mandas)
@@ -38,8 +159,19 @@ exports.getReports = async (req, res) => {
             type: "waste",
         };
 
-        if (from && to) {
-            mermaFilter.createdAt = { $gte: new Date(from), $lte: new Date(to) };
+        const startDate = from ? parseReportBoundary(from, false) : null;
+        const endDate = to ? parseReportBoundary(to, true) : null;
+
+        if ((from && !startDate) || (to && !endDate)) {
+            return res.status(400).json({
+                success: false,
+                message: "INVALID_REPORT_DATE_RANGE",
+                details: { from, to },
+            });
+        }
+
+        if (startDate && endDate) {
+            mermaFilter.createdAt = { $gte: startDate, $lte: endDate };
         }
 
         const mermaAgg = await InventoryMovement.aggregate([
@@ -58,14 +190,15 @@ exports.getReports = async (req, res) => {
 
 
 
-        const filter = { tenantId, clientId };
+        const filter = buildLegacyReportFilter({
+            tenantId,
+            clientId,
+            registerId,
+            startDate,
+            endDate,
+        });
 
-        // Filtrar por rango de fechas
-        if (from && to) {
-            filter.createdAt = { $gte: new Date(from), $lte: new Date(to) };
-        }
-
-        // Filtrar por método de pago (Cash / Online)
+// Filtrar por método de pago
         if (method) {
             filter.paymentMethod = method;
         }
@@ -82,14 +215,12 @@ exports.getReports = async (req, res) => {
             else return res.status(200).json({ success: true, data: [] }); // si no hay coincidencias
         }
 
-
         // Buscar órdenes que cumplan con los filtros
         const orders = await Order.find(filter)
             .populate("user", "name role email")
             .populate("table", "tableNumber virtualType type isVirtual name")
 
-            .sort({ createdAt: -1 });
-
+            .sort({ paidAt: -1, createdAt: -1 });
         // Calcular totales
         const totalSales = orders.reduce((sum, o) => sum + (Number(o.bills?.totalWithTax) || 0), 0);
         const totalTax = orders.reduce((sum, o) => sum + (Number(o.bills?.tax) || 0), 0);
@@ -125,7 +256,8 @@ exports.getReports = async (req, res) => {
         // 🔹 También agrupar por fecha (para gráficas)
         const groupedByDate = {};
         orders.forEach((o) => {
-            const date = o.createdAt.toISOString().split("T")[0];
+            const refDate = o.paidAt || o.createdAt;
+            const date = new Date(refDate).toISOString().split("T")[0];
             if (!groupedByDate[date]) groupedByDate[date] = 0;
             groupedByDate[date] += Number(o.bills?.totalWithTax) || 0;
         });
@@ -145,6 +277,7 @@ exports.getReports = async (req, res) => {
             .status(500)
             .json({ success: false, message: "Error al obtener reportes", error });
     }
+
 };
 
 // 🔹 Obtener todos los empleados (sin incluir al admin)
@@ -372,6 +505,10 @@ exports.getFiscalConfig = async (req, res) => {
                 ...(f.tip || {}),
                 enabled: typeof f.tip?.enabled === "boolean" ? f.tip.enabled : true,
             },
+            checkout: {
+                ...(f.checkout || {}),
+                chargeMode: String(f.checkout?.chargeMode || "AT_COMPLETE"),
+            },
             discount: {
                 ...(f.discount || {}),
                 enabled: typeof f.discount?.enabled === "boolean" ? f.discount.enabled : true,
@@ -426,6 +563,10 @@ exports.updateFiscalConfig = async (req, res) => {
 
         // ✅ declarar primero (UNA sola vez)
         const $set = {};
+        const chargeMode = req.body?.features?.checkout?.chargeMode;
+        if (["AT_INVOICE", "AT_COMPLETE"].includes(chargeMode)) {
+            $set["features.checkout.chargeMode"] = chargeMode;
+        }
 
         // ✅ leer values
         const fiscalEnabled = req.body?.fiscalEnabled;

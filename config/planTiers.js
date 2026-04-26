@@ -22,7 +22,7 @@ const TIERS = {
         limits: {
             maxUsers: 7,      // 1 admins + 1 cashiers + 4 waiters
             maxAdmins: 2,
-            maxCashiers: 1,
+            maxCashiers: 2,
             maxWaiters: 4,
             maxDishes: 28,
             maxTables: 25,

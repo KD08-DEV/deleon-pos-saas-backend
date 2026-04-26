@@ -363,6 +363,7 @@ const addOrder = async (req, res, next) => {
             orderSource,
             orderNote = "",
             fiscal: incomingFiscal = null,
+            submitAction = "",
         } = req.body;
 
         const normalizedStatus = normalizeOrderStatus(orderStatus);
@@ -401,6 +402,15 @@ const addOrder = async (req, res, next) => {
         const tipFeatureEnabled = features?.tip?.enabled !== false;
         const discountFeatureEnabled = features?.discount?.enabled !== false;
         const fiscalFeatureEnabled = tenant?.fiscal?.enabled === true;
+        const chargeMode = tenant?.features?.checkout?.chargeMode || "AT_COMPLETE";
+
+        const shouldMarkPaidByInvoice =
+            chargeMode === "AT_INVOICE" && String(submitAction).trim().toLowerCase() === "invoice";
+
+        const shouldMarkPaidByCompletion =
+            chargeMode === "AT_COMPLETE" && normalizedStatus === "Completado";
+
+        const shouldMarkPaid = shouldMarkPaidByInvoice || shouldMarkPaidByCompletion;
 
         let fiscalPayload = {
             requested: false,
@@ -600,6 +610,9 @@ const addOrder = async (req, res, next) => {
                 ),
             };
         }
+        const registerId = String(req.body?.registerId || "MAIN")
+            .trim()
+            .toUpperCase();
 
         const payload = {
             tenantId,
@@ -608,6 +621,7 @@ const addOrder = async (req, res, next) => {
             customerDetails: resolvedCustomerDetails,
             orderStatus: normalizedStatus,
             isDraft,
+
 
             bills: {
                 subtotal,
@@ -631,8 +645,14 @@ const addOrder = async (req, res, next) => {
             commissionAmount,
             netTotal,
 
+
             items: normItems,
             paymentMethod,
+            registerId,
+            paymentStatus: shouldMarkPaid ? "Pagado" : "Pendiente",
+            paidAt: shouldMarkPaid ? new Date() : null,
+            paidBy: shouldMarkPaid ? (req.user?._id || null) : null,
+            invoicedAt: incomingFiscal?.requested === true ? new Date() : null,
             ...(tableRef ? { table: tableRef } : {}),
             ...(req.user?._id ? { user: req.user._id } : {}),
         };
@@ -1266,6 +1286,41 @@ const updateOrder = async (req, res, next) => {
                 message: "Order deleted because items were explicitly cleared.",
             });
         }
+        const incomingStatus = requestedStatusNormalized;
+        const incomingRegisterId = String(
+            req.body?.registerId || current.registerId || "MAIN"
+        )
+            .trim()
+            .toUpperCase();
+
+        const submitAction = String(req.body?.submitAction || "").trim().toLowerCase();
+        const chargeMode = tenant?.features?.checkout?.chargeMode || "AT_COMPLETE";
+
+        const shouldMarkPaidByInvoice =
+            chargeMode === "AT_INVOICE" && submitAction === "invoice";
+
+        const shouldMarkPaidByCompletion =
+            chargeMode === "AT_COMPLETE" && incomingStatus === "Completado";
+
+        const shouldMarkPaid = shouldMarkPaidByInvoice || shouldMarkPaidByCompletion;
+
+
+        safeUpdate.registerId = incomingRegisterId;
+
+// guardar fecha de facturación si emitió fiscal
+        if (incomingFiscal?.requested === true) {
+            safeUpdate.invoicedAt = current.invoicedAt || new Date();
+        }
+
+// pago automático según el modo del tenant
+        safeUpdate.paymentStatus = shouldMarkPaid
+            ? "Pagado"
+            : current.paymentStatus || "Pendiente";
+
+        if (shouldMarkPaid) {
+            safeUpdate.paidAt = current.paidAt || new Date();
+            safeUpdate.paidBy = req.user?._id || current.paidBy || null;
+        }
 
         // ✅ Update
         let order = await Order.findOneAndUpdate(orderScope, safeUpdate, { new: true })
@@ -1288,8 +1343,6 @@ const updateOrder = async (req, res, next) => {
             );
         }
 
-
-        const incomingStatus = requestedStatusNormalized;
         // ✅ Si se completó => generar PDF (no rompe la respuesta)
         // ✅ Si se completó => descontar inventario (idempotente) + generar PDF
         // ✅ Congelar snapshot de items para reportes (category, unitCost, taxAmount)
@@ -1595,7 +1648,32 @@ const getSalesByProductReport = async (req, res) => {
             isDraft: { $ne: true },
             orderStatus: { $ne: "Cancelado" },
             "items.0": { $exists: true },
-            createdAt: { $gte: start, $lte: end },
+            $or: [
+                {
+                    paymentStatus: "Pagado",
+                    paidAt: { $gte: start, $lte: end },
+                },
+                {
+                    $or: [
+                        { paymentStatus: { $exists: false } },
+                        { paymentStatus: null },
+                        { paymentStatus: "" },
+                        { paymentStatus: "Pendiente" },
+                    ],
+                    orderStatus: "Completado",
+                    createdAt: { $gte: start, $lte: end },
+                },
+                {
+                    $or: [
+                        { paymentStatus: { $exists: false } },
+                        { paymentStatus: null },
+                        { paymentStatus: "" },
+                        { paymentStatus: "Pendiente" },
+                    ],
+                    "fiscal.requested": true,
+                    createdAt: { $gte: start, $lte: end },
+                },
+            ],
         };
 
         if (paymentMethod) match.paymentMethod = paymentMethod;

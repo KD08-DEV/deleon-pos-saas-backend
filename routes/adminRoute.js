@@ -16,6 +16,12 @@ const {
     adjustCashSessionClosing,
 } = require("../controllers/cashSessionController");
 const { getManagerCodeStatus, setManagerCode } = require("../controllers/adminController");
+const {
+    listRegisters,
+    createRegister,
+    updateRegister,
+    toggleRegister,
+} = require("../controllers/registerController");
 
 
 
@@ -272,4 +278,32 @@ router.post("/payroll/runs/:id/post", requireScope({ level: "tenant" }), require
 router.get("/summary", requireScope({ level: "tenant" }), requireRole("Owner","Admin","Cajera"), getFinanceSummary);
 
 
+// Registers (cajas)
+router.get(
+    "/registers",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    listRegisters
+);
+
+router.post(
+    "/registers",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin"),
+    createRegister
+);
+
+router.put(
+    "/registers/:id",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin"),
+    updateRegister
+);
+
+router.patch(
+    "/registers/:id/toggle",
+    requireScope({ level: "client" }),
+    requireRole("Owner", "Admin"),
+    toggleRegister
+);
 module.exports = router;

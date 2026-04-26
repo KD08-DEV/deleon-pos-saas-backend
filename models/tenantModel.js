@@ -74,6 +74,13 @@ const tenantSchema = new mongoose.Schema(
             preInvoice: {
                 enabled: { type: Boolean, default: false },
             },
+            checkout: {
+                chargeMode: {
+                    type: String,
+                    enum: ["AT_INVOICE", "AT_COMPLETE"],
+                    default: "AT_COMPLETE",
+                },
+            },
             // Dentro de features.orderSources
             orderSources: {
                 pedidosYa: {
