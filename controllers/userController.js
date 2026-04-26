@@ -36,7 +36,7 @@ const register = async (req, res, next) => {
             const tenantPlan = (plan || "emprendedor").toLowerCase();
 
             // 1) Validar plan
-            const allowedPlans = ["emprendedor", "premium", "vip"];
+            const allowedPlans = ["emprendedor", "premium", "estandar"];
             if (!allowedPlans.includes(tenantPlan)) {
                 return next(createHttpError(400, "Invalid plan for tenant!"));
             }

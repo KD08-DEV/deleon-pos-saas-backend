@@ -18,9 +18,9 @@ const TIERS = {
         },
     },
 
-    premium: {
+    estandar: {
         limits: {
-            maxUsers: 7,      // 1 admins + 1 cashiers + 4 waiters
+            maxUsers: 8,      // 2 admins + 2 cashiers + 4 waiters
             maxAdmins: 2,
             maxCashiers: 2,
             maxWaiters: 4,
@@ -35,7 +35,7 @@ const TIERS = {
         },
     },
 
-    vip: {
+    premium: {
         limits: {
             maxUsers: 15,      // 3 admins + 3 cashiers + 9 waiters
             maxAdmins: 3,

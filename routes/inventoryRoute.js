@@ -22,11 +22,11 @@ const requirePlanOrSuper = (checkFn) => {
 // Requiere Premium (ajusta nombres si tu plan es "premium" o "pro")
 const requireInventoryPlan = requirePlanOrSuper((tenant) => {
     const plan = (tenant.plan || "").toString().toLowerCase();
-    const ok = ["premium", "vip"].includes(plan);
+    const ok = ["premium", "estandar"].includes(plan);
 
     return {
         ok,
-        reason: "Este módulo requiere Plan Premium o VIP",
+        reason: "Este módulo requiere Plan Premium o Estandar",
     };
 });
 const requireInventoryPremiumOrVip = requireInventoryPlan;
