@@ -404,8 +404,14 @@ const addOrder = async (req, res, next) => {
         const fiscalFeatureEnabled = tenant?.fiscal?.enabled === true;
         const chargeMode = tenant?.features?.checkout?.chargeMode || "AT_COMPLETE";
 
+        const submitActionNormalized = String(submitAction || "").trim().toLowerCase();
+        const isInvoiceAction = submitActionNormalized === "invoice";
+
+        let assignedInternalInvoice = null;
+
+
         const shouldMarkPaidByInvoice =
-            chargeMode === "AT_INVOICE" && String(submitAction).trim().toLowerCase() === "invoice";
+            chargeMode === "AT_INVOICE" && isInvoiceAction;
 
         const shouldMarkPaidByCompletion =
             chargeMode === "AT_COMPLETE" && normalizedStatus === "Completado";
@@ -431,7 +437,8 @@ const addOrder = async (req, res, next) => {
                 ncfType: requestedType,
             });
 
-            const { internalSeq, internalNumber } = await allocateInternalSeq({ tenantId });
+            assignedInternalInvoice = await allocateInternalSeq({ tenantId });
+            const { internalSeq, internalNumber } = assignedInternalInvoice;
 
             const emissionPoint =
                 String(tenant?.fiscal?.emissionPoint || "001").trim() || "001";
@@ -461,6 +468,18 @@ const addOrder = async (req, res, next) => {
             };
 
             topLevelNcfNumber = ncfNumber;
+        }
+        if (isInvoiceAction && !assignedInternalInvoice) {
+            assignedInternalInvoice = await allocateInternalSeq({ tenantId });
+
+            const { internalSeq, internalNumber } = assignedInternalInvoice;
+
+            fiscalPayload = {
+                ...(fiscalPayload || {}),
+                internalSeq,
+                internalNumber,
+                issuedAt: fiscalPayload?.issuedAt || new Date(),
+            };
         }
 
         // Canal / comisión
@@ -621,6 +640,8 @@ const addOrder = async (req, res, next) => {
             customerDetails: resolvedCustomerDetails,
             orderStatus: normalizedStatus,
             isDraft,
+            invoiceNumber: assignedInternalInvoice?.internalNumber || null,
+            facturaNo: assignedInternalInvoice?.internalNumber || null,
 
 
             bills: {
@@ -652,7 +673,7 @@ const addOrder = async (req, res, next) => {
             paymentStatus: shouldMarkPaid ? "Pagado" : "Pendiente",
             paidAt: shouldMarkPaid ? new Date() : null,
             paidBy: shouldMarkPaid ? (req.user?._id || null) : null,
-            invoicedAt: incomingFiscal?.requested === true ? new Date() : null,
+            invoicedAt: isInvoiceAction || incomingFiscal?.requested === true ? new Date() : null,
             ...(tableRef ? { table: tableRef } : {}),
             ...(req.user?._id ? { user: req.user._id } : {}),
         };
@@ -892,7 +913,20 @@ async function allocateInternalSeq({ tenantId }) {
     return { internalSeq: assigned, internalNumber };
 }
 
-
+function getExistingInternalInvoiceNumber(order = {}) {
+    return (
+        order?.facturaNo ||
+        order?.invoiceNumber ||
+        order?.invoiceNo ||
+        order?.fiscal?.facturaNo ||
+        order?.fiscal?.invoiceNumber ||
+        order?.fiscal?.invoiceNo ||
+        order?.fiscal?.internalNumber ||
+        order?.fiscal?.internalSeq ||
+        order?.fiscal?.internal ||
+        null
+    );
+}
 
 
 
@@ -942,6 +976,8 @@ const updateOrder = async (req, res, next) => {
         // ✅ Orden actual primero (evita TDZ errors)
         const current = await Order.findOne(orderScope);
         if (!current) return next(createHttpError(404, "Order not found!"));
+        const submitAction = String(req.body?.submitAction || "").trim().toLowerCase();
+        const isInvoiceAction = submitAction === "invoice";
 
         const prevStatus = current.orderStatus;
         const existingBills = current.bills || {};
@@ -1042,6 +1078,8 @@ const updateOrder = async (req, res, next) => {
                 emissionPoint,
                 branchName,
             };
+            safeUpdate.invoiceNumber = internalNumber;
+            safeUpdate.facturaNo = internalNumber;
         } else if (fiscalFeatureEnabled && incomingFiscal?.requested === true && alreadyHasNCF) {
             // Backfill por si la orden vieja tiene NCF pero le faltan campos
             const existingNcfNumber = String(
@@ -1099,7 +1137,25 @@ const updateOrder = async (req, res, next) => {
                     safeUpdate.fiscal.expirationDate ||
                     expirationDateISO,
             };
+
     }
+        const alreadyHasInternalInvoice =
+            getExistingInternalInvoiceNumber(current) ||
+            getExistingInternalInvoiceNumber(safeUpdate);
+
+        if (isInvoiceAction && !alreadyHasInternalInvoice) {
+            const { internalSeq, internalNumber } = await allocateInternalSeq({ tenantId });
+
+            safeUpdate.fiscal = {
+                ...(safeUpdate.fiscal || {}),
+                internalSeq,
+                internalNumber,
+                issuedAt: safeUpdate?.fiscal?.issuedAt || new Date(),
+            };
+
+            safeUpdate.invoiceNumber = internalNumber;
+            safeUpdate.facturaNo = internalNumber;
+        }
         if (incomingFiscal?.requested === true && !fiscalFeatureEnabled) {
             return next(createHttpError(400, "FISCAL_NOT_ENABLED_FOR_TENANT"));
         }
@@ -1293,11 +1349,10 @@ const updateOrder = async (req, res, next) => {
             .trim()
             .toUpperCase();
 
-        const submitAction = String(req.body?.submitAction || "").trim().toLowerCase();
         const chargeMode = tenant?.features?.checkout?.chargeMode || "AT_COMPLETE";
 
         const shouldMarkPaidByInvoice =
-            chargeMode === "AT_INVOICE" && submitAction === "invoice";
+            chargeMode === "AT_INVOICE" && isInvoiceAction;
 
         const shouldMarkPaidByCompletion =
             chargeMode === "AT_COMPLETE" && incomingStatus === "Completado";
@@ -1308,7 +1363,7 @@ const updateOrder = async (req, res, next) => {
         safeUpdate.registerId = incomingRegisterId;
 
 // guardar fecha de facturación si emitió fiscal
-        if (incomingFiscal?.requested === true) {
+        if (isInvoiceAction || incomingFiscal?.requested === true) {
             safeUpdate.invoicedAt = current.invoicedAt || new Date();
         }
 

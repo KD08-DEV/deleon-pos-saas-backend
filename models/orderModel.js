@@ -74,6 +74,10 @@ const orderSchema = new mongoose.Schema(
             index: true,
         },
 
+// No. interno de factura, secuencial y cronológico
+        invoiceNumber: { type: String, default: null, index: true },
+        facturaNo: { type: String, default: null, index: true },
+
         invoicePath: { type: String, default: "" },
         invoiceUrl: { type: String, default: "" },
         orderSource: {

@@ -108,9 +108,22 @@ async function generateInvoicePDF(orderId, tenantId) {
         const ncfType = fiscal?.ncfType || order?.ncfType || "";
         const ncfNumber = fiscal?.ncfNumber || order?.ncfNumber || "";
         const pad8 = (val) => String(val).padStart(8, "0");
-        const internalNumber =
+
+        const rawInvoiceNumber =
+            order?.facturaNo ||
+            order?.invoiceNumber ||
+            order?.invoiceNo ||
+            fiscal?.facturaNo ||
+            fiscal?.invoiceNumber ||
+            fiscal?.invoiceNo ||
             fiscal?.internalNumber ||
-            (fiscal?.internalSeq ? pad8(fiscal.internalSeq) : "");
+            fiscal?.internalSeq ||
+            "";
+
+        const internalNumber =
+            rawInvoiceNumber && /^\d+$/.test(String(rawInvoiceNumber))
+                ? pad8(rawInvoiceNumber)
+                : String(rawInvoiceNumber || "");
         const branchName =
             fiscal?.branchName ||
             tenant?.fiscal?.defaultBranchName ||
@@ -227,12 +240,12 @@ async function generateInvoicePDF(orderId, tenantId) {
         // Top details
         doc.fontSize(10).fillColor("#111827");
 
+        doc.text(`Factura No.: ${internalNumber || "N/A"}`);
+
         if (hasNCF) {
-            doc.text(`Factura No.: ${internalNumber || "N/A"}`);
             doc.text(`Sucursal: ${branchName} · Punto de emision: ${emissionPoint}`);
         }
 
-        doc.text(`Order ID: ${String(order?._id || "")}`);
         doc.text(`Fecha/Hora: ${formatDateTimeDO(order?.createdAt)}`);
         if (hasNCF) doc.text(`Fecha de Vencimiento: ${formatDateUTC(expirationDate)}`);
 
@@ -246,11 +259,11 @@ async function generateInvoicePDF(orderId, tenantId) {
         doc.moveDown(1);
 
         // Table header
+        // Table header
         const tableTop = doc.y;
         doc.fontSize(10).fillColor("#374151");
         doc.text("Descripción", 50, tableTop);
-        doc.text("Cant.", 260, tableTop, { width: 60, align: "right" });
-        doc.text("ITBIS", 340, tableTop, { width: 80, align: "right" });
+        doc.text("Cant.", 320, tableTop, { width: 60, align: "right" });
         doc.text("Valor", 440, tableTop, { width: 100, align: "right" });
         doc.moveTo(50, tableTop + 15).lineTo(545, tableTop + 15).strokeColor("#e5e7eb").stroke();
 
@@ -267,19 +280,8 @@ async function generateInvoicePDF(orderId, tenantId) {
             const lineTotal = qty * unitPrice;
 
 
-            let lineTax = Number(it?.tax);
-            if (isNaN(lineTax)) {
-                if (taxEnabled) {
-                    if (subtotal > 0 && totalTax > 0) lineTax = (lineTotal / subtotal) * totalTax;
-                    else lineTax = lineTotal * taxRate;
-                } else {
-                    lineTax = 0;
-                }
-            }
-
-            doc.text(it?.name || "Item", 50, y, { width: 200 });
-            doc.text(String(qty), 260, y, { width: 60, align: "right" });
-            doc.text(moneyRD(lineTax), 340, y, { width: 80, align: "right" });
+            doc.text(it?.name || "Item", 50, y, { width: 250 });
+            doc.text(String(qty), 320, y, { width: 60, align: "right" });
             doc.text(moneyRD(unitPrice), 440, y, { width: 100, align: "right" });
             y += 18;
         });
@@ -293,11 +295,11 @@ async function generateInvoicePDF(orderId, tenantId) {
         if (discount > 0) doc.text(`Descuento: -${moneyRD(discount)}`);
         doc.text(`Subtotal: ${moneyRD(subtotal)}`);
         doc.text(`Propina: ${moneyRD(tip)}`);
+        doc.text(`ITBIS: ${moneyRD(totalTax)}`);
+
         if (deliveryFee > 0) {
             doc.text(`Envío: ${moneyRD(deliveryFee)}`);
         }
-
-        doc.text(`ITBIS: ${moneyRD(totalTax)}`);
 
         if (isDelivery && commissionAmount > 0) {
             doc.text(`Comisión: ${moneyRD(commissionAmount)}`);
