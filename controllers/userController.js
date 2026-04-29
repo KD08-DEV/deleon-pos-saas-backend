@@ -22,8 +22,8 @@ const register = async (req, res, next) => {
     try {
         const { name, phone, email, password, role, tenantName, plan } = req.body;
 
-        if (!name || !phone || !email || !password || !role) {
-            return next(createHttpError(400, "All fields are required!"));
+        if (!name || !email || !password || !role) {
+            return next(createHttpError(400, "Name, email, password and role are required!"));
         }
 
         // ✅ Declarar primero (para evitar el error "Cannot access tenantId before initialization")
@@ -156,21 +156,23 @@ const register = async (req, res, next) => {
                     );
                 }
                 membershipRole = "Cajera";
-            } else if (role === "Camarero") {
-                const countWaiters = await Membership.countDocuments({
+            } else if (role === "Camarero" || role === "Cocina") {
+                const countWaitersAndKitchen = await Membership.countDocuments({
                     tenantId,
-                    role: "Camarero",
+                    role: { $in: ["Camarero", "Cocina"] },
                     status: "active",
                 });
-                if (countWaiters >= limits.camareros) {
+
+                if (limits.camareros !== null && countWaitersAndKitchen >= limits.camareros) {
                     return next(
                         createHttpError(
                             403,
-                            "¡Se alcanzó el límite de camareros para este plan!"
+                            "¡Se alcanzó el límite de camareros/cocina para este plan!"
                         )
                     );
                 }
-                membershipRole = "Camarero";
+
+                membershipRole = role;
             } else {
                 return next(createHttpError(400, "Invalid role!"));
             }
@@ -191,20 +193,20 @@ const register = async (req, res, next) => {
 
         // Crear usuario
         const newUser = await User.create({
-            name,
-            phone,
-            email,
+            name: String(name || "").trim(),
+            phone: String(phone || "").trim(),
+            email: String(email || "").trim().toLowerCase(),
             password,
-            role,     // Admin / Cajera / Camarero
-            tenantId, // tenant del usuario
+            role,     // Admin / Cajera / Camarero / Cocina
+            tenantId,
         });
 
         // Crear membership
         await Membership.create({
             user: newUser._id,
             tenantId,
-            role: membershipRole, // Owner/Admin/Cajera/Camarero
-            clientIds: ["default"],
+            role: membershipRole, // Owner/Admin/Cajera/Camarero/Cocina
+            //            clientIds: ["default"],
             status: "active",
         });
 

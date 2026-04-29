@@ -15,15 +15,23 @@ const userSchema = new mongoose.Schema(
             }
         },
         phone: {
-            type: Number,
-            required: true,
+            type: String,
+            default: "",
+            trim: true,
             validate: {
-                validator: v => /\d{10}/.test(v),
-                message: "Phone number must be a 10-digit number!"
+                validator: function (v) {
+                    if (!v) return true;
+                    return /^\d{7,15}$/.test(String(v));
+                },
+                message: "Phone number must contain between 7 and 15 digits!"
             }
         },
         password: { type: String, required: true },
-        role: { type: String, required: true, enum: ["Admin", "Camarero", "Cajera"] },
+        role: {
+            type: String,
+            required: true,
+            enum: ["Admin", "Camarero", "Cocina", "Cajera"]
+        },
 
         // 🔐 multi-tenant
         tenantId: { type: String, required: true, index: true },
