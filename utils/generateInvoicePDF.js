@@ -259,15 +259,20 @@ async function generateInvoicePDF(orderId, tenantId) {
         doc.moveDown(1);
 
         // Table header
-        // Table header
         const tableTop = doc.y;
         doc.fontSize(10).fillColor("#374151");
-        doc.text("Descripción", 50, tableTop);
-        doc.text("Cant.", 320, tableTop, { width: 60, align: "right" });
-        doc.text("Valor", 440, tableTop, { width: 100, align: "right" });
-        doc.moveTo(50, tableTop + 15).lineTo(545, tableTop + 15).strokeColor("#e5e7eb").stroke();
 
-        // Rows
+        doc.text("Descripción", 50, tableTop, { width: 230 });
+        doc.text("Cant.", 285, tableTop, { width: 50, align: "right" });
+        doc.text("Precio", 355, tableTop, { width: 80, align: "right" });
+        doc.text("Importe", 455, tableTop, { width: 90, align: "right" });
+
+        doc.moveTo(50, tableTop + 15)
+            .lineTo(545, tableTop + 15)
+            .strokeColor("#e5e7eb")
+            .stroke();
+
+// Rows
         let y = tableTop + 25;
         doc.fontSize(10).fillColor("#111827");
 
@@ -279,10 +284,11 @@ async function generateInvoicePDF(orderId, tenantId) {
 
             const lineTotal = qty * unitPrice;
 
+            doc.text(it?.name || "Item", 50, y, { width: 230 });
+            doc.text(String(qty), 285, y, { width: 50, align: "right" });
+            doc.text(moneyRD(unitPrice), 355, y, { width: 80, align: "right" });
+            doc.text(moneyRD(lineTotal), 455, y, { width: 90, align: "right" });
 
-            doc.text(it?.name || "Item", 50, y, { width: 250 });
-            doc.text(String(qty), 320, y, { width: 60, align: "right" });
-            doc.text(moneyRD(unitPrice), 440, y, { width: 100, align: "right" });
             y += 18;
         });
 

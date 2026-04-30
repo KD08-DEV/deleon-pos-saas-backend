@@ -66,11 +66,19 @@ router.post("/merma", requireRole("Owner", "Admin"), inventoryController.createM
 
 // Lotes de merma (batch)
 router.post("/merma/batches", requireRole("Owner", "Admin"), inventoryController.createMermaBatch);
-router.get("/merma/batches", requireRole("Owner", "Admin"), inventoryController.listMermaBatches);
+router.get(
+    "/merma/batches",
+    requireRole("Owner", "Admin", "Cajera"),
+    inventoryController.listMermaBatches
+);
 router.patch("/merma/batches/:id", requireRole("Owner", "Admin"), inventoryController.updateMermaBatch);
 router.patch("/merma/batches/:id/close", requireRole("Owner", "Admin"), inventoryController.closeMermaBatch);
 
-router.get("/merma/summary", requireRole("Owner", "Admin"), inventoryController.getMermaSummary);
+router.get(
+    "/merma/summary",
+    requireRole("Owner", "Admin", "Cajera"),
+    inventoryController.getMermaSummary
+);
 router.post("/movements/yield", requireRole("Owner", "Admin"), inventoryController.processYield);
 
 

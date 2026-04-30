@@ -4,12 +4,11 @@ const CashSession = require("../models/cashSessionModel");
 const Order = require("../models/orderModel"); // agrega arriba
 
 const getRangeForDay = (dateYMD) => {
-    // OJO: puedes enviar from/to desde el front si quieres exactitud local
-    const start = new Date(`${dateYMD}T00:00:00.000`);
-    const end   = new Date(`${dateYMD}T23:59:59.999`);
+    const tzOffset = process.env.REPORT_TZ_OFFSET || "-04:00"; // República Dominicana
+    const start = new Date(`${dateYMD}T00:00:00.000${tzOffset}`);
+    const end = new Date(`${dateYMD}T23:59:59.999${tzOffset}`);
     return { start, end };
 };
-
 const normalize = (v) => String(v || "").trim().toLowerCase();
 
 const coerceMoney = (v) => {
@@ -105,8 +104,14 @@ const closeCashSession = async (req, res, next) => {
         const dateYMD = getDateFromReq(req);
         const registerId = getRegisterIdFromWriteReq(req);
 
-        const session = await CashSession.findOne({ tenantId, clientId, dateYMD, registerId });
-        if (!session) return next(createHttpError(404, "SESSION_NOT_FOUND"));
+        const registerFilter = buildLegacyRegisterReadFilter(registerId);
+
+        const session = await CashSession.findOne({
+            tenantId,
+            clientId,
+            dateYMD,
+            ...registerFilter,
+        }).sort({ updatedAt: -1, createdAt: -1 });        if (!session) return next(createHttpError(404, "SESSION_NOT_FOUND"));
         if (!tenantId) return next(createHttpError(400, "MISSING_TENANT_ID"));
         if (!clientId) return next(createHttpError(400, "MISSING_CLIENT_ID"));
 
@@ -201,8 +206,13 @@ const closeCashSession = async (req, res, next) => {
 
         return res.status(200).json({ success: true, data: session });
     } catch (err) {
-        // Para que puedas ver el error real en consola del server
         if (process.env.NODE_ENV !== "production") console.log("[POST close] ERROR", err);
+
+        // No conviertas errores 400/403/409 en 500.
+        if (err?.status || err?.statusCode) {
+            return next(err);
+        }
+
         return next(createHttpError(500, "CLOSE_CASH_SESSION_FAILED"));
     }
 };
@@ -287,16 +297,22 @@ function buildLegacyRegisterReadFilter(registerId) {
         return {};
     }
 
-    return {
-        $or: [
-            { registerId: reg },
-            { registerId: "MAIN" },
-            { registerId: "default" },
-            { registerId: { $exists: false } },
-            { registerId: null },
-            { registerId: "" },
-        ],
-    };
+    // Solo MAIN usa compatibilidad con registros viejos.
+    // Esto evita que CAJA2 o cualquier otra caja lea sesiones de MAIN/default.
+    if (reg === "MAIN" || reg === "DEFAULT") {
+        return {
+            $or: [
+                { registerId: "MAIN" },
+                { registerId: "default" },
+                { registerId: { $exists: false } },
+                { registerId: null },
+                { registerId: "" },
+            ],
+        };
+    }
+
+    // Cajas reales deben ser estrictas.
+    return { registerId: reg };
 }
 
 // GET /cash-session?dateYMD=YYYY-MM-DD&registerId=default
@@ -451,6 +467,38 @@ const getCashSessionsRange = async (req, res, next) => {
     }
 };
 
+// GET /cash-session/pending-close?dateYMD=YYYY-MM-DD&registerId=MAIN
+const getPendingCashSession = async (req, res, next) => {
+    try {
+        const { tenantId, clientId } = getScope(req);
+
+        if (!tenantId) return next(createHttpError(400, "MISSING_TENANT_ID"));
+        if (!clientId) return next(createHttpError(400, "MISSING_CLIENT_ID"));
+
+        const dateYMD = getDateFromReq(req);
+        const registerId = getRegisterIdFromReadReq(req) || "MAIN";
+        const registerFilter = buildLegacyRegisterReadFilter(registerId);
+
+        const pending = await CashSession.findOne({
+            tenantId,
+            clientId,
+            dateYMD: { $lt: dateYMD },
+            status: "OPEN",
+            ...registerFilter,
+        })
+            .sort({ dateYMD: -1, updatedAt: -1, createdAt: -1 })
+            .populate("openedBy", "name role")
+            .populate("movements.by", "name role");
+
+        return res.status(200).json({
+            success: true,
+            data: pending || null,
+        });
+    } catch (err) {
+        return next(createHttpError(500, "GET_PENDING_CASH_SESSION_FAILED"));
+    }
+};
+// POST /cash-session/open
 // POST /cash-session/open
 const openCashSession = async (req, res, next) => {
     try {
@@ -463,39 +511,84 @@ const openCashSession = async (req, res, next) => {
         const registerId = getRegisterIdFromWriteReq(req);
 
         const openingFloat = Number(req.body?.openingFloat ?? 0);
-        if (Number.isNaN(openingFloat) || openingFloat < 0) {
+        if (!Number.isFinite(openingFloat) || openingFloat < 0) {
             return next(createHttpError(400, "INVALID_OPENING_FLOAT"));
         }
 
-        dbg("[POST open] scope", { tenantId, clientId, userId, role });
-        dbg("[POST open] payload", { dateYMD, registerId, openingFloat });
+        // 1) No permitir abrir hoy si existe una caja anterior abierta.
+        const previousOpen = await CashSession.findOne({
+            tenantId,
+            clientId,
+            dateYMD: { $lt: dateYMD },
+            status: "OPEN",
+            ...buildLegacyRegisterReadFilter(registerId),
+        }).sort({ dateYMD: -1, updatedAt: -1, createdAt: -1 });
 
-        const existing = await CashSession.findOne({ tenantId, clientId, dateYMD, registerId });
-
-        // Si ya existe y ya se abrió, cajera NO puede editar
-        const hasOpenMovement = (s) => Array.isArray(s?.movements) && s.movements.some(m => m.type === "OPEN");
-
-        if (existing && hasOpenMovement(existing)) {
-            if (role === "Cajera") return next(createHttpError(409, "OPENING_ALREADY_SET"));
-            return next(createHttpError(409, "USE_ADJUST_ENDPOINT"));
+        if (previousOpen) {
+            return res.status(409).json({
+                success: false,
+                message: "PENDING_CASH_SESSION_CLOSE",
+                data: previousOpen,
+            });
         }
 
+        // 2) Buscar sesión del mismo día/caja.
+        const existing = await CashSession.findOne({
+            tenantId,
+            clientId,
+            dateYMD,
+            ...buildLegacyRegisterReadFilter(registerId),
+        }).sort({ updatedAt: -1, createdAt: -1 });
+
+        const hasOpenMovement = (s) =>
+            Array.isArray(s?.movements) &&
+            s.movements.some((m) => String(m?.type || "").toUpperCase() === "OPEN");
 
         if (existing) {
-            existing.openingFloatInitial = openingFloat;
-            existing.openedBy = userId;
-            existing.openedAt = new Date();
-            existing.status = "OPEN";
-            existing.movements.push({
-                type: "OPEN",
-                amount: openingFloat,
-                by: userId,
-            });
+            // Si ya cerró ese día, no se puede abrir otra vez.
+            if (
+                String(existing.status || "").toUpperCase() === "CLOSED" ||
+                existing.closedAt
+            ) {
+                return res.status(409).json({
+                    success: false,
+                    message: "CASH_SESSION_ALREADY_CLOSED",
+                    data: existing,
+                });
+            }
 
-            await existing.save();
-            return res.status(200).json({ success: true, data: existing });
+            // Si ya está abierta, no falles con 409.
+            // Devuelve success para que el frontend no piense que no tomó la apertura.
+            const shouldRepairOpening =
+                !hasOpenMovement(existing) ||
+                Number(existing.openingFloatInitial || 0) <= 0;
+
+            if (shouldRepairOpening) {
+                existing.openingFloatInitial = openingFloat;
+                existing.openedBy = existing.openedBy || userId;
+                existing.openedAt = existing.openedAt || new Date();
+                existing.status = "OPEN";
+
+                if (!hasOpenMovement(existing)) {
+                    existing.movements.push({
+                        type: "OPEN",
+                        amount: openingFloat,
+                        by: userId,
+                        note: "Apertura reparada/registrada",
+                    });
+                }
+
+                await existing.save();
+            }
+
+            return res.status(200).json({
+                success: true,
+                alreadyOpen: true,
+                data: existing,
+            });
         }
 
+        // 3) Crear nueva sesión.
         const created = await CashSession.create({
             tenantId,
             clientId,
@@ -506,15 +599,27 @@ const openCashSession = async (req, res, next) => {
             addedFloatTotal: 0,
             openedBy: userId,
             openedAt: new Date(),
-            movements: [{ type: "OPEN", amount: openingFloat, by: userId }],
+            movements: [
+                {
+                    type: "OPEN",
+                    amount: openingFloat,
+                    by: userId,
+                    note: role === "Cajera" ? "Apertura por cajera" : "Apertura de caja",
+                },
+            ],
         });
 
-        return res.status(201).json({ success: true, data: created });
+        return res.status(201).json({
+            success: true,
+            data: created,
+        });
     } catch (err) {
         dbg("[POST open] ERROR", err);
+
         if (err?.code === 11000) {
             return next(createHttpError(409, "SESSION_ALREADY_EXISTS"));
         }
+
         return next(createHttpError(500, "OPEN_CASH_SESSION_FAILED"));
     }
 };
@@ -727,20 +832,8 @@ const adjustCashSessionClosing = async (req, res, next) => {
                 .reduce((s, o) => s + (Number(o.bills?.totalWithTax) || 0), 0)
                 .toFixed(2)
         );
-        const openingInitial = Number(
-            session?.opening?.initial ??
-            session?.opening?.initialFloat ??
-            session?.openingFloat ??
-            session?.openingInitial ??
-            0
-        );
-
-        const addedTotal = Number(
-            session?.opening?.addedTotal ??
-            session?.addedTotal ??
-            session?.addedCash ??
-            0
-        );
+        const openingInitial = Number(session?.openingFloatInitial || 0);
+        const addedTotal = Number(session?.addedFloatTotal || 0);
 
         const expectedInRegister = Number((openingInitial + addedTotal + expectedCashSales).toFixed(2));
         const difference = Number((countedTotal - expectedInRegister).toFixed(2));
@@ -784,6 +877,7 @@ const adjustCashSessionClosing = async (req, res, next) => {
 module.exports = {
     getCashSessionByDate,
     getCurrentCashSession,
+    getPendingCashSession,
     openCashSession,
     addCashToSession,
     adjustOpeningFloat,

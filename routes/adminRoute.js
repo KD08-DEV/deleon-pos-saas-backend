@@ -8,6 +8,7 @@ const { exportExcel } = require("../controllers/reportExportController");
 const {
     getCashSessionByDate,
     getCurrentCashSession,
+    getPendingCashSession,
     openCashSession,
     closeCashSession,
     addCashToSession,
@@ -89,7 +90,12 @@ router.get(
 router.get("/reports",   requireScope({ level: "tenant" }), requireRole("Owner","Admin","Cajera"), getReports);
 router.get("/employees", requireScope({ level: "tenant" }), requireRole("Owner","Admin"), getEmployees);
 router.get("/users",     requireScope({ level: "tenant" }), requireRole("Owner","Admin"), getUsers);
-router.get("/usage",     requireScope({ level: "tenant" }), requireRole("Owner","Admin"), getUsage);
+router.get(
+    "/usage",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    getUsage
+);
 router.get(
     "/reports/export/excel",
     requireScope({ level: "tenant" }),
@@ -168,40 +174,52 @@ router.delete(
     requireRole("Owner", "Admin"),
     deleteCategory
 );
-
+router.get(
+    "/cash-session/pending-close",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    getPendingCashSession
+);
 router.get("/cash-session/current",
-    requireScope({ level: "client" }),
+    requireScope({ level: "tenant" }),
     requireRole("Owner", "Admin", "Cajera"),
     getCurrentCashSession
 );
 
 router.post("/cash-session/open",
-    requireScope({ level: "client" }),
+    requireScope({ level: "tenant" }),
     requireRole("Owner", "Admin", "Cajera"),
     openCashSession
 );
+
+
+
 router.post("/cash-session/close",
-    requireScope({ level: "client" }),
+    requireScope({ level: "tenant" }),
     requireRole("Owner", "Admin", "Cajera"),
     closeCashSession
 );
 
-
-
 router.get(
     "/cash-session",
-    requireScope({ level: "client" }),
+    requireScope({ level: "tenant" }),
     requireRole("Owner", "Admin", "Cajera"),
     getCashSessionByDate
 );
+
 router.get(
     "/cash-session/range",
-    requireScope({ level: "client" }),
+    requireScope({ level: "tenant" }),
     requireRole("Owner", "Admin", "Cajera"),
     getCashSessionsRange
 );
 
-
+router.get(
+    "/registers",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    listRegisters
+);
 router.post(
     "/cash-session/add",
     requireScope({ level: "client" }),
@@ -279,12 +297,7 @@ router.get("/summary", requireScope({ level: "tenant" }), requireRole("Owner","A
 
 
 // Registers (cajas)
-router.get(
-    "/registers",
-    requireScope({ level: "client" }),
-    requireRole("Owner", "Admin", "Cajera"),
-    listRegisters
-);
+
 
 router.post(
     "/registers",

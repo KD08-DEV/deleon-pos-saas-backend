@@ -205,8 +205,8 @@ const register = async (req, res, next) => {
         await Membership.create({
             user: newUser._id,
             tenantId,
-            role: membershipRole, // Owner/Admin/Cajera/Camarero/Cocina
-            //            clientIds: ["default"],
+            role: membershipRole,
+            clientIds: ["default"],
             status: "active",
         });
 
