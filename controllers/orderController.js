@@ -747,6 +747,10 @@ const addOrder = async (req, res, next) => {
 
 // Si la orden se creó con mesa y ya tiene items, marcar mesa ocupada
         if (tableRef && Array.isArray(payload.items) && payload.items.length > 0) {
+            const shouldFreeTable =
+                normalizedStatus === "Completado" ||
+                normalizedStatus === "Cancelado";
+
             await Table.updateOne(
                 {
                     _id: tableRef,
@@ -758,10 +762,15 @@ const addOrder = async (req, res, next) => {
                     ],
                 },
                 {
-                    $set: {
-                        status: "Ocupada",
-                        currentOrder: order._id,
-                    },
+                    $set: shouldFreeTable
+                        ? {
+                            status: "Disponible",
+                            currentOrder: null,
+                        }
+                        : {
+                            status: "Ocupada",
+                            currentOrder: order._id,
+                        },
                 }
             );
         }
