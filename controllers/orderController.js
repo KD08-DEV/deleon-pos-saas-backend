@@ -10,6 +10,7 @@ const Customer = require("../models/customerModel");
 const { deductInventoryForOrder, restoreInventoryForOrder } = require("../services/inventory/deductInventoryForOrder");
 const Printer = require("../models/printerModel");
 const networkPrintService = require("../services/networkPrintService");
+const Membership = require("../models/membershipModel");
 
 
 
@@ -102,6 +103,44 @@ function normalizeOrderStatus(s) {
 
     return map[v] || "En Progreso";
 }
+
+async function getCurrentMembership(req, tenantId) {
+    const userId = req.user?._id;
+
+    if (!userId || !tenantId) return null;
+
+    return Membership.findOne({
+        user: userId,
+        tenantId,
+        status: "active",
+    }).lean();
+}
+
+async function assertCanCancelOrder(req, tenantId) {
+    const userRole = String(req.user?.role || "").trim();
+
+    // Admin del UserModel siempre puede.
+    if (userRole === "Admin" || userRole === "Owner" || userRole === "SuperAdmin") {
+        return true;
+    }
+
+    const membership = await getCurrentMembership(req, tenantId);
+    const membershipRole = String(membership?.role || "").trim();
+
+    // Owner/Admin del Membership siempre puede.
+    if (membershipRole === "Owner" || membershipRole === "Admin") {
+        return true;
+    }
+
+    const canCancel = Boolean(membership?.permissions?.orders?.cancel);
+
+    if (!canCancel) {
+        throw createHttpError(403, "NO_PERMISSION_TO_CANCEL_ORDER");
+    }
+
+    return true;
+}
+
 const VALID_PRODUCTION_AREAS = ["kitchen", "bar", "other"];
 
 function normalizeProductionArea(value = "kitchen") {
@@ -406,6 +445,32 @@ const addOrder = async (req, res, next) => {
 
         const submitActionNormalized = String(submitAction || "").trim().toLowerCase();
         const isInvoiceAction = submitActionNormalized === "invoice";
+        const isCompletionAction = normalizedStatus === "Completado";
+
+        const isFinalizingOrder =
+            isInvoiceAction ||
+            isCompletionAction ||
+            incomingFiscal?.requested === true;
+
+        if (
+            String(req.body?.paymentStatus || "").trim() === "Pagado" &&
+            !isFinalizingOrder
+        ) {
+            return next(
+                createHttpError(
+                    400,
+                    "No se puede marcar una orden como pagada sin facturar o completar explícitamente."
+                )
+            );
+        }
+
+        const shouldIssueInternalInvoice =
+            isInvoiceAction ||
+            incomingFiscal?.requested === true ||
+            req.body?.markAsPaid === true ||
+            req.body?.paid === true ||
+            req.body?.isPaid === true ||
+            String(req.body?.paymentStatus || "").trim() === "Pagado";
 
         let assignedInternalInvoice = null;
 
@@ -469,7 +534,7 @@ const addOrder = async (req, res, next) => {
 
             topLevelNcfNumber = ncfNumber;
         }
-        if (isInvoiceAction && !assignedInternalInvoice) {
+        if (shouldIssueInternalInvoice && !assignedInternalInvoice) {
             assignedInternalInvoice = await allocateInternalSeq({ tenantId });
 
             const { internalSeq, internalNumber } = assignedInternalInvoice;
@@ -680,7 +745,7 @@ const addOrder = async (req, res, next) => {
 
         const order = await Order.create(payload);
 
-        // Si la orden se creó con mesa y ya tiene items, marcar mesa ocupada
+// Si la orden se creó con mesa y ya tiene items, marcar mesa ocupada
         if (tableRef && Array.isArray(payload.items) && payload.items.length > 0) {
             await Table.updateOne(
                 {
@@ -701,10 +766,28 @@ const addOrder = async (req, res, next) => {
             );
         }
 
+        let responseOrder = order;
+
+        try {
+            const invResult = await syncInventoryForOrderTiming({
+                orderId: order._id,
+                tenant,
+                orderStatus: normalizedStatus,
+                isInvoiceAction,
+                userId: req.user?._id || null,
+            });
+
+            if (["deduct", "restore"].includes(invResult?.action)) {
+                responseOrder = await Order.findById(order._id) || order;
+            }
+        } catch (e) {
+            console.error("INVENTORY SYNC ON ADD ORDER ERROR =>", e);
+        }
+
         return res.status(201).json({
             success: true,
             message: "Order created!",
-            data: order,
+            data: responseOrder,
         });
     } catch (error) {
         console.error("[addOrder] error:", error?.message);
@@ -809,6 +892,7 @@ const deleteOrder = async (req, res, next) => {
                 message: "Order already removed or not found",
             });
         }
+        await assertCanCancelOrder(req, req.user.tenantId);
 
         // Si la orden tiene mesa asignada, liberar la mesa
         if (order.table?._id) {
@@ -818,6 +902,15 @@ const deleteOrder = async (req, res, next) => {
             );
         }
 
+        if (order.inventoryDeducted === true) {
+            try {
+                await restoreInventoryForOrder(order._id, {
+                    userId: req.user?._id || null,
+                });
+            } catch (e) {
+                console.error("INVENTORY RESTORE BEFORE DELETE ERROR =>", e);
+            }
+        }
         await Order.deleteOne({ _id: id, tenantId: req.user.tenantId, clientId: req.clientId  });
 
         return res.status(200).json({
@@ -929,6 +1022,83 @@ function getExistingInternalInvoiceNumber(order = {}) {
 }
 
 
+function getTenantChargeMode(tenant = {}) {
+    const mode = String(
+        tenant?.features?.checkout?.chargeMode || "AT_COMPLETE"
+    )
+        .trim()
+        .toUpperCase();
+
+    return ["AT_INVOICE", "AT_COMPLETE"].includes(mode)
+        ? mode
+        : "AT_COMPLETE";
+}
+
+function shouldDeductInventoryNow({ tenant, orderStatus, isInvoiceAction }) {
+    const chargeMode = getTenantChargeMode(tenant);
+    const normalizedStatus = normalizeOrderStatus(orderStatus);
+
+    if (normalizedStatus === "Cancelado") {
+        return false;
+    }
+
+    // Modo cobrar al facturar:
+    // descuenta inventario cuando la acción real es facturar.
+    if (chargeMode === "AT_INVOICE" && isInvoiceAction) {
+        return true;
+    }
+
+    // Modo cobrar al completar:
+    // descuenta inventario cuando la orden pasa a Completado.
+    if (chargeMode === "AT_COMPLETE" && normalizedStatus === "Completado") {
+        return true;
+    }
+
+    return false;
+}
+
+async function syncInventoryForOrderTiming({
+                                               orderId,
+                                               tenant,
+                                               orderStatus,
+                                               isInvoiceAction,
+                                               userId,
+                                           }) {
+    const normalizedStatus = normalizeOrderStatus(orderStatus);
+
+    if (normalizedStatus === "Cancelado") {
+        const restored = await restoreInventoryForOrder(orderId, {
+            userId: userId || null,
+        });
+
+        return {
+            action: "restore",
+            result: restored,
+        };
+    }
+
+    if (
+        shouldDeductInventoryNow({
+            tenant,
+            orderStatus: normalizedStatus,
+            isInvoiceAction,
+        })
+    ) {
+        const deducted = await deductInventoryForOrder(orderId, {
+            userId: userId || null,
+        });
+
+        return {
+            action: "deduct",
+            result: deducted,
+        };
+    }
+
+    return {
+        action: "skip",
+        result: null,
+    };
+}
 
 const updateOrder = async (req, res, next) => {
     console.log("[ORDER UPDATE] body =>", {
@@ -978,6 +1148,13 @@ const updateOrder = async (req, res, next) => {
         if (!current) return next(createHttpError(404, "Order not found!"));
         const submitAction = String(req.body?.submitAction || "").trim().toLowerCase();
         const isInvoiceAction = submitAction === "invoice";
+        const shouldIssueInternalInvoice =
+            isInvoiceAction ||
+            req.body?.fiscal?.requested === true ||
+            req.body?.markAsPaid === true ||
+            req.body?.paid === true ||
+            req.body?.isPaid === true ||
+            String(req.body?.paymentStatus || "").trim() === "Pagado";
 
         const prevStatus = current.orderStatus;
         const existingBills = current.bills || {};
@@ -989,6 +1166,13 @@ const updateOrder = async (req, res, next) => {
         const requestedStatusNormalized = normalizeOrderStatus(
             req.body.orderStatus ?? current.orderStatus
         );
+        const isCancellingOrder =
+            requestedStatusNormalized === "Cancelado" &&
+            currentStatusNormalized !== "Cancelado";
+
+        if (isCancellingOrder) {
+            await assertCanCancelOrder(req, tenantId);
+        }
 
         const isReopeningCancelledOrder =
             currentStatusNormalized === "Cancelado" &&
@@ -1143,7 +1327,7 @@ const updateOrder = async (req, res, next) => {
             getExistingInternalInvoiceNumber(current) ||
             getExistingInternalInvoiceNumber(safeUpdate);
 
-        if (isInvoiceAction && !alreadyHasInternalInvoice) {
+        if (shouldIssueInternalInvoice && !alreadyHasInternalInvoice) {
             const { internalSeq, internalNumber } = await allocateInternalSeq({ tenantId });
 
             safeUpdate.fiscal = {
@@ -1363,24 +1547,47 @@ const updateOrder = async (req, res, next) => {
         safeUpdate.registerId = incomingRegisterId;
 
 // guardar fecha de facturación si emitió fiscal
-        if (isInvoiceAction || incomingFiscal?.requested === true) {
+        if (shouldIssueInternalInvoice) {
             safeUpdate.invoicedAt = current.invoicedAt || new Date();
         }
 
 // pago automático según el modo del tenant
-        safeUpdate.paymentStatus = shouldMarkPaid
-            ? "Pagado"
-            : current.paymentStatus || "Pendiente";
+        if (incomingStatus === "Cancelado") {
+            safeUpdate.paymentStatus = "Anulado";
+        } else {
+            safeUpdate.paymentStatus = shouldMarkPaid
+                ? "Pagado"
+                : current.paymentStatus || "Pendiente";
+        }
 
-        if (shouldMarkPaid) {
+        if (shouldMarkPaid && incomingStatus !== "Cancelado") {
             safeUpdate.paidAt = current.paidAt || new Date();
             safeUpdate.paidBy = req.user?._id || current.paidBy || null;
         }
 
         // ✅ Update
         let order = await Order.findOneAndUpdate(orderScope, safeUpdate, { new: true })
+
             .populate("table", "tableNo status")
             .populate("user", "name email role");
+
+        try {
+            const invResult = await syncInventoryForOrderTiming({
+                orderId: order._id,
+                tenant,
+                orderStatus: incomingStatus,
+                isInvoiceAction,
+                userId: req.user?._id || null,
+            });
+
+            if (["deduct", "restore"].includes(invResult?.action)) {
+                order = await Order.findOne(orderScope)
+                    .populate("table", "tableNo status")
+                    .populate("user", "name email role") || order;
+            }
+        } catch (e) {
+            console.error("INVENTORY SYNC ERROR =>", e);
+        }
         // Si antes no tenía items y ahora sí tiene, ocupar la mesa
         const prevCount = Array.isArray(current.items) ? current.items.length : 0;
         const newCount = Array.isArray(order.items) ? order.items.length : 0;
@@ -1410,7 +1617,7 @@ const updateOrder = async (req, res, next) => {
 
             // 1) Buscar dishes (incluye inventoryCategoryId + recipe)
             const dishes = await Dish.find({ _id: { $in: dishIds } })
-                .select("_id category inventoryCategoryId isInventoryItem avgCost lastCost recipe productionArea")
+                .select("_id category inventoryCategoryId inventoryType isInventoryItem avgCost lastCost recipe productionArea")
                 .lean();
 
             const dishMap = new Map(dishes.map((d) => [String(d._id), d]));
@@ -1484,9 +1691,12 @@ const updateOrder = async (req, res, next) => {
                 // - Si no tiene nada => 0
                 let unitCost = 0;
 
-                const hasRecipe = Array.isArray(d?.recipe) && d.recipe.length > 0;
+                const inventoryType = String(d?.inventoryType || "").trim();
+                const hasRecipe =
+                    inventoryType === "recipe" ||
+                    (Array.isArray(d?.recipe) && d.recipe.length > 0);
 
-                if (d?.isInventoryItem === true && !hasRecipe) {
+                if (inventoryType === "direct" && !hasRecipe) {
                     unitCost = Number(d.avgCost ?? d.lastCost ?? 0) || 0;
                 } else if (hasRecipe) {
                     let recipeCost = 0;
@@ -1522,36 +1732,27 @@ const updateOrder = async (req, res, next) => {
         }
 
 
-// ✅ Inventario real:
-// - Al completar => descontar (idempotente por order.inventoryDeducted)
-// - Al cancelar => restaurar (si ya se había descontado)
-        const allowNegativeStock = Boolean(
-            tenant?.features?.inventory?.allowNegativeStock ??
-            tenant?.inventory?.allowNegativeStock ??
-            false
-        );
+// ✅ Inventario real según modo del tenant:
+// - AT_INVOICE: descuenta al facturar
+// - AT_COMPLETE: descuenta al completar
+// - Cancelado: restaura si ya había descontado
+        try {
+            const invResult = await syncInventoryForOrderTiming({
+                orderId: order._id,
+                tenant,
+                orderStatus: incomingStatus,
+                isInvoiceAction,
+                userId: req.user?._id || null,
+            });
 
-        if (incomingStatus === "Completado") {
-            try {
-                await deductInventoryForOrder(order._id, {
-                    allowNegativeStock,
-                    userId: req.user?._id || null,
-                });
-            } catch (e) {
-                console.error("INVENTORY DEDUCT ERROR =>", e);
+            if (["deduct", "restore"].includes(invResult?.action)) {
+                order = await Order.findOne(orderScope)
+                    .populate("table", "tableNo status")
+                    .populate("user", "name email role") || order;
             }
+        } catch (e) {
+            console.error("INVENTORY SYNC ERROR =>", e);
         }
-
-        if (incomingStatus === "Cancelado") {
-            try {
-                await restoreInventoryForOrder(order._id, {
-                    userId: req.user?._id || null,
-                });
-            } catch (e) {
-                console.error("INVENTORY RESTORE ERROR =>", e);
-            }
-        }
-
 // ✅ Liberar mesa si cancelada/completada
         if (
             (incomingStatus === "Cancelado" || incomingStatus === "Completado") &&

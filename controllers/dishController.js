@@ -2,7 +2,55 @@ const Dish = require("../models/dish");
 const createHttpError = require("http-errors");
 const mongoose = require("mongoose");
 const { supabase } = require("../config/supabaseClient");
+const Tenant = require("../models/tenantModel");
+
+const {
+    getPlanFeatures,
+    getPlanLimits,
+    isUnlimited,
+    normalizePlan,
+} = require("../middlewares/requirePlan");
+
 const VALID_PRODUCTION_AREAS = ["kitchen", "bar", "other"];
+const { hasPermission } = require("../middlewares/requirePermission");
+
+function getCurrentRole(req) {
+    return (
+        req.authzMembership?.role ||
+        req.scope?.membership?.role ||
+        req.user?.role ||
+        ""
+    );
+}
+
+function isAdminLike(req) {
+    return ["SuperAdmin", "Owner", "Admin"].includes(getCurrentRole(req));
+}
+
+async function getTenantPlanContext(tenantId) {
+    if (!tenantId) {
+        throw createHttpError(401, "TENANT_NOT_FOUND");
+    }
+
+    const tenant = await Tenant.findOne({ tenantId }).select("plan status").lean();
+
+    if (!tenant) {
+        throw createHttpError(404, "TENANT_NOT_FOUND");
+    }
+
+    if (tenant.status && tenant.status !== "active") {
+        throw createHttpError(403, "TENANT_SUSPENDED");
+    }
+
+    const plan = normalizePlan(tenant.plan);
+
+    return {
+        plan,
+        features: getPlanFeatures(plan),
+        limits: getPlanLimits(plan),
+    };
+}
+
 
 const normalizeProductionArea = (value) => {
     const v = String(value || "kitchen").trim().toLowerCase();
@@ -73,9 +121,15 @@ const deleteFromSupabase = async (imageUrl) => {
 // --------------------------------------------
 // CREATE
 exports.addDish = async (req, res, next) => {
-    const clientId = req.clientId || "default";
-
     try {
+        const clientId = req.clientId || "default";
+        const tenantId = req.user?.tenantId;
+
+        if (!tenantId) {
+            return next(createHttpError(401, "TENANT_NOT_FOUND"));
+        }
+
+        const planContext = await getTenantPlanContext(tenantId);
         const {
             name,
             price,
@@ -99,7 +153,38 @@ exports.addDish = async (req, res, next) => {
         // inventoryCategoryId (si viene)
 // Flags base (evita usar variables antes de declararlas)
         const isInv = String(isInventoryItem) === "true" || isInventoryItem === true;
+        if (isInv && !isAdminLike(req)) {
+            return next(createHttpError(
+                403,
+                "Tu permiso solo permite crear productos del menú. No puedes crear artículos directos de inventario."
+            ));
+        }
         const sm = sellMode !== undefined ? String(sellMode) : undefined;
+
+        if (isInv && !planContext.features.inventory) {
+            return next(createHttpError(403, "Tu plan actual no incluye inventario. Mejora a Estándar, Premium o Pro para usar esta función."));
+        }
+
+        if (inventoryCategoryId && !planContext.features.inventoryCategories) {
+            return next(createHttpError(403, "Tu plan actual no incluye categorías de inventario."));
+        }
+
+        if (!isInv && !isUnlimited(planContext.limits.maxDishes)) {
+            const currentDishes = await Dish.countDocuments({
+                tenantId,
+                clientId,
+                isArchived: { $ne: true },
+                isInventoryItem: { $ne: true },
+                category: { $ne: "Inventario" },
+            });
+
+            if (currentDishes >= planContext.limits.maxDishes) {
+                return next(createHttpError(
+                    403,
+                    `Límite de platos alcanzado para tu plan (${planContext.limits.maxDishes}). Mejora tu plan para agregar más productos.`
+                ));
+            }
+        }
 
 // inventoryCategoryId (si viene)
         const allowCP = String(allowCustomPrice) === "true" || allowCustomPrice === true;
@@ -210,7 +295,7 @@ exports.addDish = async (req, res, next) => {
             ...(wu !== undefined ? { weightUnit: wu } : {}),
             ...(pplb !== undefined ? { pricePerLb: pplb } : {}),
             ...(u !== undefined ? { unit: u } : {}),
-            tenantId: req.user.tenantId,
+            tenantId,
             clientId: clientId,
         });
 
@@ -243,13 +328,23 @@ exports.getDishes = async (req, res, next) => {
             search = "",
             category = "",
         } = req.query;
+        const tenantId = req.user?.tenantId;
+        const planContext = await getTenantPlanContext(tenantId);
+
+        if (String(includeInventory) === "true" && !planContext.features.inventory) {
+            return res.status(403).json({
+                success: false,
+                code: "PLAN_FEATURE_NOT_ALLOWED",
+                message: "Tu plan actual no incluye inventario.",
+            });
+        }
 
         const pageNum = Math.max(Number(page) || 1, 1);
         const limitNum = Math.max(Number(limit) || 12, 1);
         const skip = (pageNum - 1) * limitNum;
 
         const filter = {
-            tenantId: req.user.tenantId,
+            tenantId,
             isArchived: { $ne: true },
         };
 
@@ -315,13 +410,32 @@ exports.updateDish = async (req, res, next) => {
             unit,
         } = req.body;
 
+        const tenantId = req.user?.tenantId;
+
+        if (!tenantId) {
+            return next(createHttpError(401, "TENANT_NOT_FOUND"));
+        }
+
+        const planContext = await getTenantPlanContext(tenantId);
+
+        const isTryingInventoryChange =
+            isInventoryItem !== undefined ||
+            inventoryCategoryId !== undefined;
+
+        if (isTryingInventoryChange && !planContext.features.inventory) {
+            return next(createHttpError(
+                403,
+                "Tu plan actual no incluye inventario. Mejora a Estándar, Premium o Pro para usar esta función."
+            ));
+        }
+
         if (!mongoose.Types.ObjectId.isValid(id)) {
             return next(createHttpError(404, "Invalid dish ID!"));
         }
 
         const dish = await Dish.findOne({
             _id: id,
-            tenantId: req.user.tenantId,
+            tenantId,
         });
 
         if (!dish) return next(createHttpError(404, "Dish not found!"));

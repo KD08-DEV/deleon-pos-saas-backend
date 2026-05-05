@@ -62,8 +62,20 @@ const cashSessionSchema = new mongoose.Schema(
 );
 
 cashSessionSchema.index(
-    { tenantId: 1, clientId: 1, dateYMD: 1, registerId: 1 },
-    { unique: true }
+    { tenantId: 1, clientId: 1, dateYMD: 1, registerId: 1, openedBy: 1 },
+    {
+        unique: true,
+        name: "uniq_cash_session_per_cashier_register_day",
+    }
 );
+
+cashSessionSchema.index({
+    tenantId: 1,
+    clientId: 1,
+    dateYMD: 1,
+    registerId: 1,
+    status: 1,
+    openedBy: 1,
+});
 
 module.exports = mongoose.model("CashSession", cashSessionSchema);

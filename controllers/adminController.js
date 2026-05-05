@@ -10,7 +10,10 @@ const InventoryMovement = require("../models/inventoryMovementModel");
 const createHttpError = require("http-errors");
 const bcrypt = require("bcrypt");
 const TenantSettings = require("../models/tenantSettingsModel");
-
+const {
+    normalizePlan,
+    getPlanFeatures,
+} = require("../middlewares/requirePlan");
 
 
 function parseReportBoundary(value, endOfDay = false) {
@@ -283,15 +286,45 @@ exports.getReports = async (req, res) => {
 // 🔹 Obtener todos los empleados (sin incluir al admin)
 exports.getEmployees = async (req, res) => {
     try {
-        const employees = await User.find({
-            tenantId: req.user.tenantId,
-        }).select("_id name email phone role");
-        res.status(200).json({ success: true, data: employees });
+        const tenantId = req.user.tenantId;
+
+        const employees = await User.find({ tenantId })
+            .select("_id name email phone role")
+            .lean();
+
+        const memberships = await Membership.find({
+            tenantId,
+            user: { $in: employees.map((e) => e._id) },
+            status: "active",
+        })
+            .select("user role clientIds permissions status")
+            .lean();
+
+        const membershipByUserId = new Map(
+            memberships.map((m) => [String(m.user), m])
+        );
+
+        const data = employees.map((employee) => {
+            const membership = membershipByUserId.get(String(employee._id));
+
+            return {
+                ...employee,
+                membershipRole: membership?.role || employee.role,
+                clientIds: membership?.clientIds || [],
+                permissions: normalizePermissions(membership?.permissions || DEFAULT_PERMISSIONS),
+            };
+        });
+
+        res.status(200).json({
+            success: true,
+            data,
+        });
     } catch (error) {
         console.error("❌ Error al obtener empleados:", error);
-        res
-            .status(500)
-            .json({ success: false, message: "Error al obtener empleados" });
+        res.status(500).json({
+            success: false,
+            message: "Error al obtener empleados",
+        });
     }
 };
 
@@ -313,7 +346,7 @@ exports.getUsers = async (req, res) => {
 exports.updateEmployee = async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, email, phone, role, password } = req.body;
+        const { name, email, phone, role, password, permissions } = req.body;
 
 
         // Verificar que el empleado existe y pertenece al mismo tenant
@@ -370,7 +403,7 @@ exports.updateEmployee = async (req, res) => {
             updateData.phone = phoneNum;
         }
 
-        if (role && ["Admin", "Camarero", "Cajera"].includes(role)) {
+        if (role && ["Admin", "Camarero", "Cajera", "Cocina"].includes(role)) {
             updateData.role = role;
         }
 
@@ -415,16 +448,16 @@ exports.updateEmployee = async (req, res) => {
                 }
             }
 
-            if (role === "Camarero") {
+            if (role === "Camarero" || role === "Cocina") {
                 const waitersCount = await Membership.countDocuments({
                     ...base,
-                    role: "Camarero",
+                    role: { $in: ["Camarero", "Cocina"] },
                 });
 
                 if (!isUnlimited(limits.maxWaiters) && waitersCount + 1 > limits.maxWaiters) {
                     return res.status(409).json({
                         success: false,
-                        message: `Límite de Camareros alcanzado (${limits.maxWaiters}). Mejora el plan o cambia otro usuario de rol.`,
+                        message: `Límite de Camareros/Cocina alcanzado (${limits.maxWaiters}). Mejora el plan o cambia otro usuario de rol.`,
                     });
                 }
             }
@@ -450,23 +483,65 @@ exports.updateEmployee = async (req, res) => {
         const updatedEmployee = await User.findById(employee._id).select("name email phone role");
 
 // Actualizar membership si el rol cambió
+        const membershipRoleMap = {
+            Admin: "Admin",
+            Cajera: "Cajera",
+            Camarero: "Camarero",
+            Cocina: "Cocina",
+        };
+
+        const membershipSet = {};
+
         if (role && role !== previousRole) {
-            const Membership = require("../models/membershipModel");
+            membershipSet.role = membershipRoleMap[role] || role;
+        }
+
+        if (permissions && typeof permissions === "object") {
+            membershipSet.permissions = normalizePermissions(permissions);
+        }
+
+        let updatedMembership = null;
+
+        if (Object.keys(membershipSet).length > 0) {
             const membershipRoleMap = {
                 Admin: "Admin",
                 Cajera: "Cajera",
                 Camarero: "Camarero",
+                Cocina: "Cocina",
             };
 
-            await Membership.updateMany(
-                { user: id, tenantId: req.user.tenantId },
-                { $set: { role: membershipRoleMap[role] || role } }
-            );
+            updatedMembership = await Membership.findOneAndUpdate(
+                {
+                    user: employee._id,
+                    tenantId: req.user.tenantId,
+                },
+                {
+                    $set: {
+                        ...membershipSet,
+                        status: "active",
+                    },
+                    $setOnInsert: {
+                        user: employee._id,
+                        tenantId: req.user.tenantId,
+                        role: membershipRoleMap[role] || role || employee.role || "Camarero",
+                        clientIds: ["default"],
+                    },
+                },
+                {
+                    new: true,
+                    upsert: true,
+                }
+            ).lean();
         }
-        res.status(200).json({ 
-            success: true, 
-            message: "Empleado actualizado exitosamente", 
-            data: updatedEmployee 
+
+        res.status(200).json({
+            success: true,
+            message: "Empleado actualizado exitosamente",
+            data: {
+                ...updatedEmployee.toObject(),
+                membershipRole: updatedMembership?.role || role || updatedEmployee.role,
+                permissions: updatedMembership?.permissions || membershipSet.permissions,
+            },
         });
     } catch (error) {
         console.error("❌ Error al actualizar empleado:", error);
@@ -492,7 +567,9 @@ exports.updateEmployee = async (req, res) => {
 exports.getFiscalConfig = async (req, res) => {
     try {
         const tenantId = req.user.tenantId;
-        const tenant = await Tenant.findOne({ tenantId }).select("fiscal features");
+        const tenant = await Tenant.findOne({ tenantId }).select("plan fiscal features");
+        const normalizedPlan = normalizePlan(tenant?.plan);
+        const planFeatures = getPlanFeatures(normalizedPlan);
 
         const f = tenant?.features || {};
         const norm = {
@@ -545,6 +622,8 @@ exports.getFiscalConfig = async (req, res) => {
         return res.json({
             success: true,
             data: {
+                plan: normalizedPlan,
+                planFeatures,
                 fiscal: tenant?.fiscal || null,
                 features: norm,
             },
@@ -560,133 +639,185 @@ exports.updateFiscalConfig = async (req, res) => {
     try {
         const tenantId = req.user.tenantId;
 
+        const tenantPrev = await Tenant.findOne({ tenantId }).select("plan features fiscal");
 
-        // ✅ declarar primero (UNA sola vez)
+        if (!tenantPrev) {
+            return res.status(404).json({
+                success: false,
+                message: "Tenant not found",
+            });
+        }
+
+        const normalizedPlan = normalizePlan(tenantPrev?.plan);
+        const planFeatures = getPlanFeatures(normalizedPlan);
+
+        const prevFeatures = tenantPrev?.features || {};
+
         const $set = {};
+
+        // =========================
+        // CONFIGURACIÓN GENERAL
+        // Disponible para todos los planes
+        // =========================
+
         const chargeMode = req.body?.features?.checkout?.chargeMode;
         if (["AT_INVOICE", "AT_COMPLETE"].includes(chargeMode)) {
             $set["features.checkout.chargeMode"] = chargeMode;
         }
 
-        // ✅ leer values
-        const fiscalEnabled = req.body?.fiscalEnabled;
         const taxEnabled = req.body?.features?.tax?.enabled;
         const tipEnabled = req.body?.features?.tip?.enabled;
         const discountEnabled = req.body?.features?.discount?.enabled;
-        const orderSources = req.body?.features?.orderSources;
         const preInvoiceEnabled = req.body?.features?.preInvoice?.enabled;
-
-        // ✅ SOLO setear si viene boolean (para que false se guarde)
-        if (typeof fiscalEnabled === "boolean") $set["fiscal.enabled"] = fiscalEnabled;
-        if (typeof taxEnabled === "boolean") $set["features.tax.enabled"] = taxEnabled;
-        if (typeof tipEnabled === "boolean") $set["features.tip.enabled"] = tipEnabled;
-        if (typeof discountEnabled === "boolean") $set["features.discount.enabled"] = discountEnabled;
-        if (typeof preInvoiceEnabled === "boolean") $set["features.preInvoice.enabled"] = preInvoiceEnabled;
-
-        const ncfConfig = req.body?.ncfConfig || {};
-        const B01 = ncfConfig.B01;
-        const B02 = ncfConfig.B02;
-
-        const buildUpdateForType = (type, data) => {
-            const u = {};
-            if (!data) return u;
-
-            ["start", "current", "max"].forEach((k) => {
-                if (data[k] !== undefined && data[k] !== null && data[k] !== "") {
-                    const n = Number(data[k]);
-                    if (!Number.isFinite(n) || n < 0) throw new Error(`${type}.${k} inválido`);
-                    u[`fiscal.ncfConfig.${type}.${k}`] = Math.floor(n);
-                }
-            });
-            if (orderSources?.delivery) {
-                if (typeof orderSources.delivery.enabled === "boolean") {
-                    $set["features.orderSources.delivery.enabled"] = orderSources.delivery.enabled;
-                }
-            }
-
-            if ("active" in data) u[`fiscal.ncfConfig.${type}.active`] = !!data.active;
-
-            if ("expiresAt" in data) {
-                if (!data.expiresAt) u[`fiscal.ncfConfig.${type}.expiresAt`] = null;
-                else {
-                    const d = new Date(data.expiresAt);
-                    if (Number.isNaN(d.getTime())) throw new Error(`${type}.expiresAt inválido`);
-                    u[`fiscal.ncfConfig.${type}.expiresAt`] = d;
-                }
-            }
-
-            return u;
-        };
-
-        Object.assign($set, buildUpdateForType("B01", B01));
-        Object.assign($set, buildUpdateForType("B02", B02));
-
-        if (orderSources?.pedidosYa) {
-            if (typeof orderSources.pedidosYa.enabled === "boolean") {
-                $set["features.orderSources.pedidosYa.enabled"] = orderSources.pedidosYa.enabled;
-            }
-            if (orderSources.pedidosYa.commissionRate !== undefined) {
-                const r = Number(orderSources.pedidosYa.commissionRate);
-                if (!Number.isFinite(r) || r < 0 || r > 1) throw new Error("pedidosYa.commissionRate inválido (usa 0.26)");
-                $set["features.orderSources.pedidosYa.commissionRate"] = r;
-            }
-        }
-
-        if (orderSources?.uberEats) {
-            if (typeof orderSources.uberEats.enabled === "boolean") {
-                $set["features.orderSources.uberEats.enabled"] = orderSources.uberEats.enabled;
-            }
-            if (orderSources.uberEats.commissionRate !== undefined) {
-                const r = Number(orderSources.uberEats.commissionRate);
-                if (!Number.isFinite(r) || r < 0 || r > 1) throw new Error("uberEats.commissionRate inválido (usa 0.22)");
-                $set["features.orderSources.uberEats.commissionRate"] = r;
-            }
-        }
-        const tenantPrev = await Tenant.findOne({ tenantId }).select("features");
-        const prev = tenantPrev?.features || {};
-        const tenantPrev2 = await Tenant.findOne({ tenantId }).select("features fiscal");
-        const prevFiscalEnabled =
-            typeof tenantPrev2?.fiscal?.enabled === "boolean" ? tenantPrev2.fiscal.enabled : true;
-
-        const currentFiscalEnabled =
-            typeof fiscalEnabled === "boolean" ? fiscalEnabled : prevFiscalEnabled;
-
-
+        const orderSources = req.body?.features?.orderSources;
 
         const currentTaxEnabled =
             typeof taxEnabled === "boolean"
                 ? taxEnabled
-                : (typeof prev?.tax?.enabled === "boolean" ? prev.tax.enabled : true);
+                : (typeof prevFeatures?.tax?.enabled === "boolean" ? prevFeatures.tax.enabled : true);
 
         const currentTipEnabled =
             typeof tipEnabled === "boolean"
                 ? tipEnabled
-                : (typeof prev?.tip?.enabled === "boolean" ? prev.tip.enabled : true);
+                : (typeof prevFeatures?.tip?.enabled === "boolean" ? prevFeatures.tip.enabled : true);
 
         const currentDiscountEnabled =
             typeof discountEnabled === "boolean"
                 ? discountEnabled
-                : (typeof prev?.discount?.enabled === "boolean" ? prev.discount.enabled : true);
+                : (typeof prevFeatures?.discount?.enabled === "boolean" ? prevFeatures.discount.enabled : true);
+
         const currentPreInvoiceEnabled =
             typeof preInvoiceEnabled === "boolean"
                 ? preInvoiceEnabled
-                : (typeof prev?.preInvoice?.enabled === "boolean" ? prev.preInvoice.enabled : false);
+                : (typeof prevFeatures?.preInvoice?.enabled === "boolean" ? prevFeatures.preInvoice.enabled : false);
 
-// SIEMPRE setearlos (para que nunca queden undefined)
-
-        $set["fiscal.enabled"] = currentFiscalEnabled;
         $set["features.tax.enabled"] = currentTaxEnabled;
         $set["features.tip.enabled"] = currentTipEnabled;
         $set["features.discount.enabled"] = currentDiscountEnabled;
-
-
         $set["features.preInvoice.enabled"] = currentPreInvoiceEnabled;
+
+        // Delivery interno: permitido para todos los planes
+        if (orderSources?.delivery) {
+            if (typeof orderSources.delivery.enabled === "boolean") {
+                $set["features.orderSources.delivery.enabled"] = orderSources.delivery.enabled;
+            }
+
+            if (orderSources.delivery.defaultFee !== undefined) {
+                const fee = Number(orderSources.delivery.defaultFee);
+                if (!Number.isFinite(fee) || fee < 0) {
+                    throw new Error("delivery.defaultFee inválido");
+                }
+                $set["features.orderSources.delivery.defaultFee"] = fee;
+            }
+        }
+
+        // PedidosYa: permitido para todos los planes
+        if (orderSources?.pedidosYa) {
+            if (typeof orderSources.pedidosYa.enabled === "boolean") {
+                $set["features.orderSources.pedidosYa.enabled"] = orderSources.pedidosYa.enabled;
+            }
+
+            if (orderSources.pedidosYa.commissionRate !== undefined) {
+                const r = Number(orderSources.pedidosYa.commissionRate);
+                if (!Number.isFinite(r) || r < 0 || r > 1) {
+                    throw new Error("pedidosYa.commissionRate inválido (usa 0.26)");
+                }
+
+                $set["features.orderSources.pedidosYa.commissionRate"] = r;
+            }
+        }
+
+        // Uber Eats: permitido para todos los planes
+        if (orderSources?.uberEats) {
+            if (typeof orderSources.uberEats.enabled === "boolean") {
+                $set["features.orderSources.uberEats.enabled"] = orderSources.uberEats.enabled;
+            }
+
+            if (orderSources.uberEats.commissionRate !== undefined) {
+                const r = Number(orderSources.uberEats.commissionRate);
+                if (!Number.isFinite(r) || r < 0 || r > 1) {
+                    throw new Error("uberEats.commissionRate inválido (usa 0.22)");
+                }
+
+                $set["features.orderSources.uberEats.commissionRate"] = r;
+            }
+        }
+
+        // =========================
+        // NCF / COMPROBANTE FISCAL
+        // Solo Premium / Pro
+        // =========================
+
+        const fiscalEnabled = req.body?.fiscalEnabled;
+
+        if (!planFeatures.fiscal && fiscalEnabled === true) {
+            return res.status(403).json({
+                success: false,
+                code: "PLAN_FEATURE_NOT_ALLOWED",
+                message: "Tu plan actual no incluye NCF. Mejora a Premium o Pro para activar comprobantes fiscales.",
+            });
+        }
+
+        const currentFiscalEnabled = planFeatures.fiscal
+            ? (
+                typeof fiscalEnabled === "boolean"
+                    ? fiscalEnabled
+                    : (typeof tenantPrev?.fiscal?.enabled === "boolean" ? tenantPrev.fiscal.enabled : false)
+            )
+            : false;
+
+        $set["fiscal.enabled"] = currentFiscalEnabled;
+
+        // IMPORTANTE:
+        // Si el plan no tiene fiscal, ignoramos ncfConfig aunque el frontend lo mande.
+        // Así Emprendedor y Estándar pueden guardar Delivery, ITBIS, Propina, etc.
+        if (planFeatures.fiscal) {
+            const ncfConfig = req.body?.ncfConfig || {};
+
+            const buildUpdateForType = (type, data) => {
+                const u = {};
+                if (!data) return u;
+
+                ["start", "current", "max"].forEach((k) => {
+                    if (data[k] !== undefined && data[k] !== null && data[k] !== "") {
+                        const n = Number(data[k]);
+                        if (!Number.isFinite(n) || n < 0) {
+                            throw new Error(`${type}.${k} inválido`);
+                        }
+
+                        u[`fiscal.ncfConfig.${type}.${k}`] = Math.floor(n);
+                    }
+                });
+
+                if ("active" in data) {
+                    u[`fiscal.ncfConfig.${type}.active`] = !!data.active;
+                }
+
+                if ("expiresAt" in data) {
+                    if (!data.expiresAt) {
+                        u[`fiscal.ncfConfig.${type}.expiresAt`] = null;
+                    } else {
+                        const d = new Date(data.expiresAt);
+                        if (Number.isNaN(d.getTime())) {
+                            throw new Error(`${type}.expiresAt inválido`);
+                        }
+
+                        u[`fiscal.ncfConfig.${type}.expiresAt`] = d;
+                    }
+                }
+
+                return u;
+            };
+
+            Object.assign($set, buildUpdateForType("B01", ncfConfig.B01));
+            Object.assign($set, buildUpdateForType("B02", ncfConfig.B02));
+        }
 
         const updated = await Tenant.findOneAndUpdate(
             { tenantId },
             { $set },
             { new: true }
-        ).select("fiscal features");
+        ).select("plan fiscal features");
 
         const io = req.app.get("io");
         if (io) {
@@ -699,13 +830,55 @@ exports.updateFiscalConfig = async (req, res) => {
 
         return res.json({
             success: true,
-            data: { fiscal: updated.fiscal, features: updated.features },
+            data: {
+                plan: normalizePlan(updated.plan),
+                planFeatures: getPlanFeatures(updated.plan),
+                fiscal: updated.fiscal,
+                features: updated.features,
+            },
         });
     } catch (e) {
-        return res.status(400).json({ success: false, message: e.message });
+        return res.status(400).json({
+            success: false,
+            message: e.message,
+        });
     }
 };
+const DEFAULT_PERMISSIONS = {
+    products: {
+        create: false,
+        update: false,
+        delete: false,
+    },
+    inventory: {
+        entry: false,
+        exit: false,
+        adjust: false,
+        waste: false,
+    },
+    orders: {
+        cancel: false,
+    },
+};
 
+function normalizePermissions(permissions = {}) {
+    return {
+        products: {
+            create: Boolean(permissions?.products?.create),
+            update: Boolean(permissions?.products?.update),
+            delete: Boolean(permissions?.products?.delete),
+        },
+        inventory: {
+            entry: Boolean(permissions?.inventory?.entry),
+            exit: Boolean(permissions?.inventory?.exit),
+            adjust: Boolean(permissions?.inventory?.adjust),
+            waste: Boolean(permissions?.inventory?.waste),
+        },
+        orders: {
+            cancel: Boolean(permissions?.orders?.cancel),
+        },
+    };
+}
 
 // 🔹 Uso del plan: usuarios, platos, mesas y límites
 exports.getUsage = async (req, res) => {
@@ -718,15 +891,23 @@ exports.getUsage = async (req, res) => {
             return res.status(404).json({ success: false, message: "Tenant not found" });
         }
 
-        const tier = TIERS[tenant.plan] || TIERS.emprendedor;
+        const normalizedPlan = normalizePlan(tenant.plan);
+        const tier = TIERS[normalizedPlan] || TIERS.emprendedor;
         const limits = tier.limits || {};
+        const features = getPlanFeatures(normalizedPlan);
+        const currentMembership = req.scope?.membership || null;
+
+        const currentUser = {
+            role: currentMembership?.role || req.user?.role || null,
+            permissions: normalizePermissions(currentMembership?.permissions || DEFAULT_PERMISSIONS),
+        };
 
         // Cálculos en paralelo
         const [totalUsers, admins, cajeras, camareros, dishes, tables] = await Promise.all([
             Membership.countDocuments({ tenantId, status: "active" }),
             Membership.countDocuments({ tenantId, status: "active", role: { $in: ["Owner", "Admin"] } }),
             Membership.countDocuments({ tenantId, status: "active", role: "Cajera" }),
-            Membership.countDocuments({ tenantId, status: "active", role: "Camarero" }),
+            Membership.countDocuments({ tenantId, status: "active", role: { $in: ["Camarero", "Cocina"] } }),
             Dish.countDocuments({ tenantId }),
             Table.countDocuments({ tenantId }),
         ]);
@@ -737,7 +918,9 @@ exports.getUsage = async (req, res) => {
         return res.status(200).json({
             success: true,
             data: {
-                plan: tenant.plan,
+                plan: normalizedPlan,
+                features,
+                currentUser,
                 limits: {
                     maxUsers: limits.maxUsers ?? null,
                     maxAdmins: limits.maxAdmins ?? null,

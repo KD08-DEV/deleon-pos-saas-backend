@@ -22,7 +22,31 @@ const dishSchema = new mongoose.Schema(
             default: null,
             index: true,
         },
+
+        // Compatibilidad con lógica vieja.
+        // Se mantiene para no romper datos actuales.
         isInventoryItem: { type: Boolean, default: false, index: true },
+
+        // Nueva clasificación clara de inventario:
+        // none       = plato normal, no descuenta inventario
+        // direct     = producto vendible con stock directo
+        // ingredient = ingrediente/insumo para recetas
+        // recipe     = plato que descuenta ingredientes
+        inventoryType: {
+            type: String,
+            enum: ["none", "direct", "ingredient", "recipe"],
+            default: "none",
+            index: true,
+        },
+
+        // Solo aplica para productos que sí manejan stock:
+        // direct e ingredient.
+        // Esto permite que una venta/salida deje el stock en negativo.
+        allowNegativeStock: {
+            type: Boolean,
+            default: true,
+            index: true,
+        },
 
         // unidad del artículo
         unit: { type: String, enum: ["unidad", "lb", "kg"], default: "unidad" },

@@ -109,7 +109,7 @@ const tenantSchema = new mongoose.Schema(
 
         plan: {
             type: String,
-            enum: ["emprendedor", "premium", "estandar"],
+            enum: ["emprendedor", "estandar", "premium", "pro"],
             default: "emprendedor",
         },
 

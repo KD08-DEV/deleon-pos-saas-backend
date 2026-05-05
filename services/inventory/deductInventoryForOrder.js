@@ -22,11 +22,56 @@ const DBG_INV = process.env.DEBUG_INV === "1";
 function dbg(...args) {
     if (DBG_INV) console.log("[INV_DEDUCT]", ...args);
 }
-function shouldTrackStock(dish) {
-    if (!dish) return false;
+const STOCK_INVENTORY_TYPES = ["direct", "ingredient"];
 
-    // Solo descontar inventario directo si el producto está marcado explícitamente
-    return dish.isInventoryItem === true;
+function normalizeInventoryType(dish = {}) {
+    const t = String(dish?.inventoryType || "").trim();
+
+    if (["none", "direct", "ingredient", "recipe"].includes(t)) {
+        return t;
+    }
+
+    // Compatibilidad con datos viejos
+    if (Array.isArray(dish?.recipe) && dish.recipe.length > 0) {
+        return "recipe";
+    }
+
+    if (dish?.isInventoryItem === true) {
+        return "ingredient";
+    }
+
+    if (dish?.inventoryCategoryId) {
+        return "direct";
+    }
+
+    return "none";
+}
+
+function hasRecipe(dish = {}) {
+    return Array.isArray(dish?.recipe) && dish.recipe.length > 0;
+}
+
+function shouldUseRecipe(dish = {}) {
+    return normalizeInventoryType(dish) === "recipe" || hasRecipe(dish);
+}
+
+function shouldTrackDirectStock(dish = {}) {
+    return normalizeInventoryType(dish) === "direct";
+}
+
+function isStockManagedItem(dish = {}) {
+    return STOCK_INVENTORY_TYPES.includes(normalizeInventoryType(dish));
+}
+
+function stockManagedOrLegacyFilter() {
+    return [
+        { inventoryType: { $in: STOCK_INVENTORY_TYPES } },
+        { inventoryType: { $exists: false }, isInventoryItem: true },
+        {
+            inventoryType: { $exists: false },
+            inventoryCategoryId: { $ne: null, $exists: true },
+        },
+    ];
 }
 // Detecta si la línea es por peso (lb) o por quantity
 function getSoldAmount(orderItem) {
@@ -55,7 +100,7 @@ async function applyDeduction({
         tenantId,
         clientId,
         isArchived: { $ne: true },
-        isInventoryItem: true,
+        $or: stockManagedOrLegacyFilter(),
     }).session(session);
 
     dbg("applyDeduction()", {
@@ -77,10 +122,15 @@ async function applyDeduction({
     const beforeStock = num(dish.stockCurrent, 0);
     const afterStock = beforeStock - qty;
 
-    if (!allowNegativeStock && afterStock < 0) {
+    const canGoNegative =
+        isStockManagedItem(dish) &&
+        dish.allowNegativeStock !== false;
+
+    if (!canGoNegative && afterStock < 0) {
         const itemName = dish?.name || String(itemId);
         const have = Number(beforeStock.toFixed(6));
         const need = Number(qty.toFixed(6));
+
         throw createHttpError(
             409,
             `INSUFFICIENT_STOCK: ${itemName} (have ${have}, need ${need})`
@@ -102,6 +152,7 @@ async function applyDeduction({
                 itemId,
                 type: "sale",
                 qty, // positiva
+                qtySigned: -Math.abs(Number(qty)),
                 unitCost,
                 costAmount,
                 beforeStock,
@@ -123,9 +174,10 @@ async function applyDeduction({
  * - si order.inventoryDeducted === true => no hace nada
  */
 async function deductInventoryForOrder(orderId, opts = {}) {
-    const allowNegativeStock = Boolean(opts.allowNegativeStock);
+// Por defecto permitimos negativo SOLO en productos que manejan stock.
+// El control final se hace por item con allowNegativeStock.
+    const allowNegativeStock = opts.allowNegativeStock !== false;
     const userId = opts.userId || null;
-
     if (!orderId || !mongoose.Types.ObjectId.isValid(String(orderId))) {
         throw createHttpError(400, "INVALID_ORDER_ID");
     }
@@ -157,8 +209,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                 if (!soldDishId || !mongoose.Types.ObjectId.isValid(String(soldDishId))) continue;
 
                 const soldDish = await Dish.findOne({ _id: soldDishId, tenantId, clientId })
-                    .select("_id recipe isInventoryItem inventoryCategoryId stockCurrent stockMin name")
-                    .lean()
+                    .select("_id recipe inventoryType allowNegativeStock isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")                    .lean()
 
                     .session(session);
 
@@ -168,8 +219,11 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                 if (soldAmount <= 0) continue;
 
                 // Si tiene receta => descuenta ingredientes
-                if (Array.isArray(soldDish.recipe) && soldDish.recipe.length > 0) {
-                    for (const ing of soldDish.recipe) {
+                // Si es plato con receta => descuenta ingredientes.
+// Si es producto direct => descuenta el mismo producto.
+// Si es none => no descuenta nada.
+                if (shouldUseRecipe(soldDish)) {
+                    for (const ing of soldDish.recipe || []) {
                         const ingId = ing?.ingredientDishId || ing?.dishId || ing?.inventoryItemId;
                         if (!ingId || !mongoose.Types.ObjectId.isValid(String(ingId))) continue;
 
@@ -193,7 +247,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                         cogsTotal += out.costAmount;
                         movements.push(out.movement);
                     }
-                } else if (shouldTrackStock(soldDish)) {                    // Venta directa de inventario (sin receta)
+                } else if (shouldTrackDirectStock(soldDish)) {
                     const qtyToDeduct = Number(soldAmount.toFixed(6));
 
                     const out = await applyDeduction({
@@ -209,14 +263,15 @@ async function deductInventoryForOrder(orderId, opts = {}) {
 
                     cogsTotal += out.costAmount;
                     movements.push(out.movement);
-                }else {
-                dbg("route=non_inventory_skip", {
-                    soldDishId: String(soldDish._id),
-                    name: soldDish?.name,
-                    isInventoryItem: soldDish?.isInventoryItem,
-                    inventoryCategoryId: soldDish?.inventoryCategoryId ? String(soldDish.inventoryCategoryId) : null,
-                });
-            }
+                } else {
+                    dbg("route=non_inventory_skip", {
+                        soldDishId: String(soldDish._id),
+                        name: soldDish?.name,
+                        inventoryType: soldDish?.inventoryType,
+                        isInventoryItem: soldDish?.isInventoryItem,
+                        inventoryCategoryId: soldDish?.inventoryCategoryId ? String(soldDish.inventoryCategoryId) : null,
+                    });
+                }
             }
 
             const createdCount = movements.filter(Boolean).length;
@@ -270,8 +325,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
             if (!soldDishId || !mongoose.Types.ObjectId.isValid(String(soldDishId))) continue;
 
             const soldDish = await Dish.findOne({ _id: soldDishId, tenantId, clientId })
-                .select("_id recipe isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")
-                .lean();
+                .select("_id recipe inventoryType allowNegativeStock isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")                .lean();
 
             if (!soldDish) continue;
 
@@ -284,17 +338,23 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                     tenantId,
                     clientId,
                     isArchived: { $ne: true },
-                    isInventoryItem: true,
+                    $or: stockManagedOrLegacyFilter(),
                 });
 
                 if (!dish) return { skipped: true };
 
                 const beforeStock = num(dish.stockCurrent, 0);
                 const afterStock = beforeStock - qtyToDeduct;
-                if (!allowNegativeStock && afterStock < 0) throw createHttpError(
-                    409,
-                    `INSUFFICIENT_STOCK: ${dish.name} (have ${beforeStock}, need ${qtyToDeduct})`
-                );
+                const canGoNegative =
+                    isStockManagedItem(dish) &&
+                    dish.allowNegativeStock !== false;
+
+                if (!canGoNegative && afterStock < 0) {
+                    throw createHttpError(
+                        409,
+                        `INSUFFICIENT_STOCK: ${dish.name} (have ${beforeStock}, need ${qtyToDeduct})`
+                    );
+                }
 
 
                 dish.stockCurrent = afterStock;
@@ -310,6 +370,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                     itemId: ingId,
                     type: "sale",
                     qty: qtyToDeduct,
+                    qtySigned: -Math.abs(Number(qtyToDeduct)),
                     unitCost,
                     costAmount,
                     beforeStock,
@@ -323,7 +384,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                 movementsCreated += 1;
             };
 
-            if (Array.isArray(soldDish.recipe) && soldDish.recipe.length > 0) {
+            if (shouldUseRecipe(soldDish)) {
                 for (const ing of soldDish.recipe) {
                     const ingId = ing?.ingredientDishId || ing?.dishId || ing?.inventoryItemId;
                     if (!ingId || !mongoose.Types.ObjectId.isValid(String(ingId))) continue;
@@ -336,7 +397,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
 
                     await deductOne(ingId, qtyToDeduct);
                 }
-            } else if (shouldTrackStock(soldDish)) {
+            } else if (shouldTrackDirectStock(soldDish)) {
                 await deductOne(soldDish._id, Number(soldAmount.toFixed(6)));
             }
         }
@@ -402,7 +463,7 @@ async function restoreInventoryForOrder(orderId, opts = {}) {
                     tenantId,
                     clientId,
                     isArchived: { $ne: true },
-                    isInventoryItem: true,
+                    $or: stockManagedOrLegacyFilter(),
                 }).session(session);
 
                 if (!dish) return;
@@ -449,8 +510,7 @@ async function restoreInventoryForOrder(orderId, opts = {}) {
                 if (!soldDishId || !mongoose.Types.ObjectId.isValid(String(soldDishId))) continue;
 
                 const soldDish = await Dish.findOne({ _id: soldDishId, tenantId, clientId })
-                    .select("_id recipe isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")
-                    .lean()
+                    .select("_id recipe inventoryType allowNegativeStock isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")                    .lean()
                     .session(session);
 
 
@@ -459,7 +519,7 @@ async function restoreInventoryForOrder(orderId, opts = {}) {
                 const soldAmount = getSoldAmount(line);
                 if (soldAmount <= 0) continue;
 
-                if (Array.isArray(soldDish.recipe) && soldDish.recipe.length > 0) {
+                if (shouldUseRecipe(soldDish)) {
                     for (const ing of soldDish.recipe) {
                         const ingId = ing?.ingredientDishId || ing?.dishId || ing?.inventoryItemId;
                         if (!ingId || !mongoose.Types.ObjectId.isValid(String(ingId))) continue;
@@ -472,7 +532,7 @@ async function restoreInventoryForOrder(orderId, opts = {}) {
 
                         await addBackOne(ingId, qtyToAdd);
                     }
-                } else if (shouldTrackStock(soldDish)) {
+                } else if (shouldTrackDirectStock(soldDish)) {
                     await addBackOne(soldDish._id, Number(soldAmount.toFixed(6)));
                 }
             }

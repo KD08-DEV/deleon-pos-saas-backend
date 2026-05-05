@@ -18,6 +18,41 @@ function getPlanLimits(plan) {
     };
 }
 
+const DEFAULT_PERMISSIONS = {
+    products: {
+        create: false,
+        update: false,
+        delete: false,
+    },
+    inventory: {
+        entry: false,
+        exit: false,
+        adjust: false,
+        waste: false,
+    },
+    orders: {
+        cancel: false,
+    },
+};
+
+function normalizePermissions(permissions = {}) {
+    return {
+        products: {
+            create: Boolean(permissions?.products?.create),
+            update: Boolean(permissions?.products?.update),
+            delete: Boolean(permissions?.products?.delete),
+        },
+        inventory: {
+            entry: Boolean(permissions?.inventory?.entry),
+            exit: Boolean(permissions?.inventory?.exit),
+            adjust: Boolean(permissions?.inventory?.adjust),
+            waste: Boolean(permissions?.inventory?.waste),
+        },
+        orders: {
+            cancel: Boolean(permissions?.orders?.cancel),
+        },
+    };
+}
 const register = async (req, res, next) => {
     try {
         const { name, phone, email, password, role, tenantName, plan } = req.body;
@@ -36,7 +71,7 @@ const register = async (req, res, next) => {
             const tenantPlan = (plan || "emprendedor").toLowerCase();
 
             // 1) Validar plan
-            const allowedPlans = ["emprendedor", "premium", "estandar"];
+            const allowedPlans = ["emprendedor", "estandar", "premium", "pro"];
             if (!allowedPlans.includes(tenantPlan)) {
                 return next(createHttpError(400, "Invalid plan for tenant!"));
             }
@@ -263,6 +298,7 @@ const login = async (req, res, next) => {
             });
         }
 
+
         // 🔐 LOGIN USUARIO NORMAL
         const isUserPresent = await User.findOne({ email });
         if (!isUserPresent) {
@@ -271,8 +307,18 @@ const login = async (req, res, next) => {
 
         const isMatch = await bcrypt.compare(password, isUserPresent.password);
         if (!isMatch) {
+
             return next(createHttpError(401, "Invalid Credentials"));
         }
+        const membership = await Membership.findOne({
+            user: isUserPresent._id,
+            tenantId: isUserPresent.tenantId,
+            status: "active",
+        }).lean();
+
+        const normalizedPermissions = normalizePermissions(
+            membership?.permissions || DEFAULT_PERMISSIONS
+        );
 
 // ✅ 1) Crear nueva sesión (invalidará la anterior)
         const { deviceId } = req.body; // opcional
@@ -316,8 +362,17 @@ const login = async (req, res, next) => {
                 _id: isUserPresent._id,
                 name: isUserPresent.name,
                 email: isUserPresent.email,
+
+                // IMPORTANTE:
+                // Mantén el role real del UserModel para no romper ProtectedRoutes/App/Admin.
                 role: isUserPresent.role,
+
+                // Membership separado para permisos internos.
+                membershipRole: membership?.role || isUserPresent.role,
+
                 tenantId: isUserPresent.tenantId,
+                clientIds: membership?.clientIds || ["default"],
+                permissions: normalizedPermissions,
             },
         });
     } catch (error) {
@@ -336,12 +391,40 @@ const getUserData = async (req, res, next) => {
                     email: process.env.SUPERADMIN_EMAIL,
                     role: "SuperAdmin",
                     tenantId: null,
+                    permissions: DEFAULT_PERMISSIONS,
                 },
             });
         }
 
-        const user = await User.findById(req.user._id);
-        res.status(200).json({ success: true, data: user });
+        const user = await User.findById(req.user._id).lean();
+
+        if (!user) {
+            return next(createHttpError(404, "USER_NOT_FOUND"));
+        }
+
+        const membership = await Membership.findOne({
+            user: user._id,
+            tenantId: user.tenantId,
+            status: "active",
+        }).lean();
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                ...user,
+
+                // Mantener rol real para frontend/protected routes.
+                role: user.role,
+
+                // Membership separado.
+                membershipRole: membership?.role || user.role,
+
+                clientIds: membership?.clientIds || ["default"],
+                permissions: normalizePermissions(
+                    membership?.permissions || DEFAULT_PERMISSIONS
+                ),
+            },
+        });
     } catch (error) {
         next(error);
     }

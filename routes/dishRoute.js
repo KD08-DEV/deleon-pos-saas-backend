@@ -3,6 +3,8 @@ const verifyToken = require("../middlewares/tokenVerification");
 const requireRole = require("../middlewares/requireRole");
 const { tenantMiddleware } = require("../middlewares/tenantMiddleware");
 const uploadMemory = require("../middlewares/uploadMemory");
+const { requireFeature } = require("../middlewares/requirePlan");
+const requirePermission = require("../middlewares/requirePermission");
 
 const {
     addDish,
@@ -15,28 +17,27 @@ const {
     listIngredients,
 } = require("../controllers/dishController");
 
-
 const router = express.Router();
 
 router.use(verifyToken);
 router.use(tenantMiddleware);
 
-// CREATE
+// CREATE - Owner/Admin o permiso individual products.create
 router.post(
     "/",
-    requireRole("Owner", "Admin"),
+    requirePermission("products.create"),
     uploadMemory.single("image"),
     addDish
 );
 
-// READ
+// READ - menú básico permitido para operación
 router.get(
     "/",
-    requireRole("Owner", "Admin", "Cajera", "Camarero"),
+    requireRole("Owner", "Admin", "Cajera", "Camarero", "Cocina"),
     getDishes
 );
 
-// UPDATE
+// UPDATE - solo Owner/Admin por ahora
 router.put(
     "/:id",
     requireRole("Owner", "Admin"),
@@ -44,36 +45,40 @@ router.put(
     updateDish
 );
 
-// DELETE
+// DELETE - solo Owner/Admin
 router.delete(
     "/:id",
     requireRole("Owner", "Admin"),
     deleteDish
 );
 
-// RECIPE (NEW)
+// RECIPE - Premium / Pro
 router.get(
     "/:id/recipe",
-    requireRole("Owner", "Admin", "Cajera", "Camarero"),
+    requireFeature("recipes"),
+    requireRole("Owner", "Admin", "Cajera", "Camarero", "Cocina"),
     getDishRecipe
 );
 
 router.put(
     "/:id/recipe",
+    requireFeature("recipes"),
     requireRole("Owner", "Admin"),
     updateDishRecipe
 );
 
-// INGREDIENTS (NEW)
+// INGREDIENTS / INVENTORY - por ahora solo Owner/Admin
 router.post(
     "/ingredients",
+    requireFeature("inventory"),
     requireRole("Owner", "Admin"),
     createIngredient
 );
 
 router.get(
     "/ingredients",
-    requireRole("Owner", "Admin", "Cajera", "Camarero"),
+    requireFeature("inventory"),
+    requireRole("Owner", "Admin", "Cajera", "Camarero", "Cocina"),
     listIngredients
 );
 

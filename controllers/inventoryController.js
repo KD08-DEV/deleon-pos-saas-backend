@@ -7,6 +7,19 @@ const Order = require("../models/orderModel");
 const Dish = require("../models/dish");
 const InventoryMovement = require("../models/inventoryMovementModel");
 const MermaBatch = require("../models/mermaBatchModel");
+const { hasPermission } = require("../middlewares/requirePermission");
+function getCurrentRole(req) {
+    return (
+        req.authzMembership?.role ||
+        req.scope?.membership?.role ||
+        req.user?.role ||
+        ""
+    );
+}
+
+function isAdminLike(req) {
+    return ["SuperAdmin", "Owner", "Admin"].includes(getCurrentRole(req));
+}
 
 async function upsertWasteMovement({ batch, tenantId, clientId, userId }) {
     const qty = Number(batch.wasteQty || 0);
@@ -101,6 +114,48 @@ function pickCostUnit(dish, fallback) {
     if (Number.isFinite(Number(fallback)) && Number(fallback) > 0) return Number(fallback);
     return 0;
 }
+const STOCK_INVENTORY_TYPES = ["direct", "ingredient"];
+
+function normalizeInventoryType(dish = {}) {
+    const t = String(dish?.inventoryType || "").trim();
+
+    if (["none", "direct", "ingredient", "recipe"].includes(t)) {
+        return t;
+    }
+
+    // Fallback para datos viejos
+    if (Array.isArray(dish?.recipe) && dish.recipe.length > 0) {
+        return "recipe";
+    }
+
+    if (dish?.isInventoryItem === true) {
+        return "ingredient";
+    }
+
+    if (dish?.inventoryCategoryId) {
+        return "direct";
+    }
+
+    return "none";
+}
+
+function isStockManagedItem(dish = {}) {
+    return STOCK_INVENTORY_TYPES.includes(normalizeInventoryType(dish));
+}
+
+function stockManagedOrLegacyFilter() {
+    return [
+        // Nueva lógica
+        { inventoryType: { $in: STOCK_INVENTORY_TYPES } },
+
+        // Compatibilidad con datos viejos que todavía no tengan inventoryType
+        { inventoryType: { $exists: false }, isInventoryItem: true },
+        {
+            inventoryType: { $exists: false },
+            inventoryCategoryId: { $ne: null, $exists: true },
+        },
+    ];
+}
 
 /**
  * Aplica un delta a stockCurrent + crea movimiento (ATÓMICO si hay transacciones).
@@ -127,10 +182,7 @@ async function applyStockMovement({
         tenantId,
         clientId,
         isArchived: { $ne: true },
-        $or: [
-            { isInventoryItem: true },
-            { inventoryCategoryId: { $ne: null } },
-        ],
+        $or: stockManagedOrLegacyFilter(),
     }).session(session);
 
 
@@ -139,12 +191,15 @@ async function applyStockMovement({
     const beforeStock = num(dish.stockCurrent, 0);
     const afterStock = beforeStock + Number(delta);
 
-    if (!allowNegativeStock && afterStock < 0) {
+    const canGoNegative =
+        isStockManagedItem(dish) &&
+        dish.allowNegativeStock !== false;
+
+    if (!canGoNegative && afterStock < 0) {
         throw createHttpError(
             409,
-            `INSUFFICIENT_STOCK: ${dish.name} (have ${beforeStock}, need ${qtyToDeduct})`
+            `INSUFFICIENT_STOCK: ${dish.name} (have ${beforeStock}, need ${qtyMagnitude})`
         );
-
     }
 
     // costos: purchase actualiza lastCost y avgCost (promedio ponderado)
@@ -183,7 +238,7 @@ async function applyStockMovement({
                 itemId,
                 type,
                 qty: Number(qtyMagnitude),
-                qtySigned: ["adjust", "transfer", "conversion"].includes(type) ? Number(delta) : null,
+                qtySigned: Number(delta),
                 unitCost: ["purchase", "sale", "waste"].includes(type) ? effectiveUnit : movementUnitCost,
                 costAmount,
                 note: String(note || "").trim(),
@@ -242,10 +297,7 @@ exports.listItems = async (req, res, next) => {
         const filter = {
             tenantId,
             clientId,
-            $or: [
-                { isInventoryItem: true },
-                { inventoryCategoryId: { $ne: null, $exists: true } },// <- también incluye dishes del menú inventariables
-            ],
+            $or: stockManagedOrLegacyFilter(),
         };
 
         if (!includeArchived) filter.isArchived = false;
@@ -258,7 +310,7 @@ exports.listItems = async (req, res, next) => {
         }
 
         const items = await Dish.find(filter)
-            .select("_id name category isInventoryItem unit stockCurrent stockMin lastCost avgCost inventoryCategoryId supplierId updatedAt isArchived")
+            .select("_id name category inventoryType allowNegativeStock isInventoryItem unit stockCurrent stockMin lastCost avgCost inventoryCategoryId supplierId updatedAt isArchived")
             .populate({ path: "supplierId", select: "name companyName" })
             .sort({ updatedAt: -1 })
             .lean();
@@ -275,7 +327,7 @@ exports.createItem = async (req, res, next) => {
         const { tenantId, clientId } = getScope(req);
 
         const {
-            existingDishId, // <<<<<< NUEVO
+            existingDishId,
             name,
             unit,
             stockMin,
@@ -283,6 +335,8 @@ exports.createItem = async (req, res, next) => {
             avgCost,
             inventoryCategoryId,
             supplierId,
+            inventoryType,
+            allowNegativeStock,
         } = req.body || {};
 
         // 1) Habilitar plato existente como inventario (sin duplicar)
@@ -318,52 +372,81 @@ exports.createItem = async (req, res, next) => {
                 );
             }
 
-            // Para platos vendibles NO usamos isInventoryItem=true (eso lo escondería del menú).
-            // “Habilitar inventario” se logra con inventoryCategoryId != null.
-// Para platos vendibles NO usamos isInventoryItem=true (eso lo escondería del menú).
-// “Habilitar inventario” se logra con inventoryCategoryId != null.
-            dish.isInventoryItem = dish.isInventoryItem === true ? true : false;
+            const desiredType = String(inventoryType || "direct").trim();
 
-// NO tocar dish.category ni dish.price (para que siga siendo vendible en el POS)
+            if (!["direct", "recipe"].includes(desiredType)) {
+                return next(createHttpError(400, "INVALID_INVENTORY_TYPE_FOR_EXISTING_DISH"));
+            }
+
+// El plato existente puede convertirse en:
+// direct = producto vendible con stock directo
+// recipe = plato vendible que descuenta ingredientes
+            dish.inventoryType = desiredType;
+            dish.isInventoryItem = false;
+
+// NO tocar dish.category ni dish.price para que siga apareciendo en el POS.
             if (unit !== undefined) dish.unit = String(unit);
 
-// ✅ Si vienes de un plato del menú, puede tener stockCurrent/stockMin en null.
-// Al habilitar inventario propio, debe empezar como número (0 si no lo definiste).
-            if (!Number.isFinite(Number(dish.stockCurrent))) {
-                dish.stockCurrent = 0;
-            }
+            if (desiredType === "direct") {
+                dish.allowNegativeStock =
+                    allowNegativeStock === undefined ? true : Boolean(allowNegativeStock);
 
-// Si viene stockMin explícito lo respetamos, si no y está null, lo ponemos en 0
-            if (stockMin !== undefined) {
-                dish.stockMin = Number(stockMin || 0);
-            } else if (!Number.isFinite(Number(dish.stockMin))) {
-                dish.stockMin = 0;
-            }
+                if (!Number.isFinite(Number(dish.stockCurrent))) {
+                    dish.stockCurrent = 0;
+                }
 
-            if (inventoryCategoryId !== undefined) {
-                if (!inventoryCategoryId) {
-                    dish.inventoryCategoryId = null;
-                } else {
-                    if (!isObjId(inventoryCategoryId)) {
-                        return next(createHttpError(400, "inventoryCategoryId inválido"));
+                if (stockMin !== undefined) {
+                    dish.stockMin = Number(stockMin || 0);
+                } else if (!Number.isFinite(Number(dish.stockMin))) {
+                    dish.stockMin = 0;
+                }
+
+                if (inventoryCategoryId !== undefined) {
+                    if (!inventoryCategoryId) {
+                        dish.inventoryCategoryId = null;
+                    } else {
+                        if (!isObjId(inventoryCategoryId)) {
+                            return next(createHttpError(400, "inventoryCategoryId inválido"));
+                        }
+
+                        dish.inventoryCategoryId = inventoryCategoryId;
                     }
-                    dish.inventoryCategoryId = inventoryCategoryId;
+                }
+
+                if (supplierId !== undefined) {
+                    if (!supplierId) {
+                        dish.supplierId = null;
+                    } else {
+                        if (!isObjId(supplierId)) {
+                            return next(createHttpError(400, "supplierId inválido"));
+                        }
+
+                        dish.supplierId = supplierId;
+                    }
+                }
+
+                if (lastCost !== undefined) {
+                    dish.lastCost =
+                        lastCost === null || lastCost === "" ? null : Number(lastCost);
+                }
+
+                if (avgCost !== undefined) {
+                    dish.avgCost =
+                        avgCost === null || avgCost === "" ? null : Number(avgCost);
                 }
             }
 
-            if (supplierId !== undefined) {
-                if (!supplierId) {
-                    dish.supplierId = null;
-                } else {
-                    if (!isObjId(supplierId)) {
-                        return next(createHttpError(400, "supplierId inválido"));
-                    }
-                    dish.supplierId = supplierId;
-                }
+            if (desiredType === "recipe") {
+                // El plato con receta NO maneja stock directo.
+                // Quienes reciben entrada/salida y pueden quedar negativos son los ingredientes.
+                dish.allowNegativeStock = false;
+                dish.stockCurrent = null;
+                dish.stockMin = null;
+                dish.inventoryCategoryId = null;
+                dish.supplierId = null;
+                dish.lastCost = null;
+                dish.avgCost = null;
             }
-
-            if (lastCost !== undefined) dish.lastCost = lastCost === null ? null : Number(lastCost);
-            if (avgCost !== undefined) dish.avgCost = avgCost === null ? null : Number(avgCost);
 
             await dish.save();
 
@@ -377,7 +460,10 @@ exports.createItem = async (req, res, next) => {
             name,
             price: 0,
             category: "Inventario",
+            inventoryType: "ingredient",
             isInventoryItem: true,
+            allowNegativeStock:
+                allowNegativeStock === undefined ? true : Boolean(allowNegativeStock),
             unit,
             stockCurrent: 0,
             stockMin: Number(stockMin || 0),
@@ -428,16 +514,27 @@ exports.updateItem = async (req, res, next) => {
         if (req.body.supplierId !== undefined) {
             patch.supplierId = req.body.supplierId && isObjId(req.body.supplierId) ? req.body.supplierId : null;
         }
+        if (req.body.allowNegativeStock !== undefined) {
+            patch.allowNegativeStock = Boolean(req.body.allowNegativeStock);
+        }
+
+        if (req.body.inventoryType !== undefined) {
+            const allowedTypes = ["direct", "ingredient"];
+
+            if (!allowedTypes.includes(String(req.body.inventoryType))) {
+                return next(createHttpError(400, "INVALID_INVENTORY_TYPE_FOR_STOCK_ITEM"));
+            }
+
+            patch.inventoryType = String(req.body.inventoryType);
+            patch.isInventoryItem = String(req.body.inventoryType) === "ingredient";
+        }
 
         const updated = await Dish.findOneAndUpdate(
             {
                 _id: id,
                 tenantId,
                 clientId,
-                $or: [
-                    { isInventoryItem: true },
-                    { inventoryCategoryId: { $ne: null, $exists: true } },
-                ],
+                $or: stockManagedOrLegacyFilter(),
             },
 
         { $set: patch },
@@ -465,10 +562,7 @@ exports.archiveItem = async (req, res, next) => {
                 _id: id,
                 tenantId,
                 clientId,
-                $or: [
-                    { isInventoryItem: true },
-                    { inventoryCategoryId: { $ne: null, $exists: true } },
-                ],
+                $or: stockManagedOrLegacyFilter(),
             },
         { $set: { isArchived: true } },
             { new: true }
@@ -489,10 +583,7 @@ exports.lowStock = async (req, res, next) => {
         const items = await Dish.find({
             tenantId,
             clientId,
-            $or: [
-                { isInventoryItem: true },
-                { inventoryCategoryId: { $ne: null, $exists: true } },
-            ],
+            $or: stockManagedOrLegacyFilter(),
             isArchived: false,
             $expr: { $lte: ["$stockCurrent", "$stockMin"] },
         })
@@ -527,6 +618,32 @@ exports.createMovement = async (req, res, next) => {
         const t = String(type || "").trim();
         if (!["purchase", "sale", "waste", "adjust", "transfer", "conversion"].includes(t)) {
             return next(createHttpError(400, "INVALID_TYPE"));
+        }
+        if (!isAdminLike(req)) {
+            const canEntry = await hasPermission(req, "inventory.entry");
+            const canExit = await hasPermission(req, "inventory.exit");
+            const canAdjust = await hasPermission(req, "inventory.adjust");
+            const canWaste = await hasPermission(req, "inventory.waste");
+
+            if (t === "purchase" && !canEntry) {
+                return next(createHttpError(403, "No tienes permiso para registrar entradas de inventario."));
+            }
+
+            if (t === "sale" && !canExit) {
+                return next(createHttpError(403, "No tienes permiso para registrar salidas de inventario."));
+            }
+
+            if (t === "adjust" && !canAdjust) {
+                return next(createHttpError(403, "No tienes permiso para realizar ajustes de inventario."));
+            }
+
+            if (t === "waste" && !canWaste) {
+                return next(createHttpError(403, "No tienes permiso para registrar merma."));
+            }
+
+            if (["transfer", "conversion"].includes(t)) {
+                return next(createHttpError(403, "No tienes permiso para realizar este movimiento de inventario."));
+            }
         }
         if (!itemId || !isObjId(itemId)) return next(createHttpError(400, "INVALID_ITEM_ID"));
 
@@ -576,18 +693,26 @@ exports.createMovement = async (req, res, next) => {
 
 
 // GET /api/inventory/movements?itemId=&type=&from=&to=&limit=&skip=
+// GET /api/inventory/movements?itemId=&type=&from=&to=&limit=&skip=
 exports.listMovements = async (req, res, next) => {
     try {
         const { tenantId, clientId } = getScope(req);
         if (!tenantId) return next(createHttpError(401, "TENANT_NOT_FOUND"));
 
         const { itemId, type, from, to } = req.query;
-        const limit = Math.min(Number(req.query.limit || 100), 500);
+
+        const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 500);
         const skip = Math.max(Number(req.query.skip || 0), 0);
 
         const filter = { tenantId, clientId };
-        if (itemId && isObjId(itemId)) filter.itemId = itemId;
-        if (type) filter.type = String(type);
+
+        if (itemId && isObjId(itemId)) {
+            filter.itemId = itemId;
+        }
+
+        if (type) {
+            filter.type = String(type);
+        }
 
         if (from || to) {
             filter.createdAt = {};
@@ -595,30 +720,45 @@ exports.listMovements = async (req, res, next) => {
             if (to) filter.createdAt.$lt = new Date(to);
         }
 
-        const movements = await InventoryMovement.find(filter)
-            .populate({ path: "itemId", select: "name unit" })
-            .populate({ path: "fromItemId", select: "name unit" })
-            .populate({ path: "toItemId", select: "name unit" })
-            .sort({ createdAt: -1 })
-            .limit(limit)
-            .skip(skip)
-            .lean();
+        const [total, movements] = await Promise.all([
+            InventoryMovement.countDocuments(filter),
+            InventoryMovement.find(filter)
+                .populate({ path: "itemId", select: "name unit" })
+                .populate({ path: "fromItemId", select: "name unit" })
+                .populate({ path: "toItemId", select: "name unit" })
+                .populate({ path: "createdBy", select: "name email role" })
+                .sort({ createdAt: -1 })
+                .limit(limit)
+                .skip(skip)
+                .lean(),
+        ]);
 
-        return res.json({ movements, limit, skip });
+        return res.json({
+            success: true,
+            movements,
+            limit,
+            skip,
+            total,
+        });
     } catch (e) {
         next(e);
     }
 };
 // GET /api/inventory/consumption?from=&to=
 
+// GET /api/inventory/consumption?from=&to=&inventoryCategoryId=&page=&limit=
 exports.consumption = async (req, res, next) => {
     try {
         const tenantId = getTenantId(req);
         const clientId = req.scope?.clientId || req.clientId || "default";
+
         if (!tenantId) return next(createHttpError(401, "TENANT_NOT_FOUND"));
 
-
         const { from, to, inventoryCategoryId } = req.query;
+
+        const page = Math.max(Number(req.query.page || 1), 1);
+        const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 100);
+        const skip = (page - 1) * limit;
 
         const match = {
             tenantId,
@@ -629,10 +769,10 @@ exports.consumption = async (req, res, next) => {
         if (from || to) {
             match.createdAt = {};
             if (from) match.createdAt.$gte = new Date(from);
-            if (to) match.createdAt.$lt = new Date(to); // fin exclusivo recomendado
+            if (to) match.createdAt.$lt = new Date(to);
         }
 
-        const dishCollection = Dish.collection.name; // normalmente "dishes"
+        const dishCollection = Dish.collection.name;
 
         const pipeline = [
             { $match: match },
@@ -657,27 +797,57 @@ exports.consumption = async (req, res, next) => {
             { $unwind: { path: "$dish", preserveNullAndEmptyArrays: true } },
         ];
 
-        // filtro opcional por categoria inventario
         if (inventoryCategoryId && mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
             pipeline.push({
-                $match: { "dish.inventoryCategoryId": new mongoose.Types.ObjectId(inventoryCategoryId) },
+                $match: {
+                    "dish.inventoryCategoryId": new mongoose.Types.ObjectId(inventoryCategoryId),
+                },
             });
         }
 
-        pipeline.push({
-            $project: {
-                dishId: "$_id",
-                name: { $ifNull: ["$dish.name", "(Plato eliminado)"] },
-                inventoryCategoryId: "$dish.inventoryCategoryId",
-                qtySold: 1,
-                revenue: 1,
-                lines: 1,
+        pipeline.push(
+            {
+                $project: {
+                    dishId: "$_id",
+                    name: { $ifNull: ["$dish.name", "(Plato eliminado)"] },
+                    inventoryCategoryId: "$dish.inventoryCategoryId",
+                    qtySold: 1,
+                    revenue: 1,
+                    lines: 1,
+                },
+            },
+            { $sort: { qtySold: -1, name: 1 } },
+            {
+                $facet: {
+                    rows: [
+                        { $skip: skip },
+                        { $limit: limit },
+                    ],
+                    totalRows: [
+                        { $count: "count" },
+                    ],
+                },
+            }
+        );
+
+        const result = await Order.aggregate(pipeline);
+
+        const rows = result?.[0]?.rows || [];
+        const total = result?.[0]?.totalRows?.[0]?.count || 0;
+        const totalPages = Math.max(Math.ceil(total / limit), 1);
+
+        return res.json({
+            success: true,
+            rows,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages,
+                hasPrev: page > 1,
+                hasNext: page < totalPages,
             },
         });
-
-        const rows = await Order.aggregate(pipeline);
-
-        return res.json({ rows });
     } catch (e) {
         next(e);
     }
@@ -1048,10 +1218,7 @@ exports.unarchiveItem = async (req, res, next) => {
                 _id: id,
                 tenantId,
                 clientId,
-                $or: [
-                    { isInventoryItem: true },
-                    { inventoryCategoryId: { $ne: null, $exists: true } },
-                ],
+                $or: stockManagedOrLegacyFilter(),
             },
             { $set: { isArchived: false } },
             { new: true }
