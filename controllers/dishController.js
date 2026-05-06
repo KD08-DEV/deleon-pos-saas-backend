@@ -146,6 +146,11 @@ exports.addDish = async (req, res, next) => {
             lastCost,
             isInventoryItem,
             allowCustomPrice,
+
+            // NUEVO
+            inventoryType,
+            allowNegativeStock,
+            stockMin,
         } = req.body;
 
         const normalizedProductionArea = normalizeProductionArea(productionArea);
@@ -153,6 +158,14 @@ exports.addDish = async (req, res, next) => {
         // inventoryCategoryId (si viene)
 // Flags base (evita usar variables antes de declararlas)
         const isInv = String(isInventoryItem) === "true" || isInventoryItem === true;
+        const requestedInventoryType = String(inventoryType || "none").trim().toLowerCase();
+
+        const normalizedInventoryType = ["none", "direct", "recipe"].includes(requestedInventoryType)
+            ? requestedInventoryType
+            : "none";
+
+        const isDirectStockProduct = normalizedInventoryType === "direct";
+        const isRecipeProduct = normalizedInventoryType === "recipe";
         if (isInv && !isAdminLike(req)) {
             return next(createHttpError(
                 403,
@@ -161,8 +174,11 @@ exports.addDish = async (req, res, next) => {
         }
         const sm = sellMode !== undefined ? String(sellMode) : undefined;
 
-        if (isInv && !planContext.features.inventory) {
-            return next(createHttpError(403, "Tu plan actual no incluye inventario. Mejora a Estándar, Premium o Pro para usar esta función."));
+        if ((isInv || isDirectStockProduct || isRecipeProduct) && !planContext.features.inventory) {
+            return next(createHttpError(
+                403,
+                "Tu plan actual no incluye inventario. Mejora a Estándar, Premium o Pro para usar esta función."
+            ));
         }
 
         if (inventoryCategoryId && !planContext.features.inventoryCategories) {
@@ -194,13 +210,18 @@ exports.addDish = async (req, res, next) => {
         if (allowCP && sm === "weight") {
             return next(createHttpError(400, "allowCustomPrice no aplica a venta por peso"));
         }
-
         let invCatId = null;
 
-        if (inventoryCategoryId !== undefined && inventoryCategoryId !== null && inventoryCategoryId !== "") {
+        if (
+            (isInv || isDirectStockProduct) &&
+            inventoryCategoryId !== undefined &&
+            inventoryCategoryId !== null &&
+            inventoryCategoryId !== ""
+        ) {
             if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
                 return next(createHttpError(400, "inventoryCategoryId inválido"));
             }
+
             invCatId = inventoryCategoryId;
         }
 
@@ -279,26 +300,48 @@ exports.addDish = async (req, res, next) => {
             last = n;
         }
 
+        const directStockMin =
+            stockMin !== undefined && stockMin !== null && stockMin !== ""
+                ? Number(stockMin)
+                : 0;
+
         const newDish = await Dish.create({
             name: String(name).trim(),
             price: finalPrice,
             category: String(finalCategory).trim(),
             productionArea: normalizedProductionArea,
-            inventoryCategoryId: invCatId,
+
+            // Inventario desde Menú
+            inventoryType: isInv ? "ingredient" : normalizedInventoryType,
             isInventoryItem: isInv,
+
+            // Solo direct/ingredient tienen categoría de inventario
+            inventoryCategoryId: isInv || isDirectStockProduct ? invCatId : null,
+
+            // Solo direct/ingredient manejan stock propio
+            stockCurrent: isInv || isDirectStockProduct ? 0 : null,
+            stockMin: isInv || isDirectStockProduct ? directStockMin : null,
+
+            allowNegativeStock:
+                isInv || isDirectStockProduct
+                    ? allowNegativeStock === undefined
+                        ? true
+                        : String(allowNegativeStock) === "true" || allowNegativeStock === true
+                    : false,
+
             imageUrl,
-            avgCost: avg,
+            avgCost: isInv || isDirectStockProduct ? avg : null,
+            lastCost: isInv || isDirectStockProduct ? last : null,
             allowCustomPrice: allowCP,
-            lastCost: last,
-            // ✅ guardamos venta por peso desde creación
+
             ...(sm !== undefined ? { sellMode: sm } : {}),
             ...(wu !== undefined ? { weightUnit: wu } : {}),
             ...(pplb !== undefined ? { pricePerLb: pplb } : {}),
             ...(u !== undefined ? { unit: u } : {}),
-            tenantId,
-            clientId: clientId,
-        });
 
+            tenantId,
+            clientId,
+        });
 
         res.status(201).json({
             success: true,
@@ -408,6 +451,13 @@ exports.updateDish = async (req, res, next) => {
             inventoryCategoryId,
             isInventoryItem,
             unit,
+
+            // NUEVO
+            inventoryType,
+            allowNegativeStock,
+            stockMin,
+            avgCost,
+            lastCost,
         } = req.body;
 
         const tenantId = req.user?.tenantId;
@@ -420,7 +470,12 @@ exports.updateDish = async (req, res, next) => {
 
         const isTryingInventoryChange =
             isInventoryItem !== undefined ||
-            inventoryCategoryId !== undefined;
+            inventoryCategoryId !== undefined ||
+            inventoryType !== undefined ||
+            allowNegativeStock !== undefined ||
+            stockMin !== undefined ||
+            avgCost !== undefined ||
+            lastCost !== undefined;
 
         if (isTryingInventoryChange && !planContext.features.inventory) {
             return next(createHttpError(
@@ -432,13 +487,25 @@ exports.updateDish = async (req, res, next) => {
         if (!mongoose.Types.ObjectId.isValid(id)) {
             return next(createHttpError(404, "Invalid dish ID!"));
         }
-
         const dish = await Dish.findOne({
             _id: id,
             tenantId,
         });
 
         if (!dish) return next(createHttpError(404, "Dish not found!"));
+
+        const requestedInventoryType =
+            inventoryType !== undefined
+                ? String(inventoryType || "none").trim().toLowerCase()
+                : String(dish.inventoryType || "none").trim().toLowerCase();
+
+        const normalizedInventoryType = ["none", "direct", "recipe"].includes(requestedInventoryType)
+            ? requestedInventoryType
+            : "none";
+
+        const isDirectStockProduct = normalizedInventoryType === "direct";
+        const isRecipeProduct = normalizedInventoryType === "recipe";
+
 
         // Nueva imagen
         if (req.file) {
@@ -472,8 +539,56 @@ exports.updateDish = async (req, res, next) => {
         }
 
         // 3) inventoryCategoryId SOLO afecta stock/control (NO cambia isInventoryItem)
-        if (invCatId !== undefined) {
-            dish.inventoryCategoryId = invCatId; // null o ObjectId
+        if (dish.isInventoryItem) {
+            if (invCatId !== undefined) {
+                dish.inventoryCategoryId = invCatId;
+            }
+
+            dish.inventoryType = "ingredient";
+            dish.stockCurrent = Number.isFinite(Number(dish.stockCurrent)) ? Number(dish.stockCurrent) : 0;
+            dish.stockMin = stockMin !== undefined ? Number(stockMin || 0) : Number(dish.stockMin || 0);
+        } else {
+            dish.inventoryType = normalizedInventoryType;
+
+            if (isDirectStockProduct) {
+                if (invCatId !== undefined) {
+                    dish.inventoryCategoryId = invCatId;
+                }
+
+                dish.stockCurrent = Number.isFinite(Number(dish.stockCurrent)) ? Number(dish.stockCurrent) : 0;
+                dish.stockMin = stockMin !== undefined ? Number(stockMin || 0) : Number(dish.stockMin || 0);
+
+                dish.allowNegativeStock =
+                    allowNegativeStock === undefined
+                        ? dish.allowNegativeStock !== false
+                        : String(allowNegativeStock) === "true" || allowNegativeStock === true;
+
+                if (avgCost !== undefined) {
+                    dish.avgCost = avgCost === "" || avgCost === null ? null : Number(avgCost);
+                }
+
+                if (lastCost !== undefined) {
+                    dish.lastCost = lastCost === "" || lastCost === null ? null : Number(lastCost);
+                }
+            }
+
+            if (isRecipeProduct) {
+                dish.inventoryCategoryId = null;
+                dish.stockCurrent = null;
+                dish.stockMin = null;
+                dish.allowNegativeStock = false;
+                dish.avgCost = null;
+                dish.lastCost = null;
+            }
+
+            if (normalizedInventoryType === "none") {
+                dish.inventoryCategoryId = null;
+                dish.stockCurrent = null;
+                dish.stockMin = null;
+                dish.allowNegativeStock = false;
+                dish.avgCost = null;
+                dish.lastCost = null;
+            }
         }
 
         // 4) category del MENÚ:

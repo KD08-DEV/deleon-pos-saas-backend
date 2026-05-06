@@ -37,18 +37,18 @@ router.get(
     getDishes
 );
 
-// UPDATE - solo Owner/Admin por ahora
+// UPDATE - Owner/Admin o permiso individual products.update
 router.put(
     "/:id",
-    requireRole("Owner", "Admin"),
+    requirePermission("products.update"),
     uploadMemory.single("image"),
     updateDish
 );
 
-// DELETE - solo Owner/Admin
+// DELETE - Owner/Admin o permiso individual products.delete
 router.delete(
     "/:id",
-    requireRole("Owner", "Admin"),
+    requirePermission("products.delete"),
     deleteDish
 );
 

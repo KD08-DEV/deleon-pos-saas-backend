@@ -145,14 +145,33 @@ function isStockManagedItem(dish = {}) {
 
 function stockManagedOrLegacyFilter() {
     return [
-        // Nueva lógica
+        // Nueva lógica: solo inventario real con stock.
         { inventoryType: { $in: STOCK_INVENTORY_TYPES } },
 
-        // Compatibilidad con datos viejos que todavía no tengan inventoryType
+        // Compatibilidad segura con datos viejos.
+        // Solo isInventoryItem=true debe contar como inventario legacy.
         { inventoryType: { $exists: false }, isInventoryItem: true },
+    ];
+}
+function inventoryVisibleFilter() {
+    return [
+        // Inventario real
+        ...stockManagedOrLegacyFilter(),
+
+        // Platos normales nuevos o viejos que todavía NO manejan inventario,
+        // pero pueden activarse automáticamente con una Entrada.
         {
-            inventoryType: { $exists: false },
-            inventoryCategoryId: { $ne: null, $exists: true },
+            $and: [
+                {
+                    $or: [
+                        { inventoryType: "none" },
+                        { inventoryType: { $exists: false } },
+                        { inventoryType: null },
+                    ],
+                },
+                { isInventoryItem: { $ne: true } },
+                { category: { $ne: "Inventario" } },
+            ],
         },
     ];
 }
@@ -182,11 +201,37 @@ async function applyStockMovement({
         tenantId,
         clientId,
         isArchived: { $ne: true },
-        $or: stockManagedOrLegacyFilter(),
+        $or: inventoryVisibleFilter(),
     }).session(session);
 
-
     if (!dish) throw createHttpError(404, "INVENTORY_ITEM_NOT_FOUND");
+
+    const currentType = normalizeInventoryType(dish);
+
+    const isInactiveMenuDish =
+        currentType === "none" &&
+        dish.isInventoryItem !== true &&
+        String(dish.category || "").trim() !== "Inventario";
+
+// Si es plato normal y recibe una Entrada, se convierte automáticamente en direct.
+    if (isInactiveMenuDish) {
+        if (type !== "purchase") {
+            throw createHttpError(
+                400,
+                "Este plato todavía no maneja inventario. Primero debes registrar una Entrada."
+            );
+        }
+
+        dish.inventoryType = "direct";
+        dish.isInventoryItem = false;
+        dish.stockCurrent = Number.isFinite(Number(dish.stockCurrent))
+            ? Number(dish.stockCurrent)
+            : 0;
+        dish.stockMin = Number.isFinite(Number(dish.stockMin))
+            ? Number(dish.stockMin)
+            : 0;
+        dish.allowNegativeStock = true;
+    }
 
     const beforeStock = num(dish.stockCurrent, 0);
     const afterStock = beforeStock + Number(delta);
@@ -297,7 +342,7 @@ exports.listItems = async (req, res, next) => {
         const filter = {
             tenantId,
             clientId,
-            $or: stockManagedOrLegacyFilter(),
+            $or: inventoryVisibleFilter(),
         };
 
         if (!includeArchived) filter.isArchived = false;
@@ -773,6 +818,8 @@ exports.consumption = async (req, res, next) => {
         }
 
         const dishCollection = Dish.collection.name;
+        const InventoryCategory = require("../models/inventoryCategoryModel");
+        const inventoryCategoryCollection = InventoryCategory.collection.name;
 
         const pipeline = [
             { $match: match },
@@ -795,6 +842,15 @@ exports.consumption = async (req, res, next) => {
                 },
             },
             { $unwind: { path: "$dish", preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: inventoryCategoryCollection,
+                    localField: "dish.inventoryCategoryId",
+                    foreignField: "_id",
+                    as: "inventoryCategory",
+                },
+            },
+            { $unwind: { path: "$inventoryCategory", preserveNullAndEmptyArrays: true } },
         ];
 
         if (inventoryCategoryId && mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
@@ -810,7 +866,13 @@ exports.consumption = async (req, res, next) => {
                 $project: {
                     dishId: "$_id",
                     name: { $ifNull: ["$dish.name", "(Plato eliminado)"] },
+                    category: "$dish.category",
+                    imageUrl: "$dish.imageUrl",
+                    price: "$dish.price",
+
                     inventoryCategoryId: "$dish.inventoryCategoryId",
+                    inventoryCategoryName: "$inventoryCategory.name",
+
                     qtySold: 1,
                     revenue: 1,
                     lines: 1,
