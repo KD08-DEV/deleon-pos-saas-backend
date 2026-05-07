@@ -1942,43 +1942,88 @@ const getSalesByProductReport = async (req, res) => {
             ? parseReportBoundary(to, true)
             : parseReportBoundary(todayYMD, true);
 
-        if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+        if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
             return res.status(400).json({
                 success: false,
                 message: "INVALID_DATE_RANGE",
             });
         }
 
-        const clientScope = clientId
-            ? [
-                { clientId },
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ]
-            : [
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ];
+        const rawClientId = String(clientId || "default").trim() || "default";
 
-        const match = {
+        const clientScope = [
+            { clientId: rawClientId },
+            { clientId: { $exists: false } },
+            { clientId: "default" },
+        ];
+
+        const baseOrderFilter = {
             tenantId,
+            $and: [{ $or: clientScope }],
             isDraft: { $ne: true },
             orderStatus: { $ne: "Cancelado" },
             "items.0": { $exists: true },
+        };
 
-            // ✅ Este reporte debe cuadrar con ventas:
-            // solo órdenes pagadas dentro del rango seleccionado.
-            paymentStatus: "Pagado",
-            paidAt: { $gte: start, $lte: end },
-
-            // ✅ Evita tener dos $or en el mismo objeto.
-            $and: [
-                { $or: clientScope },
+        const legacyPaymentStatusFilter = {
+            $or: [
+                { paymentStatus: { $exists: false } },
+                { paymentStatus: null },
+                { paymentStatus: "" },
+                { paymentStatus: "Pendiente" },
             ],
         };
 
-        if (paymentMethod) match.paymentMethod = paymentMethod;
-        if (orderSource) match.orderSource = orderSource;
+        const modernPaid = {
+            ...baseOrderFilter,
+            paymentStatus: "Pagado",
+            paidAt: { $gte: start, $lte: end },
+        };
+
+        const legacyCompleted = {
+            ...baseOrderFilter,
+            ...legacyPaymentStatusFilter,
+            orderStatus: "Completado",
+            createdAt: { $gte: start, $lte: end },
+        };
+
+        const legacyFiscal = {
+            ...baseOrderFilter,
+            ...legacyPaymentStatusFilter,
+            "fiscal.requested": true,
+            createdAt: { $gte: start, $lte: end },
+        };
+
+        const legacyInProgress = {
+            ...baseOrderFilter,
+            ...legacyPaymentStatusFilter,
+            orderStatus: "En Progreso",
+            "bills.totalWithTax": { $gt: 0 },
+            createdAt: { $gte: start, $lte: end },
+        };
+
+        const match = {
+            $or: [
+                modernPaid,
+                legacyCompleted,
+                legacyFiscal,
+                legacyInProgress,
+            ],
+        };
+
+        if (paymentMethod) {
+            match.$or = match.$or.map((q) => ({
+                ...q,
+                paymentMethod,
+            }));
+        }
+
+        if (orderSource) {
+            match.$or = match.$or.map((q) => ({
+                ...q,
+                orderSource,
+            }));
+        }
 
         const itemMatch = {};
         if (category) itemMatch["items.category"] = category;
