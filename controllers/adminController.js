@@ -20,12 +20,15 @@ function parseReportBoundary(value, endOfDay = false) {
     const raw = String(value || "").trim();
     if (!raw) return null;
 
-    // Caso ideal: YYYY-MM-DD
-    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-        const tzOffset = process.env.REPORT_TZ_OFFSET || "-04:00"; // República Dominicana
-        return new Date(`${raw}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}${tzOffset}`);
+    const tzOffset = process.env.REPORT_TZ_OFFSET || "-04:00";
+
+    // Soporta YYYY-MM-DD y también YYYY-MM-DDT...
+    const ymdMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (ymdMatch) {
+        const ymd = ymdMatch[1];
+        return new Date(`${ymd}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}${tzOffset}`);
     }
-    // Fallback: cualquier fecha parseable por JS
+
     const d = new Date(raw);
     if (Number.isNaN(d.getTime())) return null;
 

@@ -1895,6 +1895,26 @@ const updatePaymentMethod = async (req, res) => {
 };
 // ✅ Reporte tipo “Químicos” pero para restaurante (por categoría/presentación/producto/método)
 // ✅ Reporte tipo “Químicos” pero para restaurante (por categoría/presentación/producto/método)
+function parseReportBoundary(value, endOfDay = false) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+
+    const tzOffset = process.env.REPORT_TZ_OFFSET || "-04:00";
+
+    const ymdMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (ymdMatch) {
+        const ymd = ymdMatch[1];
+        return new Date(`${ymd}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}${tzOffset}`);
+    }
+
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return null;
+
+    if (endOfDay) d.setHours(23, 59, 59, 999);
+    else d.setHours(0, 0, 0, 0);
+
+    return d;
+}
 const getSalesByProductReport = async (req, res) => {
     try {
         const tenantId = req.tenantId || req.user?.tenantId;
@@ -1910,14 +1930,17 @@ const getSalesByProductReport = async (req, res) => {
         const { from, to, paymentMethod, category, presentation, orderSource } = req.query;
 
         const now = new Date();
+        const todayYMD = now.toLocaleDateString("en-CA", {
+            timeZone: "America/Santo_Domingo",
+        });
 
         const start = from
-            ? new Date(from)
-            : new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+            ? parseReportBoundary(from, false)
+            : parseReportBoundary(todayYMD, false);
 
         const end = to
-            ? new Date(to)
-            : new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+            ? parseReportBoundary(to, true)
+            : parseReportBoundary(todayYMD, true);
 
         if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
             return res.status(400).json({
