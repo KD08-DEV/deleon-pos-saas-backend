@@ -8,6 +8,10 @@ const { requireFeature } = require("../middlewares/requirePlan");
 
 const { exportAllInvoices } = require("../controllers/reportExportController");
 const { exportExcel } = require("../controllers/reportExportController");
+const {
+    getEcfProfile,
+    updateEcfProfile,
+} = require("../controllers/ecfAdminController");
 
 const {
     getCashSessionByDate,
@@ -162,6 +166,20 @@ router.patch(
     requireScope({ level: "tenant" }),
     requireRole("Owner", "Admin"),
     updateFiscalConfig
+);
+
+router.get(
+    "/ecf/profile",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    getEcfProfile
+);
+
+router.patch(
+    "/ecf/profile",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    updateEcfProfile
 );
 
 // =======================
