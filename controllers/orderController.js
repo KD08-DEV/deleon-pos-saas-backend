@@ -1987,15 +1987,42 @@ const getSalesByProductReport = async (req, res) => {
             {
                 $group: {
                     _id: {
-                        category: "$_cat",
                         presentation: "$_pres",
                         product: "$_prod",
                         paymentMethod: "$_pay",
                     },
+
+                    categories: {
+                        $addToSet: {
+                            $cond: [
+                                {
+                                    $and: [
+                                        { $ne: ["$_cat", null] },
+                                        { $ne: ["$_cat", ""] },
+                                        { $ne: ["$_cat", "Sin categoría"] },
+                                        { $ne: ["$_cat", "Sin Categoría"] },
+                                    ],
+                                },
+                                "$_cat",
+                                "$$REMOVE",
+                            ],
+                        },
+                    },
+
                     qty: { $sum: "$_qty" },
                     revenue: { $sum: "$_revenue" },
                     costTotal: { $sum: "$_costTotal" },
                     taxTotal: { $sum: "$_tax" },
+                },
+            },
+            {
+                $addFields: {
+                    category: {
+                        $ifNull: [
+                            { $arrayElemAt: ["$categories", 0] },
+                            "Sin categoría",
+                        ],
+                    },
                 },
             },
             {
@@ -2038,7 +2065,7 @@ const getSalesByProductReport = async (req, res) => {
             {
                 $project: {
                     _id: 0,
-                    category: "$_id.category",
+                    category: "$category",
                     presentation: "$_id.presentation",
                     product: "$_id.product",
                     paymentMethod: "$_id.paymentMethod",
