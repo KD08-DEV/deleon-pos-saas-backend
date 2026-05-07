@@ -7,7 +7,7 @@ const supabase = require("../config/supabaseClient");
 // Middlewares
 const verifyToken = require("../middlewares/tokenVerification");
 const { tenantMiddleware } = require("../middlewares/tenantMiddleware");
-//const { issueOrderAsEcf } = require("../controllers/ecfIssueController");
+const { issueOrderAsEcf } = require("../controllers/ecfIssueController");
 
 // Controllers
 const {
@@ -20,16 +20,22 @@ const {
     getSalesByProductReport,
     sendOrderToProduction,
 } = require("../controllers/orderController");
-
+router.get(
+    "/report/sales-by-product",
+    verifyToken,
+    tenantMiddleware,
+    getSalesByProductReport
+);
 /**
  * GET /api/order
  */
-//router.post(
-  //  "/:id/issue-ecf",
-    //verifyToken,
-    //tenantMiddleware,
-  //  issueOrderAsEcf
-//);
+
+router.post(
+    "/:id/issue-ecf",
+    verifyToken,
+    tenantMiddleware,
+    issueOrderAsEcf
+);
 router.get(
     "/",
     verifyToken,
@@ -160,12 +166,7 @@ router.delete(
     deleteOrder
 );
 router.patch("/:id/payment-method", verifyToken, tenantMiddleware, updatePaymentMethod);
-router.get(
-    "/report/sales-by-product",
-    verifyToken,
-    tenantMiddleware,
-    getSalesByProductReport
-);
+
 
 
 module.exports = router;
