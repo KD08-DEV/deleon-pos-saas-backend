@@ -1894,57 +1894,69 @@ const updatePaymentMethod = async (req, res) => {
     }
 };
 // ✅ Reporte tipo “Químicos” pero para restaurante (por categoría/presentación/producto/método)
+// ✅ Reporte tipo “Químicos” pero para restaurante (por categoría/presentación/producto/método)
 const getSalesByProductReport = async (req, res) => {
     try {
         const tenantId = req.tenantId || req.user?.tenantId;
         const clientId = req.clientId;
 
-        // query params
+        if (!tenantId) {
+            return res.status(401).json({
+                success: false,
+                message: "TENANT_NOT_FOUND",
+            });
+        }
+
         const { from, to, paymentMethod, category, presentation, orderSource } = req.query;
 
-        // rango por createdAt (si no mandan fechas, usa hoy)
         const now = new Date();
-        const start = from ? new Date(from) : new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
-        const end = to ? new Date(to) : new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
+
+        const start = from
+            ? new Date(from)
+            : new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+
+        const end = to
+            ? new Date(to)
+            : new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+        if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+            return res.status(400).json({
+                success: false,
+                message: "INVALID_DATE_RANGE",
+            });
+        }
+
+        const clientScope = clientId
+            ? [
+                { clientId },
+                { clientId: { $exists: false } },
+                { clientId: "default" },
+            ]
+            : [
+                { clientId: { $exists: false } },
+                { clientId: "default" },
+            ];
 
         const match = {
             tenantId,
-            $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
             isDraft: { $ne: true },
             orderStatus: { $ne: "Cancelado" },
             "items.0": { $exists: true },
-            $or: [
-                {
-                    paymentStatus: "Pagado",
-                    paidAt: { $gte: start, $lte: end },
-                },
-                {
-                    $or: [
-                        { paymentStatus: { $exists: false } },
-                        { paymentStatus: null },
-                        { paymentStatus: "" },
-                        { paymentStatus: "Pendiente" },
-                    ],
-                    orderStatus: "Completado",
-                    createdAt: { $gte: start, $lte: end },
-                },
-                {
-                    $or: [
-                        { paymentStatus: { $exists: false } },
-                        { paymentStatus: null },
-                        { paymentStatus: "" },
-                        { paymentStatus: "Pendiente" },
-                    ],
-                    "fiscal.requested": true,
-                    createdAt: { $gte: start, $lte: end },
-                },
+
+            // ✅ Este reporte debe cuadrar con ventas:
+            // solo órdenes pagadas dentro del rango seleccionado.
+            paymentStatus: "Pagado",
+            paidAt: { $gte: start, $lte: end },
+
+            // ✅ Evita tener dos $or en el mismo objeto.
+            $and: [
+                { $or: clientScope },
             ],
         };
 
         if (paymentMethod) match.paymentMethod = paymentMethod;
         if (orderSource) match.orderSource = orderSource;
 
-        // filtros por item
         const itemMatch = {};
         if (category) itemMatch["items.category"] = category;
         if (presentation) itemMatch["items.presentation"] = presentation;
@@ -1962,7 +1974,7 @@ const getSalesByProductReport = async (req, res) => {
                     _pay: { $ifNull: ["$paymentMethod", "Desconocido"] },
 
                     _qty: { $ifNull: ["$items.quantity", 0] },
-                    _revenue: { $ifNull: ["$items.price", 0] }, // line total
+                    _revenue: { $ifNull: ["$items.price", 0] },
                     _unitCost: { $ifNull: ["$items.unitCost", 0] },
                     _tax: { $ifNull: ["$items.taxAmount", 0] },
                 },
@@ -1972,34 +1984,57 @@ const getSalesByProductReport = async (req, res) => {
                     _costTotal: { $multiply: ["$_qty", "$_unitCost"] },
                 },
             },
-
-            // agrupar como reporte de químicos
             {
                 $group: {
-                    _id: { category: "$_cat", presentation: "$_pres", product: "$_prod", paymentMethod: "$_pay" },
+                    _id: {
+                        category: "$_cat",
+                        presentation: "$_pres",
+                        product: "$_prod",
+                        paymentMethod: "$_pay",
+                    },
                     qty: { $sum: "$_qty" },
                     revenue: { $sum: "$_revenue" },
                     costTotal: { $sum: "$_costTotal" },
                     taxTotal: { $sum: "$_tax" },
                 },
             },
-
-            // calcular promedios y %s
             {
                 $addFields: {
-                    unitCost: { $cond: [{ $gt: ["$qty", 0] }, { $divide: ["$costTotal", "$qty"] }, 0] },
-                    unitPrice: { $cond: [{ $gt: ["$qty", 0] }, { $divide: ["$revenue", "$qty"] }, 0] },
+                    unitCost: {
+                        $cond: [
+                            { $gt: ["$qty", 0] },
+                            { $divide: ["$costTotal", "$qty"] },
+                            0,
+                        ],
+                    },
+                    unitPrice: {
+                        $cond: [
+                            { $gt: ["$qty", 0] },
+                            { $divide: ["$revenue", "$qty"] },
+                            0,
+                        ],
+                    },
                     profit: { $subtract: ["$revenue", "$costTotal"] },
                 },
             },
             {
                 $addFields: {
-                    costPct: { $cond: [{ $gt: ["$revenue", 0] }, { $multiply: [{ $divide: ["$costTotal", "$revenue"] }, 100] }, 0] },
-                    profitPct: { $cond: [{ $gt: ["$revenue", 0] }, { $multiply: [{ $divide: ["$profit", "$revenue"] }, 100] }, 0] },
+                    costPct: {
+                        $cond: [
+                            { $gt: ["$revenue", 0] },
+                            { $multiply: [{ $divide: ["$costTotal", "$revenue"] }, 100] },
+                            0,
+                        ],
+                    },
+                    profitPct: {
+                        $cond: [
+                            { $gt: ["$revenue", 0] },
+                            { $multiply: [{ $divide: ["$profit", "$revenue"] }, 100] },
+                            0,
+                        ],
+                    },
                 },
             },
-
-            // salida final
             {
                 $project: {
                     _id: 0,
@@ -2022,10 +2057,21 @@ const getSalesByProductReport = async (req, res) => {
             { $sort: { category: 1, presentation: 1, product: 1, paymentMethod: 1 } },
         ]);
 
-        return res.json({ success: true, data: rows });
+        return res.json({
+            success: true,
+            data: rows,
+            meta: {
+                from: start.toISOString(),
+                to: end.toISOString(),
+                totalRows: rows.length,
+            },
+        });
     } catch (err) {
         console.error("getSalesByProductReport error:", err);
-        return res.status(500).json({ success: false, message: "Error interno" });
+        return res.status(500).json({
+            success: false,
+            message: "Error interno",
+        });
     }
 };
 const sendOrderToProduction = async (req, res, next) => {
