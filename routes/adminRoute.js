@@ -1,5 +1,7 @@
 const express = require("express");
 const router = express.Router();
+const multer = require("multer");
+const path = require("path");
 
 const verifyToken = require("../middlewares/tokenVerification");
 const requireScope = require("../middlewares/scope");
@@ -8,10 +10,19 @@ const { requireFeature } = require("../middlewares/requirePlan");
 
 const { exportAllInvoices } = require("../controllers/reportExportController");
 const { exportExcel } = require("../controllers/reportExportController");
+const { getFinanceSummary } = require("../controllers/summaryController");
 const {
     getEcfProfile,
     updateEcfProfile,
+    uploadEcfCertificate,
 } = require("../controllers/ecfAdminController");
+const {
+    listReceivables,
+    getReceivableSummary,
+    getReceivableCashSummary,
+    addReceivablePayment,
+    voidReceivable,
+} = require("../controllers/accountReceivableController");
 
 const {
     getCashSessionByDate,
@@ -83,8 +94,24 @@ const {
     postPayrollRun,
 } = require("../controllers/payrollController");
 
-const { getFinanceSummary } = require("../controllers/summaryController");
 
+
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: 5 * 1024 * 1024,
+    },
+    fileFilter: (req, file, cb) => {
+        const allowed = [".p12", ".pfx"];
+        const ext = path.extname(file.originalname || "").toLowerCase();
+
+        if (!allowed.includes(ext)) {
+            return cb(new Error("INVALID_CERTIFICATE_EXTENSION"));
+        }
+
+        cb(null, true);
+    },
+});
 // Panel admin: nivel tenant
 router.use(verifyToken);
 
@@ -174,6 +201,13 @@ router.get(
     requireRole("Owner", "Admin"),
     getEcfProfile
 );
+router.post(
+    "/ecf/profile/certificate",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    upload.single("certificate"),
+    uploadEcfCertificate
+);
 
 router.patch(
     "/ecf/profile",
@@ -225,8 +259,6 @@ router.delete(
 router.get(
     "/inventory/categories",
     requireScope({ level: "tenant" }),
-    requireFeature("inventoryCategories"),
-    requireRole("Owner", "Admin", "Cajera", "Camarero"),
     getCategories
 );
 
@@ -401,6 +433,7 @@ router.post(
     addPurchasePayment
 );
 
+
 // =======================
 // GASTOS - Pro
 // =======================
@@ -409,7 +442,7 @@ router.get(
     "/expense-categories",
     requireScope({ level: "tenant" }),
     requireFeature("expenses"),
-    requireRole("Owner", "Admin", "Cajera"),
+    requireRole("Owner", "Admin", "Cajera","mesero"),
     listExpenseCategories
 );
 
@@ -523,6 +556,43 @@ router.get(
     requireFeature("financeSummary"),
     requireRole("Owner", "Admin", "Cajera"),
     getFinanceSummary
+);
+// =======================
+// CUENTAS POR COBRAR
+// =======================
+router.get(
+    "/accounts-receivable/cash-summary",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    getReceivableCashSummary
+);
+
+router.get(
+    "/accounts-receivable",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    listReceivables
+);
+
+router.get(
+    "/accounts-receivable/summary",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    getReceivableSummary
+);
+
+router.post(
+    "/accounts-receivable/:id/payments",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    addReceivablePayment
+);
+
+router.patch(
+    "/accounts-receivable/:id/void",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    voidReceivable
 );
 
 module.exports = router;

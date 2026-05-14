@@ -38,106 +38,140 @@ function parseReportBoundary(value, endOfDay = false) {
     return d;
 }
 function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, endDate }) {
+    const rawClientId = String(clientId || "default").trim() || "default";
+
     const rawRegister = registerId ? String(registerId).trim().toUpperCase() : "";
+
     const normalizeReg =
         !rawRegister || rawRegister === "__ALL_REGISTERS__" || rawRegister === "ALL"
             ? ""
             : rawRegister;
 
-    const baseClient = {
-        tenantId,
-        clientId,
-    };
-
-    const withRegister = normalizeReg ? { registerId: normalizeReg } : {};
-    const withDatesPaid =
-        startDate && endDate ? { paidAt: { $gte: startDate, $lte: endDate } } : {};
-    const withDatesCreated =
-        startDate && endDate ? { createdAt: { $gte: startDate, $lte: endDate } } : {};
-
-    const modernPaid = {
-        ...baseClient,
-        ...withRegister,
-        paymentStatus: "Pagado",
-        ...withDatesPaid,
-    };
-
-    const legacyCompleted = {
-        ...baseClient,
-        ...withRegister,
+    const clientScope = {
         $or: [
-            { paymentStatus: { $exists: false } },
-            { paymentStatus: null },
-            { paymentStatus: "" },
-            { paymentStatus: "Pendiente" },
+            { clientId: rawClientId },
+            { clientId: "default" },
+            { clientId: { $exists: false } },
+            { clientId: null },
+            { clientId: "" },
         ],
-        orderStatus: "Completado",
-        ...withDatesCreated,
     };
 
-    const legacyFiscal = {
-        ...baseClient,
-        ...withRegister,
-        $or: [
-            { paymentStatus: { $exists: false } },
-            { paymentStatus: null },
-            { paymentStatus: "" },
-            { paymentStatus: "Pendiente" },
-        ],
-        "fiscal.requested": true,
-        ...withDatesCreated,
-    };
+    let registerScope = {};
 
-    const legacyInProgress = {
-        ...baseClient,
-        ...withRegister,
-        $or: [
-            { paymentStatus: { $exists: false } },
-            { paymentStatus: null },
-            { paymentStatus: "" },
-            { paymentStatus: "Pendiente" },
-        ],
-        orderStatus: "En Progreso",
-        isDraft: { $ne: true },
-        "items.0": { $exists: true },
-        "bills.totalWithTax": { $gt: 0 },
-        ...withDatesCreated,
-    };
-
-    if (!normalizeReg) {
-        return {
-            $or: [
-                modernPaid,
-                legacyCompleted,
-                legacyFiscal,
-                legacyInProgress,
-                {
-                    ...baseClient,
-                    registerId: { $exists: false },
-                    orderStatus: "Completado",
-                    ...withDatesCreated,
-                },
-                {
-                    ...baseClient,
-                    registerId: { $exists: false },
-                    "fiscal.requested": true,
-                    ...withDatesCreated,
-                },
-                {
-                    ...baseClient,
-                    registerId: { $exists: false },
-                    orderStatus: "En Progreso",
-                    isDraft: { $ne: true },
-                    "items.0": { $exists: true },
-                    "bills.totalWithTax": { $gt: 0 },
-                    ...withDatesCreated,
-                },
-            ],
-        };
+    if (normalizeReg) {
+        if (normalizeReg === "MAIN" || normalizeReg === "DEFAULT") {
+            registerScope = {
+                $or: [
+                    { registerId: "MAIN" },
+                    { registerId: "default" },
+                    { registerId: { $exists: false } },
+                    { registerId: null },
+                    { registerId: "" },
+                ],
+            };
+        } else {
+            registerScope = { registerId: normalizeReg };
+        }
     }
 
+    const paidDateRange =
+        startDate && endDate
+            ? { paidAt: { $gte: startDate, $lte: endDate } }
+            : {};
+
+    const createdDateRange =
+        startDate && endDate
+            ? { createdAt: { $gte: startDate, $lte: endDate } }
+            : {};
+
+    const paidAtMissing = {
+        $or: [
+            { paidAt: { $exists: false } },
+            { paidAt: null },
+            { paidAt: "" },
+        ],
+    };
+
     return {
-        $or: [modernPaid, legacyCompleted, legacyFiscal, legacyInProgress],
+        tenantId,
+
+        ...registerScope,
+
+        $and: [
+            clientScope,
+
+            // No traer canceladas/anuladas.
+            {
+                $or: [
+                    { orderStatus: { $exists: false } },
+                    { orderStatus: { $nin: ["Cancelado", "Canceled", "Cancelled"] } },
+                ],
+            },
+            {
+                $or: [
+                    { paymentStatus: { $exists: false } },
+                    { paymentStatus: { $ne: "Anulado" } },
+                ],
+            },
+
+            {
+                $or: [
+                    /*
+                     * Venta pagada moderna con paidAt.
+                     * No exigimos orderStatus Completado porque algunas ventas
+                     * ya están pagadas/facturadas pero el status queda En Progreso.
+                     */
+                    {
+                        paymentStatus: "Pagado",
+                        ...paidDateRange,
+                    },
+
+                    /*
+                     * Venta pagada sin paidAt, usando createdAt.
+                     */
+                    {
+                        paymentStatus: "Pagado",
+                        ...paidAtMissing,
+                        ...createdDateRange,
+                    },
+
+                    /*
+                     * Venta completada legacy.
+                     */
+                    {
+                        orderStatus: "Completado",
+                        ...createdDateRange,
+                    },
+
+                    /*
+                     * Factura fiscal/e-CF emitida o solicitada.
+                     */
+                    {
+                        "fiscal.requested": true,
+                        ...createdDateRange,
+                    },
+
+                    /*
+                     * Órdenes que tienen número de factura interno.
+                     */
+                    {
+                        invoiceNumber: { $exists: true, $nin: [null, ""] },
+                        ...createdDateRange,
+                    },
+
+                    {
+                        facturaNo: { $exists: true, $nin: [null, ""] },
+                        ...createdDateRange,
+                    },
+
+                    {
+                        internalInvoiceNumber: { $exists: true, $nin: [null, ""] },
+                        ...createdDateRange,
+                    },
+                ],
+            },
+        ],
     };
 }
 // 🔹 Obtener reportes (ventas filtradas + resumen diario)
@@ -146,23 +180,31 @@ exports.getReports = async (req, res) => {
         const { from, to, method, user, registerId } = req.query;
 
         const getClientId = (req) => {
-            // prioridad: scope -> user -> headers (por si lo mandas)
             return (
                 req.scope?.clientId ||
+                req.clientId ||
                 req.user?.clientId ||
                 req.user?.client?._id ||
                 req.headers["x-client-id"] ||
-                ""
+                "default"
             );
         };
         const tenantId = req.user.tenantId;
         const clientId = getClientId(req);
 
         // ✅ MERMA (waste) por rango de fechas (costo y cantidad)
+        const rawClientId = String(clientId || "default").trim() || "default";
+
         const mermaFilter = {
             tenantId,
-            clientId,
             type: "waste",
+            $or: [
+                { clientId: rawClientId },
+                { clientId: "default" },
+                { clientId: { $exists: false } },
+                { clientId: null },
+                { clientId: "" },
+            ],
         };
 
         const startDate = from ? parseReportBoundary(from, false) : null;
@@ -204,9 +246,46 @@ exports.getReports = async (req, res) => {
             endDate,
         });
 
-// Filtrar por método de pago
+// Crédito NO es venta cobrada.
+// Las ventas a crédito viven en Cuentas por Cobrar.
+        filter.$and = [
+            ...(Array.isArray(filter.$and) ? filter.$and : []),
+            {
+                $or: [
+                    { paymentMethod: { $exists: false } },
+                    { paymentMethod: { $ne: "Credito" } },
+                ],
+            },
+        ];
+
+// Filtrar por método de pago.
+// Si alguien intenta pedir Crédito aquí, devolvemos vacío,
+// porque Crédito no pertenece a ventas cobradas.
         if (method) {
-            filter.paymentMethod = method;
+            if (String(method).trim() === "Credito") {
+                return res.status(200).json({
+                    success: true,
+                    count: 0,
+                    dailySummary: {
+                        totalSales: 0,
+                        totalTax: 0,
+                        orderCount: 0,
+                        totalCommission: 0,
+                        totalNet: 0,
+                        mermaQty,
+                        mermaCost,
+                        netSales: 0,
+                        avgTicket: 0,
+                        cashSales: 0,
+                        onlineSales: 0,
+                        transferSales: 0,
+                    },
+                    salesByDate: {},
+                    data: [],
+                });
+            }
+
+            filter.$and.push({ paymentMethod: method });
         }
 
         // ✅ Buscar por nombre del usuario (match con populate)

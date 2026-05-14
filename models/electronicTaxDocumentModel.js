@@ -39,6 +39,8 @@ const electronicTaxDocumentSchema = new mongoose.Schema(
             },
             trackId: { type: String, default: null },
             securityCode: { type: String, default: null },
+            qrUrl: { type: String, default: null },
+            fechaHoraFirma: { type: String, default: null },
         },
 
         issuer: {

@@ -1,25 +1,40 @@
 const TenantEcfProfile = require("../../../models/tenantEcfProfileModel");
+const {
+    normalizeEcfDocumentType,
+    getEcfDocumentTypeKey,
+} = require("./ecfDocumentTypes");
 
-async function getNextSequence({ tenantId, documentType }) {
-    const profile = await TenantEcfProfile.findOne({ tenantId });
+async function getNextSequence({ tenantId, documentType = "32" }) {
+    const type = normalizeEcfDocumentType(documentType);
+    const typeKey = getEcfDocumentTypeKey(type);
+    const path = `documentTypes.${typeKey}.nextSequence`;
+    const enabledPath = `documentTypes.${typeKey}.enabled`;
 
-    if (!profile) {
-        throw new Error("ECF profile not found");
+    const profileBeforeIncrement = await TenantEcfProfile.findOneAndUpdate(
+        {
+            tenantId,
+            enabled: true,
+            [enabledPath]: true,
+        },
+        {
+            $inc: {
+                [path]: 1,
+            },
+        },
+        {
+            new: false,
+        }
+    );
+
+    if (!profileBeforeIncrement) {
+        const err = new Error(`ECF_DOCUMENT_TYPE_NOT_ENABLED_${typeKey.toUpperCase()}`);
+        err.statusCode = 400;
+        throw err;
     }
 
-    const map = {
-        "31": "e31",
-        "32": "e32",
-        "33": "e33",
-        "34": "e34",
-    };
-
-    const key = map[documentType];
-    if (!key) throw new Error("Unsupported document type");
-
-    const current = profile.documentTypes[key]?.nextSequence || 1;
-    profile.documentTypes[key].nextSequence = current + 1;
-    await profile.save();
+    const current = Number(
+        profileBeforeIncrement?.documentTypes?.[typeKey]?.nextSequence || 1
+    );
 
     return current;
 }

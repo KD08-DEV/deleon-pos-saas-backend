@@ -60,7 +60,7 @@ const tenantEcfProfileSchema = new mongoose.Schema(
 
         documentTypes: {
             e31: {
-                enabled: { type: Boolean, default: false },
+                enabled: { type: Boolean, default: true },
                 nextSequence: { type: Number, default: 1 },
             },
             e32: {

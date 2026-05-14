@@ -4,6 +4,7 @@ const Order = require("../models/orderModel");
 const Table = require("../models/tableModel");
 const Tenant = require("../models/tenantModel");
 const Dish = require("../models/dish"); // ajusta si el nombre es dishModel.js
+const ElectronicTaxDocument = require("../models/electronicTaxDocumentModel");
 // const InventoryItem = require("../models/inventoryItemModel"); // DEPRECATED: Ya no se usa InventoryItem, solo Dish
 // const InventoryMovement = require("../models/inventoryMovementModel"); // DEPRECATED
 const Customer = require("../models/customerModel");
@@ -11,7 +12,9 @@ const { deductInventoryForOrder, restoreInventoryForOrder } = require("../servic
 const Printer = require("../models/printerModel");
 const networkPrintService = require("../services/networkPrintService");
 const Membership = require("../models/membershipModel");
-
+const TenantEcfProfile = require("../models/tenantEcfProfileModel");
+const { issueOrderAsEcfCore } = require("./ecfIssueController");
+const { createReceivableForOrder } = require("./accountReceivableController");
 
 
 // Impuesto por defecto (0.25% para coincidir con tu UI)
@@ -317,8 +320,170 @@ async function findActiveProductionPrinter({ tenantId, clientId, category }) {
 //     ... (función deshabilitada porque usa InventoryItem)
 // }
 
+const getTenantEcfStatus = async (req, res, next) => {
+    try {
+        const tenantId = req.tenantId || req.user?.tenantId;
+        const clientId = req.clientId || "default";
+
+        if (!tenantId) {
+            return next(createHttpError(401, "TENANT_NOT_FOUND"));
+        }
+
+        const profile = await TenantEcfProfile.findOne({
+            tenantId,
+            $or: [
+                { clientId },
+                { clientId: { $exists: false } },
+                { clientId: "default" },
+            ],
+        })
+            .select("enabled environment certificationStatus issuer certificate security documentTypes")
+            .lean();
+
+        const enabled = profile?.enabled === true;
+
+        const certificateReady =
+            profile?.security?.certificateUploaded === true ||
+            profile?.certificate?.isActive === true;
+
+        const issuerReady = Boolean(
+            profile?.issuer?.rnc &&
+            profile?.issuer?.legalName
+        );
+
+        const canIssue =
+            enabled &&
+            issuerReady &&
+            (
+                String(profile?.environment || "") === "internal_sandbox" ||
+                certificateReady
+            );
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                enabled,
+                canIssue,
+                environment: profile?.environment || null,
+                certificationStatus: profile?.certificationStatus || null,
+                issuerReady,
+                certificateReady,
+                documentTypes: profile?.documentTypes || null,
+            },
+        });
+    } catch (error) {
+        console.error("[getTenantEcfStatus] error:", error);
+        return next(createHttpError(500, "GET_TENANT_ECF_STATUS_FAILED"));
+    }
+};
 
 
+const getOrderEcfStatus = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return next(createHttpError(400, "INVALID_ORDER_ID"));
+        }
+
+        const tenantId = req.tenantId || req.user?.tenantId;
+        const clientId = req.clientId || "default";
+
+        if (!tenantId) {
+            return next(createHttpError(401, "TENANT_NOT_FOUND"));
+        }
+
+        const orderScope = {
+            _id: id,
+            tenantId,
+            $or: [
+                { clientId },
+                { clientId: { $exists: false } },
+                { clientId: "default" },
+            ],
+        };
+
+        const order = await Order.findOne(orderScope)
+            .select("_id tenantId clientId invoiceNumber facturaNo fiscal ncfNumber invoiceUrl invoicePath createdAt updatedAt")
+            .lean();
+
+        if (!order) {
+            return next(createHttpError(404, "ORDER_NOT_FOUND"));
+        }
+
+        const ecfDocument = await ElectronicTaxDocument.findOne({
+            tenantId,
+            orderId: id,
+            sourceDocumentType: "ORDER",
+            $or: [
+                { clientId },
+                { clientId: { $exists: false } },
+                { clientId: "default" },
+            ],
+        })
+            .sort({ createdAt: -1 })
+            .lean();
+
+        if (!ecfDocument) {
+            return res.status(200).json({
+                success: true,
+                exists: false,
+                data: {
+                    orderId: String(order._id),
+                    invoiceNumber: order.invoiceNumber || order.facturaNo || null,
+                    legacyNcfNumber: order?.fiscal?.ncfNumber || order?.ncfNumber || null,
+                    canIssue: true,
+                    message: "NO_ECF_FOUND_FOR_ORDER",
+                },
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            exists: true,
+            data: {
+                documentId: String(ecfDocument._id),
+                orderId: String(order._id),
+
+                eNCF: ecfDocument?.ecf?.eNCF || null,
+                documentType: ecfDocument?.ecf?.documentType || null,
+                sequenceNumber: ecfDocument?.ecf?.sequenceNumber || null,
+                status: ecfDocument?.ecf?.status || "draft",
+                trackId: ecfDocument?.ecf?.trackId || null,
+                securityCode: ecfDocument?.ecf?.securityCode || null,
+
+                issuer: ecfDocument?.issuer || null,
+                customer: ecfDocument?.customer || null,
+                totals: ecfDocument?.totals || null,
+
+                dgiiResponse: {
+                    code: ecfDocument?.dgiiResponse?.code || null,
+                    message: ecfDocument?.dgiiResponse?.message || null,
+                    receivedAt: ecfDocument?.dgiiResponse?.receivedAt || null,
+                },
+
+                timestampsFlow: ecfDocument?.timestampsFlow || null,
+
+                xml: {
+                    hasRaw: Boolean(ecfDocument?.xml?.raw),
+                    hasSigned: Boolean(ecfDocument?.xml?.signed),
+                    hash: ecfDocument?.xml?.hash || null,
+                },
+
+                issuedAt:
+                    ecfDocument?.timestampsFlow?.generatedAt ||
+                    ecfDocument?.createdAt ||
+                    null,
+
+                createdAt: ecfDocument?.createdAt || null,
+                updatedAt: ecfDocument?.updatedAt || null,
+            },
+        });
+    } catch (error) {
+        console.error("[getOrderEcfStatus] error:", error);
+        return next(createHttpError(500, "GET_ORDER_ECF_STATUS_FAILED"));
+    }
+};
 // Normaliza items y calcula price por ítem
 function normalizeAndPriceItems(items) {
     if (!Array.isArray(items)) return [];
@@ -391,6 +556,16 @@ const addOrder = async (req, res, next) => {
 
         const clientId = req.clientId;
 
+        const ecfProfileForTenant = await TenantEcfProfile.findOne({
+            tenantId,
+            $or: [
+                { clientId },
+                { clientId: { $exists: false } },
+                { clientId: "default" },
+            ],
+        }).lean();
+
+        const ecfEnabledForTenant = ecfProfileForTenant?.enabled === true;
         const {
             customerId = null,
             customerDetails = {},
@@ -404,7 +579,8 @@ const addOrder = async (req, res, next) => {
             fiscal: incomingFiscal = null,
             submitAction = "",
         } = req.body;
-
+        const normalizedPaymentMethod = String(paymentMethod || "Efectivo").trim();
+        const isCreditSale = normalizedPaymentMethod === "Credito";
         const normalizedStatus = normalizeOrderStatus(orderStatus);
         customerDetails.name = customerDetails.name || "";
 
@@ -441,15 +617,23 @@ const addOrder = async (req, res, next) => {
         const tipFeatureEnabled = features?.tip?.enabled !== false;
         const discountFeatureEnabled = features?.discount?.enabled !== false;
         const fiscalFeatureEnabled = tenant?.fiscal?.enabled === true;
-        const chargeMode = tenant?.features?.checkout?.chargeMode || "AT_COMPLETE";
 
-        const submitActionNormalized = String(submitAction || "").trim().toLowerCase();
-        const isInvoiceAction = submitActionNormalized === "invoice";
-        const isCompletionAction = normalizedStatus === "Completado";
+        const {
+            chargeMode,
+            isInvoiceAction,
+            shouldFinalize,
+            finalOrderStatus,
+        } = getOrderFinalizationDecision({
+            tenant,
+            submitAction,
+            requestedStatus: normalizedStatus,
+        });
+
+        const isCompletionAction = finalOrderStatus === "Completado";
+
 
         const isFinalizingOrder =
-            isInvoiceAction ||
-            isCompletionAction ||
+            shouldFinalize ||
             incomingFiscal?.requested === true;
 
         if (
@@ -463,25 +647,20 @@ const addOrder = async (req, res, next) => {
                 )
             );
         }
+        const incomingExplicitEcfType = String(incomingFiscal?.ecfDocumentType || "")
+            .trim()
+            .toLowerCase()
+            .replace(/^e/, "");
 
-        const shouldIssueInternalInvoice =
-            isInvoiceAction ||
+        const fiscalRequested =
             incomingFiscal?.requested === true ||
-            req.body?.markAsPaid === true ||
-            req.body?.paid === true ||
-            req.body?.isPaid === true ||
-            String(req.body?.paymentStatus || "").trim() === "Pagado";
+            incomingExplicitEcfType === "31";
 
+        const shouldIssueInternalInvoice = isInvoiceAction || shouldFinalize;
         let assignedInternalInvoice = null;
 
 
-        const shouldMarkPaidByInvoice =
-            chargeMode === "AT_INVOICE" && isInvoiceAction;
-
-        const shouldMarkPaidByCompletion =
-            chargeMode === "AT_COMPLETE" && normalizedStatus === "Completado";
-
-        const shouldMarkPaid = shouldMarkPaidByInvoice || shouldMarkPaidByCompletion;
+        const shouldMarkPaid = shouldFinalize;
 
         let fiscalPayload = {
             requested: false,
@@ -490,7 +669,7 @@ const addOrder = async (req, res, next) => {
 
         let topLevelNcfNumber = null;
 
-        if (incomingFiscal?.requested === true) {
+        if (!ecfEnabledForTenant && shouldFinalize && fiscalRequested) {
             if (!fiscalFeatureEnabled) {
                 return next(createHttpError(400, "FISCAL_NOT_ENABLED_FOR_TENANT"));
             }
@@ -533,6 +712,24 @@ const addOrder = async (req, res, next) => {
             };
 
             topLevelNcfNumber = ncfNumber;
+        }
+        if (ecfEnabledForTenant && fiscalRequested) {
+            const requestedEcfType = String(incomingFiscal?.ecfDocumentType || "")
+                .trim()
+                .toLowerCase()
+                .replace(/^e/, "");
+
+            const finalEcfDocumentType =
+                requestedEcfType ||
+                (String(incomingFiscal?.ncfType || "").toUpperCase() === "B01" ? "31" : "32");
+
+            fiscalPayload = {
+                ...(fiscalPayload || {}),
+                requested: finalEcfDocumentType === "31",
+                ncfType: finalEcfDocumentType === "31" ? "B01" : "B02",
+                ecfDocumentType: finalEcfDocumentType,
+                issuedAt: shouldIssueInternalInvoice ? new Date() : null,
+            };
         }
         if (shouldIssueInternalInvoice && !assignedInternalInvoice) {
             assignedInternalInvoice = await allocateInternalSeq({ tenantId });
@@ -698,16 +895,19 @@ const addOrder = async (req, res, next) => {
             .trim()
             .toUpperCase();
 
+        if (isCreditSale && !resolvedCustomerId) {
+            return next(createHttpError(400, "CUSTOMER_REQUIRED_FOR_CREDIT_SALE"));
+        }
+
         const payload = {
             tenantId,
             clientId,
             customerId: resolvedCustomerId,
             customerDetails: resolvedCustomerDetails,
-            orderStatus: normalizedStatus,
+            orderStatus: finalOrderStatus,
             isDraft,
             invoiceNumber: assignedInternalInvoice?.internalNumber || null,
             facturaNo: assignedInternalInvoice?.internalNumber || null,
-
 
             bills: {
                 subtotal,
@@ -731,14 +931,30 @@ const addOrder = async (req, res, next) => {
             commissionAmount,
             netTotal,
 
-
             items: normItems,
-            paymentMethod,
+            paymentMethod: normalizedPaymentMethod,
             registerId,
-            paymentStatus: shouldMarkPaid ? "Pagado" : "Pendiente",
-            paidAt: shouldMarkPaid ? new Date() : null,
-            paidBy: shouldMarkPaid ? (req.user?._id || null) : null,
-            invoicedAt: isInvoiceAction || incomingFiscal?.requested === true ? new Date() : null,
+
+            creditStatus: isCreditSale ? "pending" : "none",
+
+            paymentStatus: isCreditSale
+                ? "Pendiente"
+                : shouldMarkPaid
+                    ? "Pagado"
+                    : "Pendiente",
+
+            paidAt: isCreditSale
+                ? null
+                : shouldMarkPaid
+                    ? new Date()
+                    : null,
+
+            paidBy: isCreditSale
+                ? null
+                : shouldMarkPaid
+                    ? (req.user?._id || null)
+                    : null,
+            invoicedAt: shouldIssueInternalInvoice ? new Date() : null,
             ...(tableRef ? { table: tableRef } : {}),
             ...(req.user?._id ? { user: req.user._id } : {}),
         };
@@ -748,8 +964,8 @@ const addOrder = async (req, res, next) => {
 // Si la orden se creó con mesa y ya tiene items, marcar mesa ocupada
         if (tableRef && Array.isArray(payload.items) && payload.items.length > 0) {
             const shouldFreeTable =
-                normalizedStatus === "Completado" ||
-                normalizedStatus === "Cancelado";
+                finalOrderStatus === "Completado" ||
+                finalOrderStatus === "Cancelado";
 
             await Table.updateOne(
                 {
@@ -781,7 +997,7 @@ const addOrder = async (req, res, next) => {
             const invResult = await syncInventoryForOrderTiming({
                 orderId: order._id,
                 tenant,
-                orderStatus: normalizedStatus,
+                orderStatus: finalOrderStatus,
                 isInvoiceAction,
                 userId: req.user?._id || null,
             });
@@ -791,6 +1007,48 @@ const addOrder = async (req, res, next) => {
             }
         } catch (e) {
             console.error("INVENTORY SYNC ON ADD ORDER ERROR =>", e);
+        }
+        const autoEcfResult = await autoIssueEcfForOrderIfNeeded({
+            tenant,
+            tenantId,
+            clientId,
+            order: responseOrder,
+            submitAction,
+            orderStatus: finalOrderStatus,
+        });
+
+        if (autoEcfResult && !autoEcfResult.error) {
+            responseOrder = responseOrder.toObject ? responseOrder.toObject() : responseOrder;
+            responseOrder.ecf = {
+                exists: true,
+                ...autoEcfResult,
+            };
+        } else if (autoEcfResult?.error) {
+            responseOrder = responseOrder.toObject ? responseOrder.toObject() : responseOrder;
+            responseOrder.ecf = {
+                exists: false,
+                error: true,
+                message: autoEcfResult.message,
+                errors: autoEcfResult.errors || [],
+            };
+        }
+        if (isCreditSale && shouldIssueInternalInvoice) {
+            try {
+                const receivable = await createReceivableForOrder({
+                    order: responseOrder,
+                    userId: req.user?._id || null,
+                });
+
+                responseOrder = await Order.findById(order._id) || responseOrder;
+                responseOrder = responseOrder.toObject ? responseOrder.toObject() : responseOrder;
+
+                responseOrder.accountReceivable = receivable.toObject
+                    ? receivable.toObject()
+                    : receivable;
+            } catch (e) {
+                console.error("[CREATE_RECEIVABLE_ON_ADD_ORDER_FAILED]", e);
+                return next(e);
+            }
         }
 
         return res.status(201).json({
@@ -1042,6 +1300,31 @@ function getTenantChargeMode(tenant = {}) {
         ? mode
         : "AT_COMPLETE";
 }
+function getOrderFinalizationDecision({
+                                          tenant,
+                                          submitAction,
+                                          requestedStatus,
+                                      }) {
+    const chargeMode = getTenantChargeMode(tenant);
+    const normalizedStatus = normalizeOrderStatus(requestedStatus);
+    const isInvoiceAction =
+        String(submitAction || "").trim().toLowerCase() === "invoice";
+
+    const finalizesByInvoice =
+        chargeMode === "AT_INVOICE" && isInvoiceAction;
+
+    const finalizesByCompletion =
+        chargeMode === "AT_COMPLETE" && normalizedStatus === "Completado";
+
+    const shouldFinalize = finalizesByInvoice || finalizesByCompletion;
+
+    return {
+        chargeMode,
+        isInvoiceAction,
+        shouldFinalize,
+        finalOrderStatus: shouldFinalize ? "Completado" : normalizedStatus,
+    };
+}
 
 function shouldDeductInventoryNow({ tenant, orderStatus, isInvoiceAction }) {
     const chargeMode = getTenantChargeMode(tenant);
@@ -1064,6 +1347,123 @@ function shouldDeductInventoryNow({ tenant, orderStatus, isInvoiceAction }) {
     }
 
     return false;
+}
+function onlyDigits(value = "") {
+    return String(value || "").replace(/\D/g, "");
+}
+
+function determineEcfDocumentTypeForOrder(order) {
+    const rnc = onlyDigits(order?.customerDetails?.rnc);
+    const rncCedula = onlyDigits(order?.customerDetails?.rncCedula);
+    const buyerDoc = rnc || rncCedula;
+
+    const hasValidBuyerDoc = [9, 11].includes(buyerDoc.length);
+
+    const explicitEcfType = String(order?.fiscal?.ecfDocumentType || "")
+        .trim()
+        .toLowerCase()
+        .replace(/^e/, "");
+
+    const ncfType = String(order?.fiscal?.ncfType || "").toUpperCase();
+
+    const wantsFiscalCredit =
+        explicitEcfType === "31" ||
+        order?.fiscal?.requested === true ||
+        ncfType === "B01";
+
+    const total = Number(order?.bills?.totalWithTax || 0);
+
+    if (explicitEcfType === "32") {
+        if (total >= 250000 && !hasValidBuyerDoc) {
+            const err = new Error("E32_OVER_250K_REQUIRES_BUYER_DOCUMENT");
+            err.statusCode = 400;
+            throw err;
+        }
+
+        return "32";
+    }
+
+    if (wantsFiscalCredit) {
+        if (!hasValidBuyerDoc) {
+            const err = new Error("E31_REQUIRES_VALID_BUYER_DOCUMENT");
+            err.statusCode = 400;
+            throw err;
+        }
+
+        return "31";
+    }
+
+    if (total >= 250000 && !hasValidBuyerDoc) {
+        const err = new Error("E32_OVER_250K_REQUIRES_BUYER_DOCUMENT");
+        err.statusCode = 400;
+        throw err;
+    }
+
+    return "32";
+}
+function shouldAutoIssueEcfNow({
+                                   ecfProfile,
+                                   submitAction,
+                               }) {
+    if (ecfProfile?.enabled !== true) return false;
+
+    const isInvoiceAction =
+        String(submitAction || "").trim().toLowerCase() === "invoice";
+
+    return isInvoiceAction;
+}
+async function autoIssueEcfForOrderIfNeeded({
+                                                tenant,
+                                                tenantId,
+                                                clientId,
+                                                order,
+                                                submitAction,
+                                                orderStatus,
+                                            }) {
+    try {
+        if (!order?._id) return null;
+
+        const ecfProfile = await TenantEcfProfile.findOne({
+            tenantId,
+            $or: [
+                { clientId },
+                { clientId: { $exists: false } },
+                { clientId: "default" },
+            ],
+        });
+
+
+        const shouldIssue = shouldAutoIssueEcfNow({
+            ecfProfile,
+            submitAction,
+        });
+
+        if (!shouldIssue) return null;
+
+        const documentType = determineEcfDocumentTypeForOrder(order);
+
+        const result = await issueOrderAsEcfCore({
+            tenantId,
+            clientId,
+            orderId: order._id,
+            documentType,
+        });
+
+        return result?.data || null;
+    } catch (error) {
+        console.error("[AUTO_ECF_ISSUE_FAILED]", {
+            orderId: order?._id,
+            tenantId,
+            message: error?.message,
+            errors: error?.errors,
+        });
+
+        return {
+            error: true,
+            message: error?.message || "AUTO_ECF_ISSUE_FAILED",
+            errors: error?.errors || [],
+        };
+    }
 }
 
 async function syncInventoryForOrderTiming({
@@ -1155,16 +1555,55 @@ const updateOrder = async (req, res, next) => {
         // ✅ Orden actual primero (evita TDZ errors)
         const current = await Order.findOne(orderScope);
         if (!current) return next(createHttpError(404, "Order not found!"));
-        const submitAction = String(req.body?.submitAction || "").trim().toLowerCase();
-        const isInvoiceAction = submitAction === "invoice";
-        const shouldIssueInternalInvoice =
-            isInvoiceAction ||
-            req.body?.fiscal?.requested === true ||
-            req.body?.markAsPaid === true ||
-            req.body?.paid === true ||
-            req.body?.isPaid === true ||
-            String(req.body?.paymentStatus || "").trim() === "Pagado";
+        const normalizedIncomingPaymentMethod = String(
+            req.body?.paymentMethod ?? current?.paymentMethod ?? "Efectivo"
+        ).trim();
 
+        const isCreditSale = normalizedIncomingPaymentMethod === "Credito";
+        const ecfProfileForTenant = await TenantEcfProfile.findOne({
+            tenantId,
+            $or: [
+                { clientId },
+                { clientId: { $exists: false } },
+                { clientId: "default" },
+            ],
+        }).lean();
+
+        const ecfEnabledForTenant = ecfProfileForTenant?.enabled === true;
+        const submitAction = String(req.body?.submitAction || "").trim().toLowerCase();
+
+        const requestedStatusRaw = normalizeOrderStatus(
+            req.body.orderStatus ?? current.orderStatus
+        );
+
+        const {
+            chargeMode,
+            isInvoiceAction,
+            shouldFinalize,
+            finalOrderStatus,
+        } = getOrderFinalizationDecision({
+            tenant,
+            submitAction,
+            requestedStatus: requestedStatusRaw,
+        });
+
+        const incomingExplicitEcfType = String(req.body?.fiscal?.ecfDocumentType || "")
+            .trim()
+            .toLowerCase()
+            .replace(/^e/, "");
+
+        const currentExplicitEcfType = String(current?.fiscal?.ecfDocumentType || "")
+            .trim()
+            .toLowerCase()
+            .replace(/^e/, "");
+
+        const fiscalRequested =
+            req.body?.fiscal?.requested === true ||
+            current?.fiscal?.requested === true ||
+            incomingExplicitEcfType === "31" ||
+            currentExplicitEcfType === "31";
+
+        const shouldIssueInternalInvoice = isInvoiceAction || shouldFinalize;
         const prevStatus = current.orderStatus;
         const existingBills = current.bills || {};
 
@@ -1172,9 +1611,7 @@ const updateOrder = async (req, res, next) => {
         const isAdminUser = userRole === "admin";
 
         const currentStatusNormalized = normalizeOrderStatus(current.orderStatus);
-        const requestedStatusNormalized = normalizeOrderStatus(
-            req.body.orderStatus ?? current.orderStatus
-        );
+        const requestedStatusNormalized = finalOrderStatus;
         const isCancellingOrder =
             requestedStatusNormalized === "Cancelado" &&
             currentStatusNormalized !== "Cancelado";
@@ -1194,11 +1631,35 @@ const updateOrder = async (req, res, next) => {
         }
 
 // ---- construir safeUpdate ----
-        const fiscalFromClient = req.body.fiscal || {};
-        const fiscalSafeFromClient = {
-            requested: fiscalFromClient.requested,
-            ncfType: fiscalFromClient.ncfType,
-        };
+        const fiscalFromClient = req.body.fiscal || null;
+
+        const fiscalSafeFromClient = {};
+
+        if (
+            fiscalFromClient &&
+            Object.prototype.hasOwnProperty.call(fiscalFromClient, "requested")
+        ) {
+            fiscalSafeFromClient.requested = fiscalFromClient.requested === true;
+        }
+
+        if (
+            fiscalFromClient?.ncfType !== undefined &&
+            fiscalFromClient?.ncfType !== null &&
+            String(fiscalFromClient.ncfType).trim() !== ""
+        ) {
+            fiscalSafeFromClient.ncfType = String(fiscalFromClient.ncfType).trim().toUpperCase();
+        }
+
+        if (
+            fiscalFromClient?.ecfDocumentType !== undefined &&
+            fiscalFromClient?.ecfDocumentType !== null &&
+            String(fiscalFromClient.ecfDocumentType).trim() !== ""
+        ) {
+            fiscalSafeFromClient.ecfDocumentType = String(fiscalFromClient.ecfDocumentType)
+                .trim()
+                .toLowerCase()
+                .replace(/^e/, "");
+        }
         const safeUpdate = {
             customerDetails: {
                 ...(current.customerDetails || {}),
@@ -1216,6 +1677,40 @@ const updateOrder = async (req, res, next) => {
             },
         };
 
+        let nextCustomerId = current.customerId || null;
+
+        if (req.body.customerId) {
+            if (!mongoose.Types.ObjectId.isValid(req.body.customerId)) {
+                return next(createHttpError(400, "INVALID_CUSTOMER_ID"));
+            }
+
+            const foundCustomer = await Customer.findOne({
+                _id: req.body.customerId,
+                tenantId,
+                clientId,
+                isActive: true,
+            }).lean();
+
+            if (!foundCustomer) {
+                return next(createHttpError(404, "CUSTOMER_NOT_FOUND"));
+            }
+
+            nextCustomerId = foundCustomer._id;
+
+            safeUpdate.customerDetails = {
+                ...(safeUpdate.customerDetails || {}),
+                name: foundCustomer.name || safeUpdate.customerDetails?.name || "",
+                phone: foundCustomer.phone || safeUpdate.customerDetails?.phone || "",
+                address: foundCustomer.address || safeUpdate.customerDetails?.address || "",
+            };
+        }
+
+        if (isCreditSale && !nextCustomerId) {
+            return next(createHttpError(400, "CUSTOMER_REQUIRED_FOR_CREDIT_SALE"));
+        }
+
+        safeUpdate.customerId = nextCustomerId;
+        safeUpdate.paymentMethod = normalizedIncomingPaymentMethod;
         // compat tip
         if (safeUpdate.bills.tipAmount === undefined && safeUpdate.bills.tip !== undefined) {
             safeUpdate.bills.tipAmount = Number(safeUpdate.bills.tip);
@@ -1232,7 +1727,7 @@ const updateOrder = async (req, res, next) => {
         });
         const alreadyHasNCF = current?.fiscal?.ncfNumber || current?.ncfNumber;
 
-        if (fiscalFeatureEnabled && incomingFiscal?.requested === true && !alreadyHasNCF) {
+        if (!ecfEnabledForTenant && shouldFinalize && fiscalFeatureEnabled && fiscalRequested && !alreadyHasNCF) {
             const requestedType = incomingFiscal.ncfType || current?.fiscal?.ncfType || "B02";
 
             const { type, ncfNumber } = await allocateNCF({
@@ -1260,20 +1755,16 @@ const updateOrder = async (req, res, next) => {
             safeUpdate.ncfNumber = ncfNumber;
             safeUpdate.fiscal = {
                 ...(safeUpdate.fiscal || {}),
-                requested: true,
-                ncfType: type,
-                ncfNumber,
-                issuedAt: new Date(),
-                expirationDate: expirationDateISO, // <-- para que el front muestre "Vence (NCF)"
-
-                internalSeq,     // numero (1,2,3...)
-                internalNumber,  // string "00000001"
-                emissionPoint,
-                branchName,
+                requested: finalEcfDocumentType === "31",
+                ncfType: finalEcfDocumentType === "31" ? "B01" : "B02",
+                ecfDocumentType: finalEcfDocumentType,
+                issuedAt: shouldIssueInternalInvoice
+                    ? (safeUpdate?.fiscal?.issuedAt || new Date())
+                    : safeUpdate?.fiscal?.issuedAt || null,
             };
             safeUpdate.invoiceNumber = internalNumber;
             safeUpdate.facturaNo = internalNumber;
-        } else if (fiscalFeatureEnabled && incomingFiscal?.requested === true && alreadyHasNCF) {
+        } else if (!ecfEnabledForTenant && shouldFinalize && fiscalFeatureEnabled && fiscalRequested && alreadyHasNCF) {
             // Backfill por si la orden vieja tiene NCF pero le faltan campos
             const existingNcfNumber = String(
                 current?.fiscal?.ncfNumber ||
@@ -1292,6 +1783,7 @@ const updateOrder = async (req, res, next) => {
                 current?.fiscal?.ncfType ||
                 incomingFiscal?.ncfType ||
                 "B02";
+
 
         const expiresAtRaw =
             tenant?.fiscal?.ncfConfig?.[currentType]?.expiresAt ??
@@ -1336,6 +1828,40 @@ const updateOrder = async (req, res, next) => {
             getExistingInternalInvoiceNumber(current) ||
             getExistingInternalInvoiceNumber(safeUpdate);
 
+        if (ecfEnabledForTenant && fiscalRequested) {
+            const preservedEcfDocumentType = String(
+                incomingFiscal?.ecfDocumentType ||
+                safeUpdate?.fiscal?.ecfDocumentType ||
+                current?.fiscal?.ecfDocumentType ||
+                ""
+            )
+                .trim()
+                .toLowerCase()
+                .replace(/^e/, "");
+
+            const preservedNcfType = String(
+                incomingFiscal?.ncfType ||
+                safeUpdate?.fiscal?.ncfType ||
+                current?.fiscal?.ncfType ||
+                "B01"
+            )
+                .trim()
+                .toUpperCase();
+
+            const finalEcfDocumentType =
+                preservedEcfDocumentType ||
+                (preservedNcfType === "B01" ? "31" : "32");
+
+            safeUpdate.fiscal = {
+                ...(safeUpdate.fiscal || {}),
+                requested: finalEcfDocumentType === "31",
+                ncfType: finalEcfDocumentType === "31" ? "B01" : "B02",
+                ecfDocumentType: finalEcfDocumentType,
+                issuedAt: shouldFinalize
+                    ? (safeUpdate?.fiscal?.issuedAt || new Date())
+                    : safeUpdate?.fiscal?.issuedAt || null,
+            };
+        }
         if (shouldIssueInternalInvoice && !alreadyHasInternalInvoice) {
             const { internalSeq, internalNumber } = await allocateInternalSeq({ tenantId });
 
@@ -1349,7 +1875,7 @@ const updateOrder = async (req, res, next) => {
             safeUpdate.invoiceNumber = internalNumber;
             safeUpdate.facturaNo = internalNumber;
         }
-        if (incomingFiscal?.requested === true && !fiscalFeatureEnabled) {
+        if (!ecfEnabledForTenant && fiscalRequested && !fiscalFeatureEnabled) {
             return next(createHttpError(400, "FISCAL_NOT_ENABLED_FOR_TENANT"));
         }
 
@@ -1542,16 +2068,7 @@ const updateOrder = async (req, res, next) => {
             .trim()
             .toUpperCase();
 
-        const chargeMode = tenant?.features?.checkout?.chargeMode || "AT_COMPLETE";
-
-        const shouldMarkPaidByInvoice =
-            chargeMode === "AT_INVOICE" && isInvoiceAction;
-
-        const shouldMarkPaidByCompletion =
-            chargeMode === "AT_COMPLETE" && incomingStatus === "Completado";
-
-        const shouldMarkPaid = shouldMarkPaidByInvoice || shouldMarkPaidByCompletion;
-
+        const shouldMarkPaid = shouldFinalize && !isCreditSale;
 
         safeUpdate.registerId = incomingRegisterId;
 
@@ -1563,10 +2080,22 @@ const updateOrder = async (req, res, next) => {
 // pago automático según el modo del tenant
         if (incomingStatus === "Cancelado") {
             safeUpdate.paymentStatus = "Anulado";
+        } else if (isCreditSale) {
+            safeUpdate.paymentStatus = "Pendiente";
+            safeUpdate.creditStatus =
+                current.creditStatus && current.creditStatus !== "none"
+                    ? current.creditStatus
+                    : "pending";
+            safeUpdate.paidAt = null;
+            safeUpdate.paidBy = null;
         } else {
             safeUpdate.paymentStatus = shouldMarkPaid
                 ? "Pagado"
                 : current.paymentStatus || "Pendiente";
+
+            if (!current.accountReceivableId) {
+                safeUpdate.creditStatus = "none";
+            }
         }
 
         if (shouldMarkPaid && incomingStatus !== "Cancelado") {
@@ -1580,23 +2109,7 @@ const updateOrder = async (req, res, next) => {
             .populate("table", "tableNo status")
             .populate("user", "name email role");
 
-        try {
-            const invResult = await syncInventoryForOrderTiming({
-                orderId: order._id,
-                tenant,
-                orderStatus: incomingStatus,
-                isInvoiceAction,
-                userId: req.user?._id || null,
-            });
 
-            if (["deduct", "restore"].includes(invResult?.action)) {
-                order = await Order.findOne(orderScope)
-                    .populate("table", "tableNo status")
-                    .populate("user", "name email role") || order;
-            }
-        } catch (e) {
-            console.error("INVENTORY SYNC ERROR =>", e);
-        }
         // Si antes no tenía items y ahora sí tiene, ocupar la mesa
         const prevCount = Array.isArray(current.items) ? current.items.length : 0;
         const newCount = Array.isArray(order.items) ? order.items.length : 0;
@@ -1819,6 +2332,30 @@ const updateOrder = async (req, res, next) => {
 
         }
 
+        const autoEcfResult = await autoIssueEcfForOrderIfNeeded({
+            tenant,
+            tenantId,
+            clientId,
+            order,
+            submitAction,
+            orderStatus: incomingStatus,
+        });
+
+        if (autoEcfResult && !autoEcfResult.error) {
+            order = order.toObject ? order.toObject() : order;
+            order.ecf = {
+                exists: true,
+                ...autoEcfResult,
+            };
+        } else if (autoEcfResult?.error) {
+            order = order.toObject ? order.toObject() : order;
+            order.ecf = {
+                exists: false,
+                error: true,
+                message: autoEcfResult.message,
+                errors: autoEcfResult.errors || [],
+            };
+        }
 
         const io = req.app?.get?.("io");
         if (io) {
@@ -1846,6 +2383,28 @@ const updateOrder = async (req, res, next) => {
             });
         }
 
+        if (isCreditSale && shouldIssueInternalInvoice) {
+            try {
+                const receivable = await createReceivableForOrder({
+                    order,
+                    userId: req.user?._id || null,
+                });
+
+                const refreshedOrder = await Order.findOne(orderScope)
+                    .populate("table", "tableNo status")
+                    .populate("user", "name email role");
+
+                order = refreshedOrder || order;
+                order = order.toObject ? order.toObject() : order;
+
+                order.accountReceivable = receivable.toObject
+                    ? receivable.toObject()
+                    : receivable;
+            } catch (e) {
+                console.error("[CREATE_RECEIVABLE_ON_UPDATE_ORDER_FAILED]", e);
+                return next(e);
+            }
+        }
         return res.status(200).json({
             success: true,
             message: "Order updated successfully",
@@ -1861,29 +2420,64 @@ const updatePaymentMethod = async (req, res) => {
         const { id } = req.params;
         const { paymentMethod } = req.body;
 
-        if (!paymentMethod) {
+        const allowedPaymentMethods = [
+            "Efectivo",
+            "Tarjeta",
+            "Transferencia",
+            "Pedido Ya",
+            "Uber Eats",
+            "Otros",
+            "Credito",
+        ];
+
+        if (!allowedPaymentMethods.includes(paymentMethod)) {
             return res.status(400).json({
                 success: false,
-                message: "paymentMethod es requerido",
+                message: "INVALID_PAYMENT_METHOD",
             });
         }
 
-        const updated = await Order.findByIdAndUpdate(
-            id,
-            { $set: { paymentMethod } },
-            { new: true }
-        );
+        const current = await Order.findOne({
+            _id: id,
+            tenantId: req.tenantId || req.user?.tenantId,
+            $or: [
+                { clientId: req.clientId },
+                { clientId: { $exists: false } },
+                { clientId: "default" },
+            ],
+        });
 
-        if (!updated) {
+        if (!current) {
             return res.status(404).json({
                 success: false,
                 message: "Orden no encontrada",
             });
         }
 
+        if (paymentMethod === "Credito" && !current.customerId) {
+            return res.status(400).json({
+                success: false,
+                message: "CUSTOMER_REQUIRED_FOR_CREDIT_SALE",
+            });
+        }
+
+        current.paymentMethod = paymentMethod;
+
+        if (paymentMethod === "Credito") {
+            current.paymentStatus = "Pendiente";
+            current.paidAt = null;
+            current.paidBy = null;
+            current.creditStatus =
+                current.creditStatus && current.creditStatus !== "none"
+                    ? current.creditStatus
+                    : "pending";
+        }
+
+        await current.save();
+
         return res.json({
             success: true,
-            data: updated,
+            data: current,
         });
     } catch (err) {
         console.error("updatePaymentMethod error:", err);
@@ -1977,6 +2571,7 @@ const getSalesByProductReport = async (req, res) => {
         const modernPaid = {
             ...baseOrderFilter,
             paymentStatus: "Pagado",
+            orderStatus: "Completado",
             paidAt: { $gte: start, $lte: end },
         };
 
@@ -1994,20 +2589,12 @@ const getSalesByProductReport = async (req, res) => {
             createdAt: { $gte: start, $lte: end },
         };
 
-        const legacyInProgress = {
-            ...baseOrderFilter,
-            ...legacyPaymentStatusFilter,
-            orderStatus: "En Progreso",
-            "bills.totalWithTax": { $gt: 0 },
-            createdAt: { $gte: start, $lte: end },
-        };
 
         const match = {
             $or: [
                 modernPaid,
                 legacyCompleted,
                 legacyFiscal,
-                legacyInProgress,
             ],
         };
 
@@ -2360,10 +2947,11 @@ const sendOrderToProduction = async (req, res, next) => {
 
 
 
-
 module.exports = {
     addOrder,
     getOrderById,
+    getOrderEcfStatus,
+    getTenantEcfStatus,
     getOrders,
     updateOrder,
     deleteOrder,

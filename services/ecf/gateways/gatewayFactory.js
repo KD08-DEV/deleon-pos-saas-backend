@@ -1,4 +1,5 @@
 const internalEcfGateway = require("./internalEcfGateway");
+const dgiiGateway = require("./dgiiGateway");
 
 function getEcfGateway(environment) {
     if (environment === "internal_sandbox") {
@@ -6,11 +7,11 @@ function getEcfGateway(environment) {
     }
 
     if (environment === "dgii_certification") {
-        throw new Error("DGII certification gateway not implemented yet");
+        return dgiiGateway;
     }
 
     if (environment === "dgii_production") {
-        throw new Error("DGII production gateway not implemented yet");
+        return dgiiGateway;
     }
 
     throw new Error(`Unsupported ECF environment: ${environment}`);

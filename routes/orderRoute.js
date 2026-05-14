@@ -2,8 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const Order = require("../models/orderModel");
-const supabase = require("../config/supabaseClient");
-
+const { supabase } = require("../config/supabaseClient");
 // Middlewares
 const verifyToken = require("../middlewares/tokenVerification");
 const { tenantMiddleware } = require("../middlewares/tenantMiddleware");
@@ -13,6 +12,8 @@ const { issueOrderAsEcf } = require("../controllers/ecfIssueController");
 const {
     getOrders,
     getOrderById,
+    getOrderEcfStatus,
+    getTenantEcfStatus,
     addOrder,
     updateOrder,
     deleteOrder,
@@ -20,6 +21,7 @@ const {
     getSalesByProductReport,
     sendOrderToProduction,
 } = require("../controllers/orderController");
+
 router.get(
     "/report/sales-by-product",
     verifyToken,
@@ -125,6 +127,29 @@ router.get("/:id/invoice/download", async (req, res) => {
     }
 });
 
+
+/**
+ * GET /api/order/:id
+ */
+/**
+ * GET /api/order/ecf/status
+ */
+router.get(
+    "/ecf/status",
+    verifyToken,
+    tenantMiddleware,
+    getTenantEcfStatus
+);
+
+/**
+ * GET /api/order/:id/ecf
+ */
+router.get(
+    "/:id/ecf",
+    verifyToken,
+    tenantMiddleware,
+    getOrderEcfStatus
+);
 
 /**
  * GET /api/order/:id

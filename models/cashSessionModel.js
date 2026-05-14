@@ -43,6 +43,13 @@ const cashSessionSchema = new mongoose.Schema(
 
         notes: { type: String, default: "" },
         closing: {
+            creditSales: { type: Number, default: 0 },
+
+            receivablePaymentsCash: { type: Number, default: 0 },
+            receivablePaymentsCard: { type: Number, default: 0 },
+            receivablePaymentsTransfer: { type: Number, default: 0 },
+            receivablePaymentsOther: { type: Number, default: 0 },
+            receivablePaymentsTotal: { type: Number, default: 0 },
             breakdown: { type: [denomSchema], default: [] },
             countedTotal: { type: Number, default: 0 },
             expectedCashSales: { type: Number, default: 0 },

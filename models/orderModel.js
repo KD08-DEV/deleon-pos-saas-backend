@@ -120,6 +120,11 @@ const orderSchema = new mongoose.Schema(
         },
         // --- FACTURACIÓN FISCAL (NCF) ---
         fiscal: {
+            ecfDocumentType: {
+                type: String,
+                enum: ["31", "32", "33", "34", null],
+                default: null,
+            },
             requested: { type: Boolean, default: false },
             ncfType: { type: String, default: "B02" },
             ncfNumber: { type: String, default: null },
@@ -152,8 +157,33 @@ const orderSchema = new mongoose.Schema(
             required: false,
             default: null,
         },
-        paymentMethod: { type: String, enum: ["Efectivo", "Tarjeta", "Transferencia", "Pedido Ya", "Uber Eats", "Otros"], default: "Efectivo" },
-        user: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // quien creó la orden
+        paymentMethod: {
+            type: String,
+            enum: [
+                "Efectivo",
+                "Tarjeta",
+                "Transferencia",
+                "Pedido Ya",
+                "Uber Eats",
+                "Otros",
+                "Credito",
+            ],
+            default: "Efectivo",
+        },
+
+        creditStatus: {
+            type: String,
+            enum: ["none", "pending", "partial", "paid"],
+            default: "none",
+            index: true,
+        },
+
+        accountReceivableId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "AccountReceivable",
+            default: null,
+            index: true,
+        },        user: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // quien creó la orden
     },
     { timestamps: true }
 );

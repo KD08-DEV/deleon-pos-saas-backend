@@ -5,7 +5,6 @@ const verifyToken = require("../middlewares/tokenVerification");
 const requireScope = require("../middlewares/scope");
 const requireRole = require("../middlewares/requireRole");
 const { requireFeature } = require("../middlewares/requirePlan");
-const requirePermission = require("../middlewares/requirePermission");
 
 const inventoryController = require("../controllers/inventoryController");
 const inventoryExportController = require("../controllers/inventoryExportController");
@@ -20,36 +19,58 @@ const requireFeatureOrSuper = (featureKey) => {
     };
 };
 
-// Base chain
+// =======================
+// BASE CHAIN
+// =======================
+
 router.use(verifyToken);
 
-// Scope valida tenant activo + membership
+// Scope valida tenant activo + membership.
+// Si el usuario pertenece al tenant, puede entrar a las rutas de lectura.
 router.use(requireScope({ level: "tenant" }));
-
-// Plan gate: Estándar / Premium / Pro según planTiers.js
-router.use(requireFeatureOrSuper("inventory"));
 
 // =======================
 // LECTURA DE INVENTARIO
+// DISPONIBLE PARA TODOS LOS USUARIOS ACTIVOS DEL TENANT
+// SIN IMPORTAR ROL NI PLAN
 // =======================
 
 router.get(
     "/items",
-    requireRole("Owner", "Admin", "Cajera", "Camarero", "Cocina"),
     inventoryController.listItems
 );
 
 router.get(
     "/movements",
-    requireRole("Owner", "Admin", "Cajera", "Camarero", "Cocina"),
     inventoryController.listMovements
 );
 
 router.get(
     "/low-stock",
-    requireRole("Owner", "Admin", "Cajera", "Camarero", "Cocina"),
     inventoryController.lowStock
 );
+
+router.get(
+    "/consumption",
+    inventoryController.consumption
+);
+
+router.get(
+    "/merma/batches",
+    inventoryController.listMermaBatches
+);
+
+router.get(
+    "/merma/summary",
+    inventoryController.getMermaSummary
+);
+
+// =======================
+// DESDE AQUÍ SÍ APLICA EL PLAN DE INVENTARIO
+// Estándar / Premium / Pro según planTiers.js
+// =======================
+
+router.use(requireFeatureOrSuper("inventory"));
 
 // =======================
 // ARTÍCULOS DE INVENTARIO
@@ -85,14 +106,15 @@ router.patch(
 // MOVIMIENTOS DE INVENTARIO
 // =======================
 
-// Permite a Owner/Admin siempre.
-// Permite a una Cajera/Camarero/Cocina solo si tiene permission inventory.entry.
-// IMPORTANTE: en inventoryController.createMovement también debes validar que,
-// si no es Owner/Admin, solo pueda mandar type: "purchase".
+// La validación fina de permisos está dentro de inventoryController.createMovement.
+// Owner/Admin siempre pueden.
+// Cajera/Camarero/Cocina dependen de permissions:
+// inventory.entry, inventory.exit, inventory.adjust, inventory.waste.
 router.post(
     "/movements",
     inventoryController.createMovement
 );
+
 // Yield / rendimiento sigue solo Owner/Admin
 router.post(
     "/movements/yield",
@@ -117,16 +139,6 @@ router.get(
 );
 
 // =======================
-// CONSUMO
-// =======================
-
-router.get(
-    "/consumption",
-    requireRole("Owner", "Admin", "Cajera"),
-    inventoryController.consumption
-);
-
-// =======================
 // MERMA
 // =======================
 
@@ -144,12 +156,6 @@ router.post(
     inventoryController.createMermaBatch
 );
 
-router.get(
-    "/merma/batches",
-    requireRole("Owner", "Admin", "Cajera"),
-    inventoryController.listMermaBatches
-);
-
 router.patch(
     "/merma/batches/:id",
     requireRole("Owner", "Admin"),
@@ -160,12 +166,6 @@ router.patch(
     "/merma/batches/:id/close",
     requireRole("Owner", "Admin"),
     inventoryController.closeMermaBatch
-);
-
-router.get(
-    "/merma/summary",
-    requireRole("Owner", "Admin", "Cajera"),
-    inventoryController.getMermaSummary
 );
 
 module.exports = router;

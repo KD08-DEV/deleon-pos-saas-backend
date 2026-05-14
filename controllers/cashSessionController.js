@@ -2,6 +2,10 @@
 const createHttpError = require("http-errors");
 const CashSession = require("../models/cashSessionModel");
 const Order = require("../models/orderModel"); // agrega arriba
+const {
+    summarizeReceivablePaymentsForCash,
+    summarizeCreditSalesForCash,
+} = require("./accountReceivableController");
 
 const getRangeForDay = (dateYMD) => {
     const tzOffset = process.env.REPORT_TZ_OFFSET || "-04:00"; // República Dominicana
@@ -50,6 +54,7 @@ function buildLegacyCashOrdersFilter({ tenantId, clientId, registerId, start, en
         $or: [
             {
                 paymentStatus: "Pagado",
+                orderStatus: "Completado",
                 paidAt: { $gte: start, $lte: end },
             },
             {
@@ -190,16 +195,51 @@ const closeCashSession = async (req, res, next) => {
                 .reduce((s, o) => s + (Number(o.bills?.totalWithTax) || 0), 0)
                 .toFixed(2)
         );
+        const receivablePaymentsSummary = await summarizeReceivablePaymentsForCash({
+            tenantId,
+            clientId,
+            registerId,
+            start,
+            end,
+            userId,
+            role,
+        });
+
+        const creditSalesSummary = await summarizeCreditSalesForCash({
+            tenantId,
+            clientId,
+            registerId,
+            start,
+            end,
+            userId,
+            role,
+        });
+
+        const receivablePaymentsCash = Number(receivablePaymentsSummary?.byMethod?.Efectivo || 0);
+        const receivablePaymentsCard = Number(receivablePaymentsSummary?.byMethod?.Tarjeta || 0);
+        const receivablePaymentsTransfer = Number(receivablePaymentsSummary?.byMethod?.Transferencia || 0);
+        const receivablePaymentsOther = Number(receivablePaymentsSummary?.byMethod?.Otros || 0);
+        const receivablePaymentsTotal = Number(receivablePaymentsSummary?.total || 0);
+        const creditSales = Number(creditSalesSummary?.total || 0);
         if (!Number.isFinite(openingInitial)) return next(createHttpError(400, "OPENING_NOT_SET"));
 
         // efectivo esperado en caja = fondo inicial + agregado + ventas en efectivo
-        const expectedInRegister = Number((openingInitial + addedTotal + expectedCashSales).toFixed(2));
+        const expectedInRegister = Number(
+            (openingInitial + addedTotal + expectedCashSales + receivablePaymentsCash).toFixed(2)
+        );
 
         const difference = Number((countedTotal - expectedInRegister).toFixed(2));
 
         session.closing = {
             ...session.closing,
             expectedCashSales,
+            creditSales,
+
+            receivablePaymentsCash,
+            receivablePaymentsCard,
+            receivablePaymentsTransfer,
+            receivablePaymentsOther,
+            receivablePaymentsTotal,
             expectedInRegister,
             countedTotal,
             difference,
@@ -963,7 +1003,7 @@ const adjustCashSessionClosing = async (req, res, next) => {
             registerId,
             paidAt: { $gte: start, $lte: end },
             paymentStatus: "Pagado",
-            orderStatus: { $ne: "Cancelado" },
+            orderStatus: "Completado",
         }).select("paymentMethod paymentMethodType paymentMethodReal deliveryPaymentMethod payment.method paidWith bills.totalWithTax registerId paidAt");
 
         const expectedCashSales = Number(
@@ -984,6 +1024,7 @@ const adjustCashSessionClosing = async (req, res, next) => {
 
         session.closing = {
             ...session.closing,
+
             breakdown,
             countedTotal,
             expectedCashSales,

@@ -4,9 +4,10 @@ const path = require("path");
 
 const Order = require("../models/orderModel");
 const Tenant = require("../models/tenantModel");
+const QRCode = require("qrcode");
 
 const { supabase } = require("../config/supabaseClient"); // ajusta si tu import es distinto
-
+const ElectronicTaxDocument = require("../models/electronicTaxDocumentModel");
 
 // ---------- helpers ----------
 const normalizeMongoDate = (val) => {
@@ -102,6 +103,33 @@ async function generateInvoicePDF(orderId, tenantId) {
         const tenant = await Tenant.findOne({ tenantId });
         if (!tenant) throw new Error("Tenant no encontrado para generar PDF.");
 
+        const ecfDoc = await ElectronicTaxDocument.findOne({
+            tenantId,
+            orderId: order._id,
+            sourceDocumentType: "ORDER",
+        }).sort({ createdAt: -1 }).lean();
+
+        const hasEcf = Boolean(ecfDoc?.ecf?.eNCF);
+
+        const ecfStatusLabelMap = {
+            draft: "Borrador",
+            xml_generated: "XML generado",
+            signed: "Firmado",
+            submitted: "Enviado",
+            track_received: "Track recibido",
+            accepted: "Aceptado",
+            accepted_with_observation: "Aceptado con observación",
+            rejected: "Rechazado",
+            cancelled: "Cancelado",
+        };
+
+        const ecfENCF = ecfDoc?.ecf?.eNCF || "";
+        const ecfStatus = ecfStatusLabelMap[ecfDoc?.ecf?.status] || ecfDoc?.ecf?.status || "";
+        const ecfTrackId = ecfDoc?.ecf?.trackId || "";
+        const ecfSecurityCode = ecfDoc?.ecf?.securityCode || "";
+        const ecfQrUrl = ecfDoc?.ecf?.qrUrl || "";
+        const ecfFechaHoraFirma = ecfDoc?.ecf?.fechaHoraFirma || "";
+
         // ----- fiscal fields -----
         const fiscal = order?.fiscal || {};
         const hasNCF = Boolean(fiscal?.ncfNumber || order?.ncfNumber);
@@ -149,9 +177,13 @@ async function generateInvoicePDF(orderId, tenantId) {
             Boolean(fiscal?.preInvoice) ||
             Boolean(tenant?.features?.preInvoice?.enabled);
 
-        const invoiceTitle = hasNCF
-            ? "Factura con Comprobante Fiscal"
-            : (isPreInvoice ? "PreFactura" : "Factura para Consumidor Final");
+        const invoiceTitle = hasEcf
+            ? "Factura Electrónica e-CF"
+            : hasNCF
+                ? "Factura con Comprobante Fiscal"
+                : isPreInvoice
+                    ? "PreFactura"
+                    : "Factura para Consumidor Final";
 
         const ncfLabel = NCF_TYPE_LABEL[ncfType] ? `${ncfType} - ${NCF_TYPE_LABEL[ncfType]}` : ncfType;
 
@@ -227,10 +259,22 @@ async function generateInvoicePDF(orderId, tenantId) {
         doc.moveDown(1);
         doc.fontSize(18).text(invoiceTitle, { align: "center" });
 
-        if (hasNCF) {
+        if (hasEcf) {
+            doc.moveDown(0.5);
+            doc.fontSize(11).text(`eNCF: ${ecfENCF}`, { align: "center" });
+            if (ecfStatus) doc.fontSize(10).text(`Estado e-CF: ${ecfStatus}`, { align: "center" });
+            if (ecfTrackId) doc.fontSize(9).text(`TrackId: ${ecfTrackId}`, { align: "center" });
+        } else if (hasNCF) {
             doc.moveDown(0.5);
             doc.fontSize(11).text(`Tipo NCF: ${ncfLabel}`, { align: "center" });
             doc.fontSize(11).text(`NCF: ${ncfNumber}`, { align: "center" });
+        }
+        if (ecfSecurityCode) {
+            doc.fontSize(9).text(`Código de seguridad: ${ecfSecurityCode}`, { align: "center" });
+        }
+
+        if (ecfFechaHoraFirma) {
+            doc.fontSize(9).text(`Fecha firma: ${ecfFechaHoraFirma}`, { align: "center" });
         }
 
         doc.moveDown(1);
@@ -242,12 +286,17 @@ async function generateInvoicePDF(orderId, tenantId) {
 
         doc.text(`Factura No.: ${internalNumber || "N/A"}`);
 
-        if (hasNCF) {
-            doc.text(`Sucursal: ${branchName} · Punto de emision: ${emissionPoint}`);
-        }
+        doc.text(`Sucursal: ${branchName} · Punto de emision: ${emissionPoint}`);
 
-        doc.text(`Fecha/Hora: ${formatDateTimeDO(order?.createdAt)}`);
-        if (hasNCF) doc.text(`Fecha de Vencimiento: ${formatDateUTC(expirationDate)}`);
+        doc.text(`Fecha/Hora: ${formatDateTimeDO(order?.invoicedAt || order?.paidAt || order?.createdAt)}`);
+
+        if (hasEcf) {
+            doc.text(`eNCF: ${ecfENCF || "N/A"}`);
+            doc.text(`Estado e-CF: ${ecfStatus || "N/A"}`);
+            doc.text(`TrackId: ${ecfTrackId || "N/A"}`);
+        } else if (hasNCF) {
+            doc.text(`Fecha de Vencimiento: ${formatDateUTC(expirationDate)}`);
+        }
 
         doc.moveDown(0.5);
         doc.text(`Cliente: ${customerName}`);
@@ -314,6 +363,38 @@ async function generateInvoicePDF(orderId, tenantId) {
         doc.font("Helvetica-Bold").text(`Total a pagar: ${moneyRD(totalToPay)}`);
         doc.font("Helvetica").text(`Método de pago: ${order?.paymentMethod || "N/A"}`);
 
+        if (hasEcf && ecfQrUrl) {
+            doc.moveDown(1);
+
+            try {
+                const qrBuffer = await QRCode.toBuffer(ecfQrUrl, {
+                    type: "png",
+                    width: 140,
+                    margin: 1,
+                });
+
+                const qrX = (doc.page.width - 120) / 2;
+
+                doc.image(qrBuffer, qrX, doc.y, {
+                    width: 120,
+                    height: 120,
+                });
+
+                doc.moveDown(8);
+                doc.fontSize(8).text("Consulta e-CF DGII", {
+                    align: "center",
+                });
+
+                if (ecfSecurityCode) {
+                    doc.fontSize(8).text(`Código de seguridad: ${ecfSecurityCode}`, {
+                        align: "center",
+                    });
+                }
+            } catch (qrError) {
+                console.error("[PDF] Error generando QR e-CF:", qrError);
+                doc.fontSize(8).text(`Consulta e-CF: ${ecfQrUrl}`);
+            }
+        }
 
         doc.end();
 
