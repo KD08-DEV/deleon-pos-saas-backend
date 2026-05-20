@@ -240,12 +240,13 @@ const closeCashSession = async (req, res, next) => {
             receivablePaymentsTransfer,
             receivablePaymentsOther,
             receivablePaymentsTotal,
+
+            breakdown,
             expectedInRegister,
             countedTotal,
             difference,
             note,
             managerCodeHint: codeHint,
-
         };
 
         // IMPORTANTE: duplicar nota aquí para que “aparezca” si tu UI usa session.notes
@@ -308,7 +309,14 @@ const getScope = (req) => {
         req.query?.clientId ||
         "default";
 
-    const userId = req.user?._id || null;
+    const userId =
+        req.user?._id ||
+        req.user?.id ||
+        req.user?.userId ||
+        req.user?.sub ||
+        req.user?.user?._id ||
+        req.user?.user?.id ||
+        null;
     const role = req.user?.role || req.scope?.membership?.role || null;
 
     return { tenantId, clientId, userId, role };
@@ -344,9 +352,15 @@ const getRegisterIdFromReadReq = (req) => {
 };
 
 const getRegisterIdFromWriteReq = (req) => {
-    return String(req.query?.registerId || req.body?.registerId || "MAIN")
+    const reg = String(req.body?.registerId || req.query?.registerId || "")
         .trim()
         .toUpperCase();
+
+    if (!reg || reg === ALL_REGISTERS_ID) {
+        throw createHttpError(400, "MISSING_REGISTER_ID_FOR_CASH_SESSION");
+    }
+
+    return reg;
 };
 
 const ALL_REGISTERS_ID = "__ALL_REGISTERS__";
@@ -379,25 +393,23 @@ const isAdminLikeRole = (role) =>
     ["Owner", "Admin", "SuperAdmin"].includes(String(role || "").trim());
 
 function buildCashierSessionFilter({ role, userId, cashierId = null }) {
-    // Admin/Owner puede ver todas o filtrar una cajera específica si luego mandas cashierId.
     if (isAdminLikeRole(role)) {
         if (cashierId) return { openedBy: cashierId };
         return {};
     }
 
-    // Cajera solo debe ver su propia caja.
     if (userId) return { openedBy: userId };
 
-    return { openedBy: null };
+    // Seguridad: si una cajera no trae userId válido,
+    // NO debe leer ni crear una sesión compartida con openedBy:null.
+    return { _id: { $exists: false } };
 }
 
 function buildCashierOrdersFilter({ role, userId }) {
     if (isAdminLikeRole(role)) return {};
 
     if (!userId) {
-        return {
-            paidBy: null,
-        };
+        return { _id: { $exists: false } };
     }
 
     return {
@@ -435,6 +447,8 @@ const getCashSessionByDate = async (req, res, next) => {
         })
             .sort({ updatedAt: -1, createdAt: -1 })
             .populate("openedBy", "name role")
+            .populate("closedBy", "name role")
+            .populate("closing.adjustedBy", "name role")
             .populate("movements.by", "name role");
 
         dbg("[GET cash-session] response", { found: !!session });
@@ -514,6 +528,7 @@ const getCashSessionsRange = async (req, res, next) => {
             )
             .populate("openedBy", "name role")
             .populate("closedBy", "name role")
+            .populate("closing.adjustedBy", "name role")
             .populate("movements.by", "name role");
 
         const normalizedSessions = sessions.map((s) => {
@@ -624,8 +639,8 @@ const openCashSession = async (req, res, next) => {
             tenantId,
             clientId,
             dateYMD: { $lt: dateYMD },
+            registerId,
             status: "OPEN",
-            ...buildLegacyRegisterReadFilter(registerId),
             ...cashierFilter,
         }).sort({ dateYMD: -1, updatedAt: -1, createdAt: -1 });
 
@@ -642,7 +657,7 @@ const openCashSession = async (req, res, next) => {
             tenantId,
             clientId,
             dateYMD,
-            ...buildLegacyRegisterReadFilter(registerId),
+            registerId,
             ...cashierFilter,
         }).sort({ updatedAt: -1, createdAt: -1 });
 
@@ -722,6 +737,10 @@ const openCashSession = async (req, res, next) => {
     } catch (err) {
         dbg("[POST open] ERROR", err);
 
+        if (err?.status || err?.statusCode) {
+            return next(err);
+        }
+
         if (err?.code === 11000) {
             return next(createHttpError(409, "SESSION_ALREADY_EXISTS"));
         }
@@ -793,9 +812,28 @@ const addCashToSession = async (req, res, next) => {
             const expectedCashSales = Number(session.closing.expectedCashSales || 0);
             const countedTotal = Number(session.closing.countedTotal || 0);
 
-            const expectedInRegister = Number((openingInitial + addedTotal + expectedCashSales).toFixed(2));
-            const difference = Number((countedTotal - expectedInRegister).toFixed(2));
+            const { start, end } = getRangeForDay(dateYMD);
+            const receivablePaymentsSummary = await summarizeReceivablePaymentsForCash({
+                tenantId,
+                clientId,
+                registerId,
+                start,
+                end,
+                userId,
+                role,
+            });
 
+            const receivablePaymentsCash = Number(receivablePaymentsSummary?.byMethod?.Efectivo || 0);
+            const receivablePaymentsCard = Number(receivablePaymentsSummary?.byMethod?.Tarjeta || 0);
+            const receivablePaymentsTransfer = Number(receivablePaymentsSummary?.byMethod?.Transferencia || 0);
+            const receivablePaymentsOther = Number(receivablePaymentsSummary?.byMethod?.Otros || 0);
+            const receivablePaymentsTotal = Number(receivablePaymentsSummary?.total || 0);
+
+            const expectedInRegister = Number(
+                (openingInitial + addedTotal + expectedCashSales + receivablePaymentsCash).toFixed(2)
+            );
+
+            const difference = Number((countedTotal - expectedInRegister).toFixed(2));
             session.closing.expectedInRegister = expectedInRegister;
             session.closing.difference = difference;
         }
@@ -814,11 +852,21 @@ const addCashToSession = async (req, res, next) => {
 const adjustOpeningFloat = async (req, res, next) => {
     try {
         const { tenantId, clientId, userId, role } = getScope(req);
-        const isAdmin = role === "Admin" || role === "Owner";
-        if (!isAdmin) return next(createHttpError(403, "FORBIDDEN"));
+        const isAdmin = isAdminLikeRole(role);
 
         if (!tenantId) return next(createHttpError(400, "MISSING_TENANT_ID"));
         if (!clientId) return next(createHttpError(400, "MISSING_CLIENT_ID"));
+
+        if (!isAdmin && !userId) {
+            return next(createHttpError(401, "MISSING_USER_ID_FOR_CASH_SESSION"));
+        }
+
+// Si no es admin, debe autorizar con código manager.
+        let codeHint = "";
+        if (!isAdmin) {
+            const result = await assertManagerCode(req, tenantId);
+            codeHint = result.codeHint;
+        }
 
         const dateYMD = getDateFromReq(req);
         const registerId = getRegisterIdFromWriteReq(req);
@@ -840,14 +888,20 @@ const adjustOpeningFloat = async (req, res, next) => {
         // Usamos filtro compatible para MAIN/default/sesiones viejas
         const registerFilter = buildLegacyRegisterReadFilter(registerId);
 
+        const cashierFilter = buildCashierSessionFilter({ role, userId });
+
         const session = await CashSession.findOne({
             tenantId,
             clientId,
             dateYMD,
             ...registerFilter,
+            ...cashierFilter,
         }).sort({ updatedAt: -1, createdAt: -1 });
 
         if (!session) return next(createHttpError(404, "SESSION_NOT_FOUND"));
+        if (!isAdmin && String(session.status || "").toUpperCase() === "CLOSED") {
+            return next(createHttpError(409, "SESSION_CLOSED"));
+        }
 
         const previousOpeningFloat = Number(session.openingFloatInitial || 0);
         const note = String(req.body?.note || "");
@@ -881,7 +935,13 @@ const adjustOpeningFloat = async (req, res, next) => {
             type: "ADJUST",
             amount: Number(openingFloat.toFixed(2)),
             by: userId,
-            note: note || `Fondo inicial ajustado de ${previousOpeningFloat} a ${openingFloat}`,
+            note:
+                note ||
+                (
+                    isAdmin
+                        ? `Fondo inicial ajustado de ${previousOpeningFloat} a ${openingFloat}`
+                        : `Fondo inicial ajustado con autorización manager ${codeHint}`
+                ),
         });
 
         // 4) Si la caja ya estaba cerrada, recalcula el cierre esperado
@@ -973,8 +1033,23 @@ const adjustCashSessionClosing = async (req, res, next) => {
         if (!session) return next(createHttpError(404, "SESSION_NOT_FOUND"));
         if (session.status !== "CLOSED") return next(createHttpError(409, "SESSION_NOT_CLOSED"));
 
-        let breakdown = Array.isArray(req.body?.breakdown) ? req.body.breakdown : [];
-        const note = String(req.body?.note || session.closing?.note || "");
+        const normalizeBreakdown = (items = []) => {
+            return items
+                .map((d) => {
+                    const value = Number(d?.value);
+                    const count = Number(d?.count);
+
+                    return {
+                        label: String(d?.label || `RD$ ${value}`).trim(),
+                        value,
+                        count,
+                    };
+                })
+                .filter((d) => Number.isFinite(d.value) && d.value > 0 && Number.isFinite(d.count) && d.count > 0);
+        };
+
+        let breakdown = normalizeBreakdown(Array.isArray(req.body?.breakdown) ? req.body.breakdown : []);
+        const note = String(req.body?.note || "").trim();
 
         // Parse countedTotal como en closeCashSession
         let countedTotal = coerceMoney(req.body?.countedTotal);
@@ -1015,7 +1090,26 @@ const adjustCashSessionClosing = async (req, res, next) => {
         const openingInitial = Number(session?.openingFloatInitial || 0);
         const addedTotal = Number(session?.addedFloatTotal || 0);
 
-        const expectedInRegister = Number((openingInitial + addedTotal + expectedCashSales).toFixed(2));
+        const receivablePaymentsSummary = await summarizeReceivablePaymentsForCash({
+            tenantId,
+            clientId,
+            registerId,
+            start,
+            end,
+            userId,
+            role,
+        });
+
+        const receivablePaymentsCash = Number(receivablePaymentsSummary?.byMethod?.Efectivo || 0);
+        const receivablePaymentsCard = Number(receivablePaymentsSummary?.byMethod?.Tarjeta || 0);
+        const receivablePaymentsTransfer = Number(receivablePaymentsSummary?.byMethod?.Transferencia || 0);
+        const receivablePaymentsOther = Number(receivablePaymentsSummary?.byMethod?.Otros || 0);
+        const receivablePaymentsTotal = Number(receivablePaymentsSummary?.total || 0);
+
+        const expectedInRegister = Number(
+            (openingInitial + addedTotal + expectedCashSales + receivablePaymentsCash).toFixed(2)
+        );
+
         const difference = Number((countedTotal - expectedInRegister).toFixed(2));
 
 
@@ -1028,6 +1122,13 @@ const adjustCashSessionClosing = async (req, res, next) => {
             breakdown,
             countedTotal,
             expectedCashSales,
+
+            receivablePaymentsCash,
+            receivablePaymentsCard,
+            receivablePaymentsTransfer,
+            receivablePaymentsOther,
+            receivablePaymentsTotal,
+
             expectedInRegister,
             difference,
             note,
@@ -1035,7 +1136,6 @@ const adjustCashSessionClosing = async (req, res, next) => {
             adjustedBy: userId,
             managerCodeHint: codeHint,
             previousCountedTotal: previous,
-
         };
 
         session.notes = note;

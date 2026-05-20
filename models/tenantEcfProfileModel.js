@@ -50,15 +50,22 @@ const tenantEcfProfileSchema = new mongoose.Schema(
             mimeType: { type: String, default: null },
             uploadedAt: { type: Date, default: null },
             uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+
             passwordEncrypted: { type: String, default: null },
+            passwordValidated: { type: Boolean, default: false },
+            passwordValidatedAt: { type: Date, default: null },
+
             isActive: { type: Boolean, default: false },
+
             validFrom: { type: Date, default: null },
             validTo: { type: Date, default: null },
             serialNumber: { type: String, default: null },
             thumbprint: { type: String, default: null },
-        },
 
+            validationError: { type: String, default: null },
+        },
         documentTypes: {
+            // Ventas normales
             e31: {
                 enabled: { type: Boolean, default: true },
                 nextSequence: { type: Number, default: 1 },
@@ -67,11 +74,39 @@ const tenantEcfProfileSchema = new mongoose.Schema(
                 enabled: { type: Boolean, default: true },
                 nextSequence: { type: Number, default: 1 },
             },
+
+            // Ajustes
             e33: {
-                enabled: { type: Boolean, default: false },
+                enabled: { type: Boolean, default: true },
                 nextSequence: { type: Number, default: 1 },
             },
             e34: {
+                enabled: { type: Boolean, default: true },
+                nextSequence: { type: Number, default: 1 },
+            },
+
+            // Comprobantes especiales
+            e41: {
+                enabled: { type: Boolean, default: false },
+                nextSequence: { type: Number, default: 1 },
+            },
+            e43: {
+                enabled: { type: Boolean, default: false },
+                nextSequence: { type: Number, default: 1 },
+            },
+            e44: {
+                enabled: { type: Boolean, default: false },
+                nextSequence: { type: Number, default: 1 },
+            },
+            e45: {
+                enabled: { type: Boolean, default: false },
+                nextSequence: { type: Number, default: 1 },
+            },
+            e46: {
+                enabled: { type: Boolean, default: false },
+                nextSequence: { type: Number, default: 1 },
+            },
+            e47: {
                 enabled: { type: Boolean, default: false },
                 nextSequence: { type: Number, default: 1 },
             },

@@ -3,9 +3,10 @@ const path = require("path");
 const TenantEcfProfile = require("../models/tenantEcfProfileModel");
 const { supabase } = require("../config/supabaseClient");
 
+
 const { encryptField } = require("../services/ecf/helpers/encryptField");
 const { validateEcfProfile } = require("../services/ecf/helpers/validateEcfProfile");
-
+const { validateP12CertificateBuffer } = require("../services/ecf/signer/realSigner");
 exports.getEcfProfile = async (req, res) => {
     try {
         const tenantId = req.user.tenantId;
@@ -80,26 +81,65 @@ exports.updateEcfProfile = async (req, res) => {
             profile.enabled = payload.enabled;
         }
 
-        if (
-            payload.environment &&
-            ["internal_sandbox", "dgii_certification", "dgii_production"].includes(payload.environment)
-        ) {
-            profile.environment = payload.environment;
+        const allowedEnvironments = [
+            "internal_sandbox",
+            "dgii_certification",
+            "dgii_production",
+        ];
+
+        const allowedCertificationStatuses = [
+            "not_started",
+            "pending_config",
+            "ready_for_testing",
+            "in_testing",
+            "certified",
+            "rejected",
+            "disabled",
+        ];
+
+        const requestedEnvironment =
+            payload.environment && allowedEnvironments.includes(payload.environment)
+                ? payload.environment
+                : null;
+
+        const requestedCertificationStatus =
+            payload.certificationStatus &&
+            allowedCertificationStatuses.includes(payload.certificationStatus)
+                ? payload.certificationStatus
+                : null;
+
+        const currentCertificationStatus = String(profile.certificationStatus || "").trim();
+
+        if (requestedEnvironment === "dgii_production") {
+            const hasRealCertificate =
+                profile?.certificate?.isActive === true &&
+                profile?.security?.certificateUploaded === true &&
+                profile?.security?.passwordConfigured === true &&
+                Boolean(profile?.certificate?.bucket) &&
+                Boolean(profile?.certificate?.path) &&
+                Boolean(profile?.certificate?.passwordEncrypted);
+
+            if (currentCertificationStatus !== "certified") {
+                return res.status(400).json({
+                    success: false,
+                    message: "ECF_CERTIFICATION_REQUIRED_BEFORE_PRODUCTION",
+                });
+            }
+
+            if (!hasRealCertificate) {
+                return res.status(400).json({
+                    success: false,
+                    message: "REAL_DGII_CERTIFICATE_REQUIRED_BEFORE_PRODUCTION",
+                });
+            }
         }
 
-        if (
-            payload.certificationStatus &&
-            [
-                "not_started",
-                "pending_config",
-                "ready_for_testing",
-                "in_testing",
-                "certified",
-                "rejected",
-                "disabled",
-            ].includes(payload.certificationStatus)
-        ) {
-            profile.certificationStatus = payload.certificationStatus;
+        if (requestedCertificationStatus) {
+            profile.certificationStatus = requestedCertificationStatus;
+        }
+
+        if (requestedEnvironment) {
+            profile.environment = requestedEnvironment;
         }
 
         if (payload.syncIssuerFromTenant === true) {
@@ -119,7 +159,18 @@ exports.updateEcfProfile = async (req, res) => {
                 ? profile.documentTypes.toObject()
                 : profile.documentTypes || {};
 
-            const allowedTypes = ["e31", "e32", "e33", "e34"];
+            const allowedTypes = [
+                "e31",
+                "e32",
+                "e33",
+                "e34",
+                "e41",
+                "e43",
+                "e44",
+                "e45",
+                "e46",
+                "e47",
+            ];
 
             for (const typeKey of allowedTypes) {
                 if (!payload.documentTypes[typeKey]) continue;
@@ -207,6 +258,25 @@ exports.uploadEcfCertificate = async (req, res) => {
                 allowed: allowedExt,
             });
         }
+        let certificateValidation;
+
+        try {
+            certificateValidation = validateP12CertificateBuffer({
+                p12Buffer: req.file.buffer,
+                password,
+            });
+        } catch (error) {
+            console.error("[uploadEcfCertificate] Certificate validation error:", error.message);
+
+            return res.status(400).json({
+                success: false,
+                message:
+                    error.message === "INVALID_CERTIFICATE_PASSWORD_OR_FILE"
+                        ? "CERTIFICATE_PASSWORD_INVALID"
+                        : "CERTIFICATE_FILE_INVALID",
+                error: error.message,
+            });
+        }
 
         const bucket = process.env.SUPABASE_ECF_CERT_BUCKET || "ecf-certificates";
 
@@ -262,16 +332,28 @@ exports.uploadEcfCertificate = async (req, res) => {
             mimeType: req.file.mimetype || "application/octet-stream",
             uploadedAt: new Date(),
             uploadedBy: req.user?._id || null,
-            passwordEncrypted: encryptField(password),
-            isActive: true,
-        };
 
+            passwordEncrypted: encryptField(password),
+            passwordValidated: true,
+            passwordValidatedAt: new Date(),
+
+            isActive: true,
+
+            serialNumber: certificateValidation?.certificateInfo?.serialNumber || null,
+            validFrom: certificateValidation?.certificateInfo?.validFrom || null,
+            validTo: certificateValidation?.certificateInfo?.validTo || null,
+
+            validationError: null,
+        };
         profile.security = {
             ...(profile.security || {}),
             certificateUploaded: true,
             passwordConfigured: true,
         };
-
+        validateP12CertificateBuffer({
+            p12Buffer: req.file.buffer,
+            password,
+        });
         const validation = validateEcfProfile(profile);
 
         profile.lastValidationResult = {

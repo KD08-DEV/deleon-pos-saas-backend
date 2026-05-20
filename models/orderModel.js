@@ -122,7 +122,7 @@ const orderSchema = new mongoose.Schema(
         fiscal: {
             ecfDocumentType: {
                 type: String,
-                enum: ["31", "32", "33", "34", null],
+                enum: ["31", "32", "33", "34", "41", "43", "44", "45", "46", "47", null],
                 default: null,
             },
             requested: { type: Boolean, default: false },

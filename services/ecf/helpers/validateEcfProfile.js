@@ -15,11 +15,22 @@ function validateEcfProfile(profile) {
     if (!profile.issuer?.taxAddress) errors.push("Falta dirección fiscal");
     if (!profile.environment) errors.push("Falta ambiente");
 
-    const hasTypeEnabled =
-        profile.documentTypes?.e31?.enabled ||
-        profile.documentTypes?.e32?.enabled ||
-        profile.documentTypes?.e33?.enabled ||
-        profile.documentTypes?.e34?.enabled;
+    const allowedTypeKeys = [
+        "e31",
+        "e32",
+        "e33",
+        "e34",
+        "e41",
+        "e43",
+        "e44",
+        "e45",
+        "e46",
+        "e47",
+    ];
+
+    const hasTypeEnabled = allowedTypeKeys.some(
+        (typeKey) => profile.documentTypes?.[typeKey]?.enabled === true
+    );
 
     if (!hasTypeEnabled) {
         errors.push("Debes habilitar al menos un tipo de e-CF");

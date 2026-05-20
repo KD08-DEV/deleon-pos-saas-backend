@@ -17,9 +17,7 @@ function getEnvironmentSlug(profile) {
     }
 
     if (env === "dgii_certification") {
-        // DGII documenta testecf y certecf en diferentes etapas.
-        // Déjalo configurable por .env según lo que DGII te habilite.
-        return process.env.DGII_ECF_CERT_ENV_SLUG || "certecf";
+        return process.env.DGII_ECF_CERT_ENV_SLUG || "testecf";
     }
 
     throw new Error(`DGII_ENVIRONMENT_NOT_SUPPORTED: ${env}`);

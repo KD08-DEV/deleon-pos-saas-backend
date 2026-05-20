@@ -238,31 +238,121 @@ function buildEcfSecurityCode(hash = "") {
     return String(hash || "").replace(/[^a-fA-F0-9]/g, "").slice(0, 6).toUpperCase();
 }
 
+
+function formatAmountForDgii(value) {
+    const n = Number(value || 0);
+    return Number.isFinite(n) ? n.toFixed(2) : "0.00";
+}
+
+function getEcfQrBaseUrl({ environment, documentType, total }) {
+    const env = String(environment || "internal_sandbox").trim();
+    const type = String(documentType || "").trim();
+    const amount = Number(total || 0);
+
+    const isFacturaConsumoMenor250k =
+        type === "32" && amount < 250000;
+
+    // Factura de Consumo Electrónica menor a RD$250,000
+    if (isFacturaConsumoMenor250k) {
+        if (env === "dgii_production") {
+            return (
+                process.env.DGII_FC_QR_BASE_URL_PROD ||
+                `${process.env.DGII_FC_BASE_URL || "https://fc.dgii.gov.do"}/eCF/ConsultaTimbreFC`
+            );
+        }
+
+        return (
+            process.env.DGII_FC_QR_BASE_URL_TEST ||
+            `${process.env.DGII_FC_BASE_URL || "https://fc.dgii.gov.do"}/eCF/ConsultaTimbreFC`
+        );
+    }
+
+    // e-CF normal en producción: e31, e33, e34 y e32 >= RD$250,000
+    if (env === "dgii_production") {
+        return (
+            process.env.DGII_ECF_QR_BASE_URL_PROD ||
+            `${process.env.DGII_ECF_BASE_URL || "https://ecf.dgii.gov.do"}/ecf/ConsultaTimbre`
+        );
+    }
+
+    // e-CF normal en certificación/pruebas
+    if (env === "dgii_certification") {
+        return (
+            process.env.DGII_ECF_QR_BASE_URL_CERT ||
+            `${process.env.DGII_ECF_BASE_URL || "https://ecf.dgii.gov.do"}/testecf/ConsultaTimbre`
+        );
+    }
+
+    // internal_sandbox / pruebas internas
+    return (
+        process.env.DGII_ECF_QR_BASE_URL_TEST ||
+        `${process.env.DGII_ECF_BASE_URL || "https://ecf.dgii.gov.do"}/testecf/ConsultaTimbre`
+    );
+}
 function buildEcfQrUrl({
+                           environment = "internal_sandbox",
+                           documentType = "32",
+                           rncEmisor,
                            rnc,
+                           rncComprador,
                            eNCF,
                            total,
                            fechaEmision,
                            fechaFirma,
                            securityCode,
                        }) {
-    const base = String(
-        process.env.DGII_ECF_QR_BASE_URL ||
-        "https://dgii.gov.do/app/WebApps/ConsultasWeb2/ConsultasWeb/consultas/ncf.aspx"
-    ).trim();
+    const type = String(documentType || "32")
+        .trim()
+        .toLowerCase()
+        .replace(/^e/, "");
 
-    const params = new URLSearchParams({
-        rnc: String(rnc || ""),
-        encf: String(eNCF || ""),
-        monto: money(total || 0),
-        fechaEmision: String(fechaEmision || ""),
-        fechaFirma: String(fechaFirma || ""),
-        codigoSeguridad: String(securityCode || ""),
+    const amount = Number(total || 0);
+
+    const finalRncEmisor = onlyDigits(rncEmisor || rnc || "");
+    const finalRncComprador = onlyDigits(rncComprador || "");
+    const finalENCF = String(eNCF || "").trim().toUpperCase();
+    const finalCodigoSeguridad = String(securityCode || "").trim();
+    const finalMontoTotal = formatAmountForDgii(amount);
+
+    const baseUrl = getEcfQrBaseUrl({
+        environment,
+        documentType: type,
+        total: amount,
     });
 
-    return `${base}?${params.toString()}`;
-}
+    const params = new URLSearchParams();
 
+    const isFacturaConsumoMenor250k =
+        type === "32" && amount < 250000;
+
+    // Factura de Consumo Electrónica menor a RD$250,000
+    // Usa ConsultaTimbreFC y solo requiere:
+    // RncEmisor, ENCF, MontoTotal y CodigoSeguridad.
+    if (isFacturaConsumoMenor250k) {
+        params.set("RncEmisor", finalRncEmisor);
+        params.set("ENCF", finalENCF);
+        params.set("MontoTotal", finalMontoTotal);
+        params.set("CodigoSeguridad", finalCodigoSeguridad);
+
+        return `${baseUrl}?${params.toString()}`;
+    }
+
+    // e-CF normal:
+    // e31, e33, e34 y e32 mayor o igual a RD$250,000.
+    params.set("RncEmisor", finalRncEmisor);
+
+    if (finalRncComprador) {
+        params.set("RncComprador", finalRncComprador);
+    }
+
+    params.set("ENCF", finalENCF);
+    params.set("FechaEmision", String(fechaEmision || "").trim());
+    params.set("MontoTotal", finalMontoTotal);
+    params.set("FechaFirma", String(fechaFirma || "").trim());
+    params.set("CodigoSeguridad", finalCodigoSeguridad);
+
+    return `${baseUrl}?${params.toString()}`;
+}
 function generateEcfXml({
                             profile,
                             order,
@@ -270,6 +360,7 @@ function generateEcfXml({
                             sequenceNumber,
                             eNCF,
                             reference = null,
+                            fechaHoraFirmaOverride = null,
                         }) {
     const type = normalizeEcfDocumentType(documentType);
 
@@ -279,7 +370,7 @@ function generateEcfXml({
 
     const totals = getTotals(order);
     const fechaEmision = formatDateDO(order?.invoicedAt || order?.paidAt || new Date());
-    const fechaHoraFirma = formatDateTimeDO(new Date());
+    const fechaHoraFirma = fechaHoraFirmaOverride || formatDateTimeDO(new Date());
 
     const buyerXml = buildBuyerXml({ type, order });
     const referenceXml = buildReferenceXml({ type, reference });

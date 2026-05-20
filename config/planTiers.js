@@ -126,8 +126,8 @@ const TIERS = {
             margin: true,
             waste: true,
 
-            expenses: false,
-            financeSummary: false,
+            expenses: true,
+            financeSummary: true,
             payroll: false,
             accountsReceivable: false,
             multiClient: false,

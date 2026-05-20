@@ -10,14 +10,14 @@ const electronicTaxDocumentSchema = new mongoose.Schema(
 
         sourceDocumentType: {
             type: String,
-            enum: ["ORDER", "INVOICE"],
+            enum: ["ORDER", "INVOICE", "ECF_ADJUSTMENT"],
             default: "ORDER",
         },
 
         ecf: {
             documentType: {
                 type: String,
-                enum: ["31", "32", "33", "34"],
+                enum: ["31", "32", "33", "34", "41", "43", "44", "45", "46", "47"],
                 required: true,
             },
             sequenceNumber: { type: Number, default: null },
@@ -43,6 +43,24 @@ const electronicTaxDocumentSchema = new mongoose.Schema(
             fechaHoraFirma: { type: String, default: null },
         },
 
+        reference: {
+            modifiedDocumentId: {
+                type: mongoose.Schema.Types.ObjectId,
+                ref: "ElectronicTaxDocument",
+                default: null,
+                index: true,
+            },
+            modifiedOrderId: {
+                type: mongoose.Schema.Types.ObjectId,
+                ref: "Order",
+                default: null,
+                index: true,
+            },
+            modifiedENCF: { type: String, default: null },
+            modifiedDate: { type: String, default: null },
+            modificationCode: { type: String, default: null },
+            reason: { type: String, default: null },
+        },
         issuer: {
             rnc: { type: String, default: null },
             legalName: { type: String, default: null },
@@ -67,11 +85,13 @@ const electronicTaxDocumentSchema = new mongoose.Schema(
             total: { type: Number, default: 0 },
         },
 
+
         xml: {
             raw: { type: String, default: null },
             signed: { type: String, default: null },
             hash: { type: String, default: null },
         },
+
 
         dgiiResponse: {
             raw: { type: mongoose.Schema.Types.Mixed, default: null },

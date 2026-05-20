@@ -94,6 +94,14 @@ function num(v, def = 0) {
     const n = Number(v);
     return Number.isFinite(n) ? n : def;
 }
+function cleanIdempotencyKey(v) {
+    const key = String(v || "").trim();
+    return key ? key.slice(0, 160) : null;
+}
+
+function isDuplicateKeyError(err) {
+    return err?.code === 11000 || err?.code === 11001;
+}
 function getClientId(req) {
     return req.scope?.clientId || req.clientId || "default";
 }
@@ -194,9 +202,34 @@ async function applyStockMovement({
                                       allowNegativeStock = false,
                                       sourceType = null,
                                       sourceId = null,
+                                      idempotencyKey = null,
                                       session = null,
                                   }) {
+    const cleanKey = cleanIdempotencyKey(idempotencyKey);
+
+    if (cleanKey) {
+        const existingMovement = await InventoryMovement.findOne({
+            tenantId,
+            clientId,
+            idempotencyKey: cleanKey,
+        }).session(session);
+
+        if (existingMovement) {
+            const existingDish = await Dish.findOne({
+                _id: existingMovement.itemId,
+                tenantId,
+                clientId,
+            }).session(session);
+
+            return {
+                dish: existingDish,
+                movement: existingMovement,
+                duplicated: true,
+            };
+        }
+    }
     const dish = await Dish.findOne({
+
         _id: itemId,
         tenantId,
         clientId,
@@ -292,6 +325,7 @@ async function applyStockMovement({
                 createdBy: userId || null,
                 sourceType,
                 sourceId,
+                idempotencyKey: cleanKey,
             },
         ],
         { session }
@@ -658,7 +692,10 @@ exports.createMovement = async (req, res, next) => {
             allowNegativeStock,
             sourceType,
             sourceId,
+            idempotencyKey,
         } = req.body || {};
+
+        const cleanKey = cleanIdempotencyKey(idempotencyKey);
 
         const t = String(type || "").trim();
         if (!["purchase", "sale", "waste", "adjust", "transfer", "conversion"].includes(t)) {
@@ -724,18 +761,55 @@ exports.createMovement = async (req, res, next) => {
                 allowNegativeStock: allowNeg,
                 sourceType: sourceType || null,
                 sourceId: sourceId || null,
+                idempotencyKey: cleanKey,
                 session,
             });
 
             return out;
         });
 
-        return res.status(201).json({ success: true, movement: result.movement, item: result.dish });
+        return res.status(result.duplicated ? 200 : 201).json({
+            success: true,
+            duplicated: Boolean(result.duplicated),
+            movement: result.movement,
+            item: result.dish,
+        });
     } catch (e) {
+        if (isDuplicateKeyError(e)) {
+            try {
+                const { tenantId, clientId } = getScope(req);
+                const cleanKey = cleanIdempotencyKey(req.body?.idempotencyKey);
+
+                if (tenantId && cleanKey) {
+                    const existingMovement = await InventoryMovement.findOne({
+                        tenantId,
+                        clientId,
+                        idempotencyKey: cleanKey,
+                    }).lean();
+
+                    if (existingMovement) {
+                        const existingDish = await Dish.findOne({
+                            _id: existingMovement.itemId,
+                            tenantId,
+                            clientId,
+                        }).lean();
+
+                        return res.status(200).json({
+                            success: true,
+                            duplicated: true,
+                            movement: existingMovement,
+                            item: existingDish,
+                        });
+                    }
+                }
+            } catch (lookupError) {
+                return next(lookupError);
+            }
+        }
+
         next(e);
     }
 };
-
 
 // GET /api/inventory/movements?itemId=&type=&from=&to=&limit=&skip=
 // GET /api/inventory/movements?itemId=&type=&from=&to=&limit=&skip=
@@ -1232,39 +1306,79 @@ exports.updateMermaBatch = async (req, res) => {
         const userId = req.user?._id || null;
         const { id } = req.params;
 
-        const { rawQty, unitCost, note } = req.body;
+        const { rawQty, unitCost, unitCostOriginal, note } = req.body || {};
 
         const batch = await MermaBatch.findOne({ _id: id, tenantId, clientId });
         if (!batch) {
-            return res.status(404).json({ success: false, message: "Lote no encontrado." });
+            return res.status(404).json({
+                success: false,
+                message: "Lote no encontrado.",
+            });
         }
 
-        if (rawQty !== undefined) batch.rawQty = Number(rawQty);
-        if (unitCost !== undefined) batch.unitCost = Number(unitCost);
-        if (note !== undefined) batch.note = note;
+        if (rawQty !== undefined) {
+            const rawQtyNum = Number(rawQty);
+            if (!Number.isFinite(rawQtyNum) || rawQtyNum <= 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Cantidad comprada inválida.",
+                });
+            }
 
-        // Recalcular si ya estaba cerrado
+            batch.rawQty = rawQtyNum;
+        }
+
+        const incomingUnitCost =
+            unitCostOriginal !== undefined ? unitCostOriginal : unitCost;
+
+        if (incomingUnitCost !== undefined) {
+            const unitCostNum = Number(incomingUnitCost);
+            if (!Number.isFinite(unitCostNum) || unitCostNum < 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Costo unitario inválido.",
+                });
+            }
+
+            batch.unitCostOriginal = unitCostNum;
+        }
+
+        if (note !== undefined) {
+            batch.note = String(note || "").trim();
+        }
+
+        const raw = Number(batch.rawQty || 0);
+        const final = Number(batch.finalQty || 0);
+        const unitCostOriginalNum = Number(batch.unitCostOriginal || 0);
+
+        batch.totalCost = Number((raw * unitCostOriginalNum).toFixed(2));
+
         if (batch.status === "closed") {
-            const raw = Number(batch.rawQty || 0);
-            const fin = Number(batch.finalQty || 0);
-            const waste = Math.max(raw - fin, 0);
-            batch.wasteQty = waste;
-            batch.costAmount = waste * Number(batch.unitCost || 0);
+            const wasteQty = Math.max(0, raw - final);
+            const wasteCostOriginal = wasteQty * unitCostOriginalNum;
+            const effectiveUnitCost = final > 0 ? batch.totalCost / final : null;
+
+            batch.wasteQty = Number(wasteQty.toFixed(6));
+            batch.wasteCostOriginal = Number(wasteCostOriginal.toFixed(2));
+            batch.costPolicy = "EFFECTIVE_RECALC";
+            batch.effectiveUnitCost =
+                effectiveUnitCost != null ? Number(effectiveUnitCost.toFixed(6)) : null;
         }
 
         await batch.save();
 
         if (batch.status === "closed") {
             await upsertWasteMovement({ batch, tenantId, clientId, userId });
+            await upsertBatchInMovement({ batch, tenantId, clientId, userId });
         }
-        await upsertWasteMovement({ batch, tenantId, clientId, userId });
-        await upsertBatchInMovement({ batch, tenantId, clientId, userId });
 
-        await upsertBatchInMovement({ batch, tenantId, clientId, userId: req.user?._id || null });
         return res.json({ success: true, data: batch });
     } catch (err) {
         console.error("updateMermaBatch error:", err);
-        return res.status(500).json({ success: false, message: "Error actualizando lote." });
+        return res.status(500).json({
+            success: false,
+            message: "Error actualizando lote.",
+        });
     }
 };
 exports.unarchiveItem = async (req, res, next) => {

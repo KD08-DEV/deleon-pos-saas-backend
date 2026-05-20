@@ -26,8 +26,8 @@ const inventoryMovementSchema = new mongoose.Schema(
             index: true,
         },
 
-        qty: { type: Number, required: true },      // siempre positiva
-        qtySigned: { type: Number, default: null }, // + / -
+        qty: { type: Number, required: true },
+        qtySigned: { type: Number, default: null },
 
         unitCost: { type: Number, default: null },
         costAmount: { type: Number, default: null },
@@ -36,9 +36,16 @@ const inventoryMovementSchema = new mongoose.Schema(
         toItemId: { type: mongoose.Schema.Types.ObjectId, ref: "dish", default: null },
         toQty: { type: Number, default: null },
 
-        // NUEVO: trazabilidad (orden, compra, etc.)
-        sourceType: { type: String, default: null, index: true }, // "order" | "manual" | ...
+        sourceType: { type: String, default: null, index: true },
         sourceId: { type: String, default: null, index: true },
+
+        // Evita duplicados cuando el frontend manda la misma petición varias veces
+        idempotencyKey: {
+            type: String,
+            default: null,
+            trim: true,
+            index: true,
+        },
 
         note: { type: String, default: "", trim: true },
 
@@ -52,5 +59,16 @@ const inventoryMovementSchema = new mongoose.Schema(
 
 inventoryMovementSchema.index({ tenantId: 1, clientId: 1, type: 1, createdAt: -1 });
 inventoryMovementSchema.index({ tenantId: 1, clientId: 1, itemId: 1, createdAt: -1 });
+
+inventoryMovementSchema.index(
+    { tenantId: 1, clientId: 1, idempotencyKey: 1 },
+    {
+        unique: true,
+        name: "uniq_inventory_movement_idempotency",
+        partialFilterExpression: {
+            idempotencyKey: { $type: "string" },
+        },
+    }
+);
 
 module.exports = mongoose.model("InventoryMovement", inventoryMovementSchema);

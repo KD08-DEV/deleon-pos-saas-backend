@@ -451,6 +451,8 @@ const getOrderEcfStatus = async (req, res, next) => {
                 status: ecfDocument?.ecf?.status || "draft",
                 trackId: ecfDocument?.ecf?.trackId || null,
                 securityCode: ecfDocument?.ecf?.securityCode || null,
+                qrUrl: ecfDocument?.ecf?.qrUrl || null,
+                fechaHoraFirma: ecfDocument?.ecf?.fechaHoraFirma || null,
 
                 issuer: ecfDocument?.issuer || null,
                 customer: ecfDocument?.customer || null,
@@ -731,18 +733,7 @@ const addOrder = async (req, res, next) => {
                 issuedAt: shouldIssueInternalInvoice ? new Date() : null,
             };
         }
-        if (shouldIssueInternalInvoice && !assignedInternalInvoice) {
-            assignedInternalInvoice = await allocateInternalSeq({ tenantId });
 
-            const { internalSeq, internalNumber } = assignedInternalInvoice;
-
-            fiscalPayload = {
-                ...(fiscalPayload || {}),
-                internalSeq,
-                internalNumber,
-                issuedAt: fiscalPayload?.issuedAt || new Date(),
-            };
-        }
 
         // Canal / comisión
         const source = normalizeSource(orderSource);
@@ -898,6 +889,49 @@ const addOrder = async (req, res, next) => {
         if (isCreditSale && !resolvedCustomerId) {
             return next(createHttpError(400, "CUSTOMER_REQUIRED_FOR_CREDIT_SALE"));
         }
+        // ✅ Validar e-CF ANTES de crear la orden/factura.
+// Esto evita que una E32 mayor o igual a 250,000 sin RNC/Cédula
+// se guarde como Consumidor Final.
+        try {
+            assertEcfCanBeIssuedBeforePersist({
+                ecfProfile: ecfProfileForTenant,
+                submitAction,
+                orderCandidate: {
+                    tenantId,
+                    clientId,
+                    customerDetails: resolvedCustomerDetails,
+                    bills: {
+                        subtotal,
+                        total: subtotal,
+                        discount: discountAmt,
+                        taxEnabled,
+                        tax,
+                        tipEnabled,
+                        tip,
+                        tipAmount: tip,
+                        deliveryFee,
+                        totalWithTax,
+                    },
+                    fiscal: fiscalPayload,
+                },
+            });
+        } catch (error) {
+            return next(getEcfHttpError(error));
+        }
+
+// ✅ Solo asignar número interno si la validación e-CF pasó.
+        if (shouldIssueInternalInvoice && !assignedInternalInvoice) {
+            assignedInternalInvoice = await allocateInternalSeq({ tenantId });
+
+            const { internalSeq, internalNumber } = assignedInternalInvoice;
+
+            fiscalPayload = {
+                ...(fiscalPayload || {}),
+                internalSeq,
+                internalNumber,
+                issuedAt: fiscalPayload?.issuedAt || new Date(),
+            };
+        }
 
         const payload = {
             tenantId,
@@ -1024,6 +1058,18 @@ const addOrder = async (req, res, next) => {
                 ...autoEcfResult,
             };
         } else if (autoEcfResult?.error) {
+            const isInvoiceActionForEcf =
+                String(submitAction || "").trim().toLowerCase() === "invoice";
+
+            if (ecfEnabledForTenant && isInvoiceActionForEcf) {
+                return next(
+                    createHttpError(
+                        502,
+                        autoEcfResult.message || "AUTO_ECF_ISSUE_FAILED"
+                    )
+                );
+            }
+
             responseOrder = responseOrder.toObject ? responseOrder.toObject() : responseOrder;
             responseOrder.ecf = {
                 exists: false,
@@ -1412,6 +1458,27 @@ function shouldAutoIssueEcfNow({
 
     return isInvoiceAction;
 }
+function assertEcfCanBeIssuedBeforePersist({
+                                               ecfProfile,
+                                               submitAction,
+                                               orderCandidate,
+                                           }) {
+    const shouldIssue = shouldAutoIssueEcfNow({
+        ecfProfile,
+        submitAction,
+    });
+
+    if (!shouldIssue) return;
+
+    // Usa la misma validación real que ya tienes para e31/e32.
+    determineEcfDocumentTypeForOrder(orderCandidate);
+}
+
+function getEcfHttpError(error) {
+    const code = error?.message || "ECF_VALIDATION_FAILED";
+
+    return createHttpError(error?.statusCode || error?.status || 400, code);
+}
 async function autoIssueEcfForOrderIfNeeded({
                                                 tenant,
                                                 tenantId,
@@ -1728,43 +1795,50 @@ const updateOrder = async (req, res, next) => {
         const alreadyHasNCF = current?.fiscal?.ncfNumber || current?.ncfNumber;
 
         if (!ecfEnabledForTenant && shouldFinalize && fiscalFeatureEnabled && fiscalRequested && !alreadyHasNCF) {
-            const requestedType = incomingFiscal.ncfType || current?.fiscal?.ncfType || "B02";
+            const requestedType = incomingFiscal?.ncfType || current?.fiscal?.ncfType || "B02";
 
             const { type, ncfNumber } = await allocateNCF({
                 tenantId,
                 ncfType: requestedType,
             });
 
-            // secuencial interno (empresa/registradora)
             const { internalSeq, internalNumber } = await allocateInternalSeq({ tenantId });
 
-            const emissionPoint = String(tenant?.fiscal?.emissionPoint || "001").trim() || "001";
+            const emissionPoint =
+                String(tenant?.fiscal?.emissionPoint || "001").trim() || "001";
 
-            const branchName = String(tenant?.fiscal?.branchName || "Principal").trim() || "Principal";
+            const branchName =
+                String(tenant?.fiscal?.branchName || "Principal").trim() || "Principal";
 
-
-            // ✅ Vence (NCF) (si existe en config)
             const expiresAtRaw =
                 tenant?.fiscal?.ncfConfig?.[type]?.expiresAt ??
                 tenant?.fiscal?.ncfConfig?.[type]?.expirationDate ??
                 tenant?.fiscal?.expiresAt ??
                 null;
+
             const expirationDate = normalizeMongoDate(expiresAtRaw);
             const expirationDateISO = expirationDate ? expirationDate.toISOString() : null;
 
             safeUpdate.ncfNumber = ncfNumber;
+
             safeUpdate.fiscal = {
                 ...(safeUpdate.fiscal || {}),
-                requested: finalEcfDocumentType === "31",
-                ncfType: finalEcfDocumentType === "31" ? "B01" : "B02",
-                ecfDocumentType: finalEcfDocumentType,
+                requested: true,
+                ncfType: type,
+                ncfNumber,
                 issuedAt: shouldIssueInternalInvoice
                     ? (safeUpdate?.fiscal?.issuedAt || new Date())
                     : safeUpdate?.fiscal?.issuedAt || null,
+                expirationDate: expirationDateISO,
+                internalSeq,
+                internalNumber,
+                emissionPoint,
+                branchName,
             };
+
             safeUpdate.invoiceNumber = internalNumber;
             safeUpdate.facturaNo = internalNumber;
-        } else if (!ecfEnabledForTenant && shouldFinalize && fiscalFeatureEnabled && fiscalRequested && alreadyHasNCF) {
+        }else if (!ecfEnabledForTenant && shouldFinalize && fiscalFeatureEnabled && fiscalRequested && alreadyHasNCF) {
             // Backfill por si la orden vieja tiene NCF pero le faltan campos
             const existingNcfNumber = String(
                 current?.fiscal?.ncfNumber ||
@@ -1862,19 +1936,7 @@ const updateOrder = async (req, res, next) => {
                     : safeUpdate?.fiscal?.issuedAt || null,
             };
         }
-        if (shouldIssueInternalInvoice && !alreadyHasInternalInvoice) {
-            const { internalSeq, internalNumber } = await allocateInternalSeq({ tenantId });
 
-            safeUpdate.fiscal = {
-                ...(safeUpdate.fiscal || {}),
-                internalSeq,
-                internalNumber,
-                issuedAt: safeUpdate?.fiscal?.issuedAt || new Date(),
-            };
-
-            safeUpdate.invoiceNumber = internalNumber;
-            safeUpdate.facturaNo = internalNumber;
-        }
         if (!ecfEnabledForTenant && fiscalRequested && !fiscalFeatureEnabled) {
             return next(createHttpError(400, "FISCAL_NOT_ENABLED_FOR_TENANT"));
         }
@@ -2103,7 +2165,42 @@ const updateOrder = async (req, res, next) => {
             safeUpdate.paidBy = req.user?._id || current.paidBy || null;
         }
 
-        // ✅ Update
+// ✅ Validar e-CF ANTES de actualizar/cerrar la orden.
+// Si falla, no se marca como pagada, no se completa y no se muestra factura.
+        try {
+            const currentPlain = current?.toObject ? current.toObject() : current;
+
+            assertEcfCanBeIssuedBeforePersist({
+                ecfProfile: ecfProfileForTenant,
+                submitAction,
+                orderCandidate: {
+                    ...currentPlain,
+                    ...safeUpdate,
+                    customerDetails: safeUpdate.customerDetails || currentPlain.customerDetails,
+                    bills: safeUpdate.bills || currentPlain.bills,
+                    fiscal: safeUpdate.fiscal || currentPlain.fiscal,
+                },
+            });
+        } catch (error) {
+            return next(getEcfHttpError(error));
+        }
+
+// ✅ Solo asignar número interno si la validación e-CF pasó.
+        if (shouldIssueInternalInvoice && !alreadyHasInternalInvoice) {
+            const { internalSeq, internalNumber } = await allocateInternalSeq({ tenantId });
+
+            safeUpdate.fiscal = {
+                ...(safeUpdate.fiscal || {}),
+                internalSeq,
+                internalNumber,
+                issuedAt: safeUpdate?.fiscal?.issuedAt || new Date(),
+            };
+
+            safeUpdate.invoiceNumber = internalNumber;
+            safeUpdate.facturaNo = internalNumber;
+        }
+
+// ✅ Update
         let order = await Order.findOneAndUpdate(orderScope, safeUpdate, { new: true })
 
             .populate("table", "tableNo status")
@@ -2348,6 +2445,18 @@ const updateOrder = async (req, res, next) => {
                 ...autoEcfResult,
             };
         } else if (autoEcfResult?.error) {
+            const isInvoiceActionForEcf =
+                String(submitAction || "").trim().toLowerCase() === "invoice";
+
+            if (ecfEnabledForTenant && isInvoiceActionForEcf) {
+                return next(
+                    createHttpError(
+                        502,
+                        autoEcfResult.message || "AUTO_ECF_ISSUE_FAILED"
+                    )
+                );
+            }
+
             order = order.toObject ? order.toObject() : order;
             order.ecf = {
                 exists: false,

@@ -100,6 +100,13 @@ function signXmlWithPem({ xml, privateKeyPem, certificatePem }) {
 
     sig.addReference({
         xpath: "/*",
+
+        // Importante:
+        // Evita que xml-crypto agregue un atributo Id al nodo raíz.
+        // DGII está rechazando ese atributo porque no existe en el XSD de la semilla.
+        uri: "",
+        isEmptyUri: true,
+
         transforms: [
             "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
             "http://www.w3.org/2001/10/xml-exc-c14n#",
@@ -114,7 +121,14 @@ function signXmlWithPem({ xml, privateKeyPem, certificatePem }) {
         },
     });
 
-    return sig.getSignedXml();
+    const signedXml = sig.getSignedXml();
+
+    // Protección temporal para detectar si la librería todavía agrega Id.
+    if (/\sId="[^"]+"/.test(signedXml)) {
+        throw new Error("SIGNED_XML_CONTAINS_UNDECLARED_ID_ATTRIBUTE");
+    }
+
+    return signedXml;
 }
 
 async function realSignXml({ xml, profile }) {
@@ -174,6 +188,27 @@ async function realSignXml({ xml, profile }) {
     };
 }
 
+function validateP12CertificateBuffer({ p12Buffer, password }) {
+    if (!p12Buffer || !Buffer.isBuffer(p12Buffer)) {
+        throw new Error("CERTIFICATE_BUFFER_REQUIRED");
+    }
+
+    if (!password) {
+        throw new Error("CERTIFICATE_PASSWORD_REQUIRED");
+    }
+
+    const result = extractPrivateKeyAndCertificateFromP12({
+        p12Buffer,
+        password,
+    });
+
+    return {
+        ok: true,
+        certificateInfo: result.certificateInfo,
+    };
+}
+
 module.exports = {
     realSignXml,
+    validateP12CertificateBuffer,
 };

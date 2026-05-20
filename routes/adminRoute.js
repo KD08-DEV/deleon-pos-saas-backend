@@ -341,8 +341,8 @@ router.post(
 
 router.patch(
     "/cash-session/adjust",
-    requireScope({ level: "client" }),
-    requireRole("Owner", "Admin"),
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
     adjustOpeningFloat
 );
 
@@ -450,7 +450,7 @@ router.post(
     "/expense-categories",
     requireScope({ level: "tenant" }),
     requireFeature("expenses"),
-    requireRole("Owner", "Admin"),
+    requireRole("Owner", "Admin", "Cajera"),
     createExpenseCategory
 );
 
@@ -458,7 +458,7 @@ router.put(
     "/expense-categories/:id",
     requireScope({ level: "tenant" }),
     requireFeature("expenses"),
-    requireRole("Owner", "Admin"),
+    requireRole("Owner", "Admin", "Cajera"),
     updateExpenseCategory
 );
 
@@ -498,7 +498,7 @@ router.patch(
     "/expenses/:id/void",
     requireScope({ level: "tenant" }),
     requireFeature("expenses"),
-    requireRole("Owner", "Admin"),
+    requireRole("Owner", "Admin", "Cajera"),
     voidExpense
 );
 

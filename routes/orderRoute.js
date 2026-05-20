@@ -6,8 +6,11 @@ const { supabase } = require("../config/supabaseClient");
 // Middlewares
 const verifyToken = require("../middlewares/tokenVerification");
 const { tenantMiddleware } = require("../middlewares/tenantMiddleware");
-const { issueOrderAsEcf } = require("../controllers/ecfIssueController");
-
+const {
+    issueOrderAsEcf,
+    issueEcfAdjustment,
+    listOrderEcfAdjustments,
+} = require("../controllers/ecfIssueController");
 // Controllers
 const {
     getOrders,
@@ -37,6 +40,19 @@ router.post(
     verifyToken,
     tenantMiddleware,
     issueOrderAsEcf
+);
+router.get(
+    "/:id/ecf/adjustments",
+    verifyToken,
+    tenantMiddleware,
+    listOrderEcfAdjustments
+);
+
+router.post(
+    "/:id/ecf/adjustment",
+    verifyToken,
+    tenantMiddleware,
+    issueEcfAdjustment
 );
 router.get(
     "/",
