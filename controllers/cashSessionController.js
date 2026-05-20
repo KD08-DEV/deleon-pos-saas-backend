@@ -1,7 +1,8 @@
 // cashSessionController.js
 const createHttpError = require("http-errors");
+const mongoose = require("mongoose");
 const CashSession = require("../models/cashSessionModel");
-const Order = require("../models/orderModel"); // agrega arriba
+const Order = require("../models/orderModel");
 const {
     summarizeReceivablePaymentsForCash,
     summarizeCreditSalesForCash,
@@ -120,16 +121,54 @@ const closeCashSession = async (req, res, next) => {
         const dateYMD = getDateFromReq(req);
         const registerId = getRegisterIdFromWriteReq(req);
 
-        const registerFilter = buildLegacyRegisterReadFilter(registerId);
-        const cashierFilter = buildCashierSessionFilter({ role, userId });
+        const fid = String(
+            req.body?.fid ||
+            req.body?.sessionId ||
+            req.query?.fid ||
+            req.query?.sessionId ||
+            ""
+        ).trim();
 
-        const session = await CashSession.findOne({
-            tenantId,
-            clientId,
-            dateYMD,
-            ...registerFilter,
-            ...cashierFilter,
-        }).sort({ updatedAt: -1, createdAt: -1 });        if (!session) return next(createHttpError(404, "SESSION_NOT_FOUND"));
+        let session = null;
+
+        if (fid) {
+            if (!mongoose.Types.ObjectId.isValid(fid)) {
+                return next(createHttpError(400, "INVALID_CASH_SESSION_ID"));
+            }
+
+            const exactFilter = {
+                _id: fid,
+                tenantId,
+                clientId,
+                dateYMD,
+                registerId,
+            };
+
+            // Admin puede cerrar una sesión específica de cualquier cajera.
+            // Cajera solo puede cerrar su propia sesión.
+            if (!isAdminLikeRole(role)) {
+                exactFilter.openedBy = userId;
+            }
+
+            session = await CashSession.findOne(exactFilter);
+        } else {
+            const registerFilter = buildLegacyRegisterReadFilter(registerId);
+            const cashierFilter = buildCashierSessionFilter({ role, userId });
+
+            session = await CashSession.findOne({
+                tenantId,
+                clientId,
+                dateYMD,
+                ...registerFilter,
+                ...cashierFilter,
+            }).sort({ updatedAt: -1, createdAt: -1 });
+        }
+
+        if (!session) return next(createHttpError(404, "SESSION_NOT_FOUND"));
+
+        if (String(session.status || "").toUpperCase() === "CLOSED" || session.closedAt) {
+            return next(createHttpError(409, "CASH_SESSION_ALREADY_CLOSED"));
+        }
         if (!tenantId) return next(createHttpError(400, "MISSING_TENANT_ID"));
         if (!clientId) return next(createHttpError(400, "MISSING_CLIENT_ID"));
 
@@ -176,7 +215,15 @@ const closeCashSession = async (req, res, next) => {
 
         // Ventas en efectivo del día (excluye canceladas)
         const { start, end } = getRangeForDay(dateYMD);
+        const targetCashierId = session.openedBy ? String(session.openedBy) : String(userId || "");
 
+        const cashOwnerUserId = isAdminLikeRole(role)
+            ? targetCashierId
+            : userId;
+
+        const cashOwnerRole = isAdminLikeRole(role)
+            ? "Cajera"
+            : role;
         const orders = await Order.find(
             buildLegacyCashOrdersFilter({
                 tenantId,
@@ -184,8 +231,8 @@ const closeCashSession = async (req, res, next) => {
                 registerId,
                 start,
                 end,
-                userId,
-                role,
+                userId: cashOwnerUserId,
+                role: cashOwnerRole,
             })
         ).select("paymentMethod paymentMethodType paymentMethodReal deliveryPaymentMethod payment.method paidWith bills.totalWithTax registerId paidAt createdAt paymentStatus orderStatus fiscal");
 
@@ -201,8 +248,8 @@ const closeCashSession = async (req, res, next) => {
             registerId,
             start,
             end,
-            userId,
-            role,
+            userId: cashOwnerUserId,
+            role: cashOwnerRole,
         });
 
         const creditSalesSummary = await summarizeCreditSalesForCash({
@@ -211,8 +258,8 @@ const closeCashSession = async (req, res, next) => {
             registerId,
             start,
             end,
-            userId,
-            role,
+            userId: cashOwnerUserId,
+            role: cashOwnerRole,
         });
 
         const receivablePaymentsCash = Number(receivablePaymentsSummary?.byMethod?.Efectivo || 0);
@@ -261,7 +308,9 @@ const closeCashSession = async (req, res, next) => {
             type: "CLOSE",
             amount: countedTotal,
             by: userId,
-            note,
+            note: isAdminLikeRole(role)
+                ? `${note || "Cierre realizado por admin"} | Sesión de cajera: ${targetCashierId}`
+                : note,
         });
 
         await session.save();
