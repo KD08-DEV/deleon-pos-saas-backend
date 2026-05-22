@@ -4,6 +4,7 @@ const Order = require("../models/orderModel");
 const Table = require("../models/tableModel");
 const Tenant = require("../models/tenantModel");
 const Dish = require("../models/dish"); // ajusta si el nombre es dishModel.js
+const InventoryCategory = require("../models/inventoryCategoryModel");
 const ElectronicTaxDocument = require("../models/electronicTaxDocumentModel");
 // const InventoryItem = require("../models/inventoryItemModel"); // DEPRECATED: Ya no se usa InventoryItem, solo Dish
 // const InventoryMovement = require("../models/inventoryMovementModel"); // DEPRECATED
@@ -2721,8 +2722,12 @@ const getSalesByProductReport = async (req, res) => {
             }));
         }
 
+        if (presentation) itemMatch["items.presentation"] = presentation;
+        const dishCollection = Dish.collection.name;
+        const inventoryCategoryCollection = InventoryCategory.collection.name;
+        const categoryFilterValue = String(category || "").trim();
+
         const itemMatch = {};
-        if (category) itemMatch["items.category"] = category;
         if (presentation) itemMatch["items.presentation"] = presentation;
 
         const rows = await Order.aggregate([
@@ -2732,22 +2737,158 @@ const getSalesByProductReport = async (req, res) => {
 
             {
                 $addFields: {
-                    _cat: { $ifNull: ["$items.category", "Sin categoría"] },
-                    _pres: { $ifNull: ["$items.presentation", "Regular"] },
-                    _prod: "$items.name",
-                    _pay: { $ifNull: ["$paymentMethod", "Desconocido"] },
+                    _dishObjectId: {
+                        $cond: [
+                            { $eq: [{ $type: "$items.dishId" }, "objectId"] },
+                            "$items.dishId",
+                            {
+                                $convert: {
+                                    input: "$items.dishId",
+                                    to: "objectId",
+                                    onError: null,
+                                    onNull: null,
+                                },
+                            },
+                        ],
+                    },
+                },
+            },
 
+            {
+                $lookup: {
+                    from: dishCollection,
+                    let: {
+                        did: "$_dishObjectId",
+                        itemName: "$items.name",
+                        tenant: "$tenantId",
+                        cid: "$clientId",
+                    },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ["$tenantId", "$$tenant"] },
+                                        {
+                                            $or: [
+                                                { $eq: ["$clientId", "$$cid"] },
+                                                { $eq: ["$clientId", "default"] },
+                                                { $eq: [{ $type: "$clientId" }, "missing"] },
+                                            ],
+                                        },
+                                        {
+                                            $or: [
+                                                {
+                                                    $and: [
+                                                        { $ne: ["$$did", null] },
+                                                        { $eq: ["$_id", "$$did"] },
+                                                    ],
+                                                },
+                                                {
+                                                    $and: [
+                                                        { $eq: ["$$did", null] },
+                                                        { $eq: ["$name", "$$itemName"] },
+                                                    ],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                        { $sort: { isInventoryItem: 1, updatedAt: -1, createdAt: -1 } },
+                        { $limit: 1 },
+                        { $project: { name: 1, category: 1, inventoryCategoryId: 1 } },
+                    ],
+                    as: "_dish",
+                },
+            },
+
+            { $unwind: { path: "$_dish", preserveNullAndEmptyArrays: true } },
+
+            {
+                $lookup: {
+                    from: inventoryCategoryCollection,
+                    localField: "_dish.inventoryCategoryId",
+                    foreignField: "_id",
+                    as: "_invCat",
+                },
+            },
+
+            { $unwind: { path: "$_invCat", preserveNullAndEmptyArrays: true } },
+
+            {
+                $addFields: {
+                    _snapshotCat: { $trim: { input: { $ifNull: ["$items.category", ""] } } },
+                    _inventoryCat: { $trim: { input: { $ifNull: ["$_invCat.name", ""] } } },
+                    _dishCat: { $trim: { input: { $ifNull: ["$_dish.category", ""] } } },
+                },
+            },
+
+            {
+                $addFields: {
+                    _cat: {
+                        $switch: {
+                            branches: [
+                                {
+                                    case: {
+                                        $and: [
+                                            { $ne: ["$_snapshotCat", ""] },
+                                            {
+                                                $not: [
+                                                    {
+                                                        $in: [
+                                                            "$_snapshotCat",
+                                                            [
+                                                                "Sin categoría",
+                                                                "Sin Categoría",
+                                                                "Sin category",
+                                                                "Sin Category",
+                                                            ],
+                                                        ],
+                                                    },
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                    then: "$_snapshotCat",
+                                },
+                                {
+                                    case: { $ne: ["$_inventoryCat", ""] },
+                                    then: "$_inventoryCat",
+                                },
+                                {
+                                    case: { $ne: ["$_dishCat", ""] },
+                                    then: "$_dishCat",
+                                },
+                            ],
+                            default: "Sin categoría",
+                        },
+                    },
+                    _pres: { $ifNull: ["$items.presentation", "Regular"] },
+                    _prod: {
+                        $cond: [
+                            { $ne: [{ $ifNull: ["$items.name", ""] }, ""] },
+                            "$items.name",
+                            { $ifNull: ["$_dish.name", "Producto"] },
+                        ],
+                    },
+                    _pay: { $ifNull: ["$paymentMethod", "Desconocido"] },
                     _qty: { $ifNull: ["$items.quantity", 0] },
                     _revenue: { $ifNull: ["$items.price", 0] },
                     _unitCost: { $ifNull: ["$items.unitCost", 0] },
                     _tax: { $ifNull: ["$items.taxAmount", 0] },
                 },
             },
+
+            ...(categoryFilterValue ? [{ $match: { _cat: categoryFilterValue } }] : []),
+
             {
                 $addFields: {
                     _costTotal: { $multiply: ["$_qty", "$_unitCost"] },
                 },
             },
+
             {
                 $group: {
                     _id: {
@@ -2755,7 +2896,6 @@ const getSalesByProductReport = async (req, res) => {
                         product: "$_prod",
                         paymentMethod: "$_pay",
                     },
-
                     categories: {
                         $addToSet: {
                             $cond: [
@@ -2772,13 +2912,13 @@ const getSalesByProductReport = async (req, res) => {
                             ],
                         },
                     },
-
                     qty: { $sum: "$_qty" },
                     revenue: { $sum: "$_revenue" },
                     costTotal: { $sum: "$_costTotal" },
                     taxTotal: { $sum: "$_tax" },
                 },
             },
+
             {
                 $addFields: {
                     category: {
@@ -2789,6 +2929,7 @@ const getSalesByProductReport = async (req, res) => {
                     },
                 },
             },
+
             {
                 $addFields: {
                     unitCost: {
@@ -2808,6 +2949,7 @@ const getSalesByProductReport = async (req, res) => {
                     profit: { $subtract: ["$revenue", "$costTotal"] },
                 },
             },
+
             {
                 $addFields: {
                     costPct: {
@@ -2826,6 +2968,7 @@ const getSalesByProductReport = async (req, res) => {
                     },
                 },
             },
+
             {
                 $project: {
                     _id: 0,
@@ -2845,6 +2988,7 @@ const getSalesByProductReport = async (req, res) => {
                     taxTotal: { $round: ["$taxTotal", 2] },
                 },
             },
+
             { $sort: { category: 1, presentation: 1, product: 1, paymentMethod: 1 } },
         ]);
 
