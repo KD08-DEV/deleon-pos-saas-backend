@@ -12,9 +12,17 @@ const cashMovementSchema = new mongoose.Schema(
 );
 const denomSchema = new mongoose.Schema(
     {
-        label: { type: String, required: true }, // "RD$ 1000", "RD$ 200", etc
-        value: { type: Number, required: true }, // 1000, 200...
-        count: { type: Number, required: true, min: 0 }, // cantidad de billetes/monedas
+        label: { type: String, required: true },
+        value: { type: Number, required: true },
+        count: { type: Number, required: true, min: 0 },
+
+        // cash = billete/moneda normal
+        // ticket = ticket/crédito físico contado como efectivo
+        kind: {
+            type: String,
+            enum: ["cash", "ticket"],
+            default: "cash",
+        },
     },
     { _id: false }
 );
@@ -44,6 +52,19 @@ const cashSessionSchema = new mongoose.Schema(
         notes: { type: String, default: "" },
         closing: {
             creditSales: { type: Number, default: 0 },
+            ticketTotal: { type: Number, default: 0 },
+
+            transferCountedTotal: { type: Number, default: 0 },
+            otherCountedTotal: { type: Number, default: 0 },
+
+            totalDeclaredAtClose: { type: Number, default: 0 },
+
+            expectedTicketSales: { type: Number, default: 0 },
+            expectedTransferSales: { type: Number, default: 0 },
+            expectedOtherSales: { type: Number, default: 0 },
+
+            transferDifference: { type: Number, default: 0 },
+            otherDifference: { type: Number, default: 0 },
 
             receivablePaymentsCash: { type: Number, default: 0 },
             receivablePaymentsCard: { type: Number, default: 0 },

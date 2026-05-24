@@ -187,11 +187,27 @@ const closeCashSession = async (req, res, next) => {
 
         let breakdown = Array.isArray(req.body?.breakdown) ? req.body.breakdown : [];
         const note = String(req.body?.note || "");
+        const transferCountedTotal = coerceMoney(req.body?.transferCountedTotal) || 0;
+        const otherCountedTotal = coerceMoney(req.body?.otherCountedTotal) || 0;
 
         // 2) Aceptar countedTotal aunque venga con comas: "2,000"
         let countedTotalRaw = req.body?.countedTotal;
         if (typeof countedTotalRaw === "string") countedTotalRaw = countedTotalRaw.replace(/,/g, "");
         let countedTotal = Number(countedTotalRaw);
+        const ticketTotal = Number(
+            breakdown
+                .filter((d) => String(d?.kind || "").toLowerCase() === "ticket")
+                .reduce((sum, d) => sum + Number(d.value || 0) * Number(d.count || 0), 0)
+                .toFixed(2)
+        );
+
+        const totalDeclaredAtClose = Number(
+            (
+                countedTotal +
+                transferCountedTotal +
+                otherCountedTotal
+            ).toFixed(2)
+        );
 
         // Si no hay breakdown, aceptamos countedTotal directo
         if (!breakdown.length) {
@@ -282,6 +298,10 @@ const closeCashSession = async (req, res, next) => {
             expectedCashSales,
             creditSales,
 
+            ticketTotal,
+            transferCountedTotal,
+            otherCountedTotal,
+            totalDeclaredAtClose,
             receivablePaymentsCash,
             receivablePaymentsCard,
             receivablePaymentsTransfer,
