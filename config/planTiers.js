@@ -30,7 +30,7 @@ const TIERS = {
             inventory: false,
             suppliers: false,
             purchases: false,
-            inventoryCategories: false,
+            inventoryCategories: true,
             fiscal: false,
             recipes: false,
             costing: false,
