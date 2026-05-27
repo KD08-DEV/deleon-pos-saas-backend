@@ -348,8 +348,8 @@ router.patch(
 
 router.patch(
     "/cash-session/close-adjust",
-    requireScope({ level: "client" }),
-    requireRole("Owner", "Admin"),
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
     adjustCashSessionClosing
 );
 
