@@ -999,7 +999,6 @@ const addOrder = async (req, res, next) => {
 // Si la orden se creó con mesa y ya tiene items, marcar mesa ocupada
         if (tableRef && Array.isArray(payload.items) && payload.items.length > 0) {
             const shouldFreeTable =
-                finalOrderStatus === "Completado" ||
                 finalOrderStatus === "Cancelado";
 
             await Table.updateOne(
@@ -1369,7 +1368,11 @@ function getOrderFinalizationDecision({
         chargeMode,
         isInvoiceAction,
         shouldFinalize,
-        finalOrderStatus: shouldFinalize ? "Completado" : normalizedStatus,
+
+        // IMPORTANTE:
+        // Facturar puede marcar pago, generar factura, NCF/e-CF e inventario,
+        // pero NO debe forzar el estado a Completado.
+        finalOrderStatus: normalizedStatus,
     };
 }
 
@@ -2373,9 +2376,10 @@ const updateOrder = async (req, res, next) => {
         } catch (e) {
             console.error("INVENTORY SYNC ERROR =>", e);
         }
-// ✅ Liberar mesa si cancelada/completada
+// ✅ Solo liberar mesa si la orden fue cancelada.
+// Completado NO debe desocupar la mesa automáticamente.
         if (
-            (incomingStatus === "Cancelado" || incomingStatus === "Completado") &&
+            incomingStatus === "Cancelado" &&
             current.table
         ) {
             const tableId = current.table?._id ? current.table._id : current.table;
@@ -2415,7 +2419,7 @@ const updateOrder = async (req, res, next) => {
                 );
             }
             // Ocupa/Reserva la nueva mesa (según si la orden tiene items)
-            if (incomingStatusNow !== "Cancelado" && incomingStatusNow !== "Completado") {
+            if (incomingStatusNow !== "Cancelado") {
                 const nextStatus = safeUpdate.isDraft ? "Reservada" : "Ocupada";
 
                 await Table.findOneAndUpdate(

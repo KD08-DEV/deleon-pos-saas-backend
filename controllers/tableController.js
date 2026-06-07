@@ -78,7 +78,7 @@ const getTables = async (req, res, next) => {
 
             const hasClosedOrder =
                 Boolean(currentOrder?._id) &&
-                ["Cancelado", "Completado"].includes(currentOrderStatus);
+                currentOrderStatus === "Cancelado";
 
             if (hasClosedOrder) {
                 staleTableIds.push(table._id);

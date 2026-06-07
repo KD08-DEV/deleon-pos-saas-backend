@@ -440,7 +440,7 @@ exports.updateDish = async (req, res, next) => {
     try {
         const { id } = req.params;
 
-        const {
+        let {
             name,
             price,
             category,
@@ -468,20 +468,17 @@ exports.updateDish = async (req, res, next) => {
 
         const planContext = await getTenantPlanContext(tenantId);
 
-        const isTryingInventoryChange =
-            isInventoryItem !== undefined ||
-            inventoryCategoryId !== undefined ||
-            inventoryType !== undefined ||
-            allowNegativeStock !== undefined ||
-            stockMin !== undefined ||
-            avgCost !== undefined ||
-            lastCost !== undefined;
-
-        if (isTryingInventoryChange && !planContext.features.inventory) {
-            return next(createHttpError(
-                403,
-                "Tu plan actual no incluye inventario. Mejora a Estándar, Premium o Pro para usar esta función."
-            ));
+        // En planes sin inventario, permitimos editar datos básicos del plato
+        // como nombre, categoría, área de producción, precio e imagen.
+        // Si el frontend manda campos de inventario por error, los ignoramos.
+        if (!planContext.features.inventory) {
+            inventoryCategoryId = undefined;
+            inventoryType = undefined;
+            allowNegativeStock = undefined;
+            stockMin = undefined;
+            avgCost = undefined;
+            lastCost = undefined;
+            isInventoryItem = undefined;
         }
 
         if (!mongoose.Types.ObjectId.isValid(id)) {
