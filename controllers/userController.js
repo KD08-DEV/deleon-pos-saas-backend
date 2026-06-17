@@ -53,6 +53,17 @@ function normalizePermissions(permissions = {}) {
         },
     };
 }
+function normalizeEmailKey(email) {
+    return String(email || "").trim().toLowerCase();
+}
+
+function escapeRegex(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildEmailRegex(email) {
+    return new RegExp(`^${escapeRegex(String(email || "").trim())}$`, "i");
+}
 const register = async (req, res, next) => {
     try {
         const { name, phone, email, password, role, tenantName, plan } = req.body;
@@ -220,8 +231,22 @@ const register = async (req, res, next) => {
             return next(createHttpError(400, "tenantId is required"));
         }
 
-        // ✅ Validar usuario existente en ESTE tenant (multi-tenant)
-        const isUserPresent = await User.findOne({ email, tenantId });
+        const cleanEmail = String(email || "").trim();
+        const emailKey = normalizeEmailKey(cleanEmail);
+
+        if (!emailKey) {
+            return next(createHttpError(400, "Email is required!"));
+        }
+
+        // ✅ Validar usuario existente en ESTE tenant sin importar mayúsculas/minúsculas
+        const isUserPresent = await User.findOne({
+            tenantId,
+            $or: [
+                { emailKey },
+                { email: { $regex: buildEmailRegex(cleanEmail) } }, // fallback para usuarios viejos
+            ],
+        });
+
         if (isUserPresent) {
             return next(createHttpError(400, "User already exist!"));
         }
@@ -230,9 +255,10 @@ const register = async (req, res, next) => {
         const newUser = await User.create({
             name: String(name || "").trim(),
             phone: String(phone || "").trim(),
-            email: String(email || "").trim().toLowerCase(),
+            email: cleanEmail,       // ✅ se guarda como lo escribiste
+            emailKey,                // ✅ se usa para login y validación
             password,
-            role,     // Admin / Cajera / Camarero / Cocina
+            role,
             tenantId,
         });
 
@@ -261,13 +287,17 @@ const login = async (req, res, next) => {
         const { email, password } = req.body;
 
         if (!email || !password) {
-            const error = createHttpError(400, "All fields are required!");
-            return next(error);
+            return next(createHttpError(400, "All fields are required!"));
         }
 
-        // 🔥 LOGIN SUPERADMIN (no va contra la DB)
+        const cleanEmail = String(email || "").trim();
+        const emailKey = normalizeEmailKey(cleanEmail);
+
+        // 🔥 LOGIN SUPERADMIN case-insensitive para el correo
+        const superAdminEmailKey = normalizeEmailKey(process.env.SUPERADMIN_EMAIL);
+
         if (
-            email === process.env.SUPERADMIN_EMAIL &&
+            emailKey === superAdminEmailKey &&
             password === process.env.SUPERADMIN_PASSWORD
         ) {
             const accessToken = jwt.sign(
@@ -298,18 +328,24 @@ const login = async (req, res, next) => {
             });
         }
 
+        // 🔐 LOGIN USUARIO NORMAL case-insensitive
+        const isUserPresent = await User.findOne({
+            $or: [
+                { emailKey },
+                { email: { $regex: buildEmailRegex(cleanEmail) } }, // fallback para usuarios viejos
+            ],
+        });
 
-        // 🔐 LOGIN USUARIO NORMAL
-        const isUserPresent = await User.findOne({ email });
         if (!isUserPresent) {
             return next(createHttpError(401, "Invalid Credentials"));
         }
 
         const isMatch = await bcrypt.compare(password, isUserPresent.password);
-        if (!isMatch) {
 
+        if (!isMatch) {
             return next(createHttpError(401, "Invalid Credentials"));
         }
+
         const membership = await Membership.findOne({
             user: isUserPresent._id,
             tenantId: isUserPresent.tenantId,
@@ -320,11 +356,9 @@ const login = async (req, res, next) => {
             membership?.permissions || DEFAULT_PERMISSIONS
         );
 
-// ✅ 1) Crear nueva sesión (invalidará la anterior)
-        const { deviceId } = req.body; // opcional
+        const { deviceId } = req.body;
         const sessionId = uuidv4();
 
-// ✅ 2) Guardar session activa en el usuario
         await User.updateOne(
             { _id: isUserPresent._id },
             {
@@ -332,11 +366,11 @@ const login = async (req, res, next) => {
                     activeSessionId: sessionId,
                     activeDeviceId: deviceId || null,
                     lastLoginAt: new Date(),
+                    emailKey: normalizeEmailKey(isUserPresent.email), // ✅ repara usuarios viejos al iniciar sesión
                 },
             }
         );
 
-// ✅ 3) Incluir sid en el JWT
         const accessToken = jwt.sign(
             {
                 _id: isUserPresent._id,
@@ -361,15 +395,9 @@ const login = async (req, res, next) => {
             data: {
                 _id: isUserPresent._id,
                 name: isUserPresent.name,
-                email: isUserPresent.email,
-
-                // IMPORTANTE:
-                // Mantén el role real del UserModel para no romper ProtectedRoutes/App/Admin.
+                email: isUserPresent.email, // ✅ devuelve el correo como fue guardado
                 role: isUserPresent.role,
-
-                // Membership separado para permisos internos.
                 membershipRole: membership?.role || isUserPresent.role,
-
                 tenantId: isUserPresent.tenantId,
                 clientIds: membership?.clientIds || ["default"],
                 permissions: normalizedPermissions,

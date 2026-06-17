@@ -35,6 +35,27 @@ const {
     getCashSessionsRange,
     adjustCashSessionClosing,
 } = require("../controllers/cashSessionController");
+const {
+    uploadTenantLogo,
+    deleteTenantLogo,
+} = require("../controllers/adminController");
+
+const uploadLogo = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: 2 * 1024 * 1024, // 2MB
+    },
+    fileFilter: (req, file, cb) => {
+        const allowed = ["image/png", "image/jpeg", "image/jpg"];
+
+        if (!allowed.includes(file.mimetype)) {
+            return cb(new Error("Formato inválido. Usa PNG, JPG o JPEG."));
+        }
+
+        cb(null, true);
+    },
+});
+
 
 const { getManagerCodeStatus, setManagerCode } = require("../controllers/adminController");
 
@@ -114,6 +135,43 @@ const upload = multer({
 });
 // Panel admin: nivel tenant
 router.use(verifyToken);
+
+// =======================
+// LOGO DEL NEGOCIO / FACTURA
+// =======================
+
+const handleUploadLogo = (req, res, next) => {
+    uploadLogo.single("logo")(req, res, (err) => {
+        if (!err) return next();
+
+        if (err.code === "LIMIT_FILE_SIZE") {
+            return res.status(413).json({
+                success: false,
+                message: "El logo no puede pesar más de 2MB.",
+            });
+        }
+
+        return res.status(400).json({
+            success: false,
+            message: err.message || "Archivo inválido. Usa PNG, JPG o JPEG.",
+        });
+    });
+};
+
+router.post(
+    "/tenant-logo",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    handleUploadLogo,
+    uploadTenantLogo
+);
+
+router.delete(
+    "/tenant-logo",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    deleteTenantLogo
+);
 
 // =======================
 // REPORTES BÁSICOS

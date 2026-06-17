@@ -10,6 +10,7 @@ const invoiceSchema = new mongoose.Schema(
         businessRNC: { type: String },
         businessAddress: { type: String },
         businessPhone: { type: String },
+        businessLogoUrl: { type: String, default: null },
 
         // ----- FISCAL -----
         invoiceNumber: { type: Number, required: true }, // correlativo por tenant

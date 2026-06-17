@@ -10,6 +10,10 @@ const InventoryMovement = require("../models/inventoryMovementModel");
 const createHttpError = require("http-errors");
 const bcrypt = require("bcrypt");
 const TenantSettings = require("../models/tenantSettingsModel");
+const path = require("path");
+const crypto = require("crypto");
+const { supabase } = require("../config/supabaseClient");
+const sharp = require("sharp");
 const {
     normalizePlan,
     getPlanFeatures,
@@ -649,7 +653,7 @@ exports.updateEmployee = async (req, res) => {
 exports.getFiscalConfig = async (req, res) => {
     try {
         const tenantId = req.user.tenantId;
-        const tenant = await Tenant.findOne({ tenantId }).select("plan fiscal features");
+        const tenant = await Tenant.findOne({ tenantId }).select("plan fiscal features business name");
         const normalizedPlan = normalizePlan(tenant?.plan);
         const planFeatures = getPlanFeatures(normalizedPlan);
 
@@ -708,6 +712,7 @@ exports.getFiscalConfig = async (req, res) => {
                 planFeatures,
                 fiscal: tenant?.fiscal || null,
                 features: norm,
+                business: tenant?.business || null,
             },
         });
     } catch (e) {
@@ -721,7 +726,7 @@ exports.updateFiscalConfig = async (req, res) => {
     try {
         const tenantId = req.user.tenantId;
 
-        const tenantPrev = await Tenant.findOne({ tenantId }).select("plan features fiscal");
+        const tenantPrev = await Tenant.findOne({ tenantId }).select("plan features fiscal business");
 
         if (!tenantPrev) {
             return res.status(404).json({
@@ -899,7 +904,7 @@ exports.updateFiscalConfig = async (req, res) => {
             { tenantId },
             { $set },
             { new: true }
-        ).select("plan fiscal features");
+        ).select("plan fiscal features business");
 
         const io = req.app.get("io");
         if (io) {
@@ -907,6 +912,7 @@ exports.updateFiscalConfig = async (req, res) => {
                 tenantId,
                 features: updated.features,
                 fiscal: updated.fiscal,
+                business: updated.business,
             });
         }
 
@@ -917,6 +923,7 @@ exports.updateFiscalConfig = async (req, res) => {
                 planFeatures: getPlanFeatures(updated.plan),
                 fiscal: updated.fiscal,
                 features: updated.features,
+                business: updated.business,
             },
         });
     } catch (e) {
@@ -1114,5 +1121,216 @@ exports.setManagerCode = async (req, res, next) => {
         });
     } catch (e) {
         return next(createHttpError(500, "SET_MANAGER_CODE_FAILED"));
+    }
+};
+const LOGO_BUCKET = process.env.SUPABASE_ASSETS_BUCKET || "invoices";
+
+const ALLOWED_LOGO_MIME = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+};
+
+exports.uploadTenantLogo = async (req, res) => {
+    try {
+        const tenantId = req.user?.tenantId;
+
+        if (!tenantId) {
+            return res.status(400).json({
+                success: false,
+                message: "Tenant no encontrado.",
+            });
+        }
+
+        if (!req.file) {
+            return res.status(400).json({
+                success: false,
+                message: "Debes seleccionar una imagen.",
+            });
+        }
+
+        const mime = String(req.file.mimetype || "").toLowerCase();
+        const ext = ALLOWED_LOGO_MIME[mime];
+
+        if (!ext) {
+            return res.status(400).json({
+                success: false,
+                message: "Formato inválido. Usa PNG, JPG o JPEG.",
+            });
+        }
+
+// ✅ Normalizar logo para que se vea mejor en factura
+        const processedLogoBuffer = await sharp(req.file.buffer)
+            .rotate()
+            .trim()
+            .resize({
+                width: 500,
+                height: 220,
+                fit: "inside",
+                withoutEnlargement: true,
+                background: { r: 255, g: 255, b: 255, alpha: 0 },
+            })
+            .png({
+                compressionLevel: 9,
+                quality: 100,
+            })
+            .toBuffer();
+
+        const tenant = await Tenant.findOne({ tenantId }).select("business");
+
+        if (!tenant) {
+            return res.status(404).json({
+                success: false,
+                message: "Tenant no encontrado.",
+            });
+        }
+
+        const oldLogoPath = tenant?.business?.logoPath || null;
+
+        const safeName = crypto.randomBytes(6).toString("hex");
+        const storagePath = `tenant-assets/tenant_${tenantId}/logo_${Date.now()}_${safeName}.png`;
+
+        const { error: uploadError } = await supabase.storage
+            .from(LOGO_BUCKET)
+            .upload(storagePath, processedLogoBuffer, {
+                contentType: "image/png",
+                upsert: true,
+            });
+
+        if (uploadError) {
+            throw uploadError;
+        }
+
+        const { data: publicData } = supabase.storage
+            .from(LOGO_BUCKET)
+            .getPublicUrl(storagePath);
+
+        const logoUrl = publicData?.publicUrl || null;
+
+        if (!logoUrl) {
+            return res.status(500).json({
+                success: false,
+                message: "Logo subido, pero no se pudo obtener la URL pública.",
+            });
+        }
+
+        const updated = await Tenant.findOneAndUpdate(
+            { tenantId },
+            {
+                $set: {
+                    "business.logoUrl": logoUrl,
+                    "business.logoPath": storagePath,
+                    "business.logoMime": "image/png",
+                    "business.logoUpdatedAt": new Date(),
+                },
+            },
+            { new: true }
+        ).select("plan fiscal features business");
+
+        // Limpia logo viejo si existía
+        if (oldLogoPath && oldLogoPath !== storagePath) {
+            try {
+                await supabase.storage.from(LOGO_BUCKET).remove([oldLogoPath]);
+            } catch (cleanupError) {
+                console.warn("[TENANT LOGO] No se pudo borrar logo anterior:", cleanupError?.message);
+            }
+        }
+
+        const io = req.app.get("io");
+        if (io) {
+            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", {
+                tenantId,
+                features: updated.features,
+                fiscal: updated.fiscal,
+                business: updated.business,
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: "Logo actualizado correctamente.",
+            data: {
+                business: updated.business,
+                logoUrl,
+                logoPath: storagePath,
+            },
+        });
+    } catch (error) {
+        console.error("❌ Error subiendo logo del tenant:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: error?.message || "Error subiendo logo del negocio.",
+        });
+    }
+};
+
+exports.deleteTenantLogo = async (req, res) => {
+    try {
+        const tenantId = req.user?.tenantId;
+
+        if (!tenantId) {
+            return res.status(400).json({
+                success: false,
+                message: "Tenant no encontrado.",
+            });
+        }
+
+        const tenant = await Tenant.findOne({ tenantId }).select("business");
+
+        if (!tenant) {
+            return res.status(404).json({
+                success: false,
+                message: "Tenant no encontrado.",
+            });
+        }
+
+        const oldLogoPath = tenant?.business?.logoPath || null;
+
+        if (oldLogoPath) {
+            try {
+                await supabase.storage.from(LOGO_BUCKET).remove([oldLogoPath]);
+            } catch (cleanupError) {
+                console.warn("[TENANT LOGO] No se pudo borrar logo:", cleanupError?.message);
+            }
+        }
+
+        const updated = await Tenant.findOneAndUpdate(
+            { tenantId },
+            {
+                $set: {
+                    "business.logoUrl": null,
+                    "business.logoPath": null,
+                    "business.logoMime": null,
+                    "business.logoUpdatedAt": null,
+                },
+            },
+            { new: true }
+        ).select("plan fiscal features business");
+
+        const io = req.app.get("io");
+        if (io) {
+            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", {
+                tenantId,
+                features: updated.features,
+                fiscal: updated.fiscal,
+                business: updated.business,
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: "Logo eliminado correctamente.",
+            data: {
+                business: updated.business,
+            },
+        });
+    } catch (error) {
+        console.error("❌ Error eliminando logo del tenant:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: error?.message || "Error eliminando logo del negocio.",
+        });
     }
 };

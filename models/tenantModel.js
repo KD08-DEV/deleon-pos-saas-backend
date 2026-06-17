@@ -118,6 +118,12 @@ const tenantSchema = new mongoose.Schema(
             rnc: { type: String, default: null },
             address: { type: String, default: null },
             phone: { type: String, default: null },
+
+            // ✅ Logo del negocio para facturas
+            logoUrl: { type: String, default: null },
+            logoPath: { type: String, default: null },
+            logoMime: { type: String, default: null },
+            logoUpdatedAt: { type: Date, default: null },
         },
     },
     { timestamps: true }

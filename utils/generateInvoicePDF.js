@@ -1,7 +1,8 @@
 const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const path = require("path");
-
+const http = require("http");
+const https = require("https");
 const Order = require("../models/orderModel");
 const Tenant = require("../models/tenantModel");
 const QRCode = require("qrcode");
@@ -34,6 +35,72 @@ const normalizeMongoDate = (val) => {
 const moneyRD = (n) => {
     const x = Number(n || 0);
     return `RD$${x.toFixed(2)}`;
+};
+const MAX_LOGO_BYTES = 2 * 1024 * 1024;
+
+const downloadImageBuffer = (url) => {
+    return new Promise((resolve, reject) => {
+        try {
+            if (!url) return resolve(null);
+
+            const parsed = new URL(url);
+            const client = parsed.protocol === "https:" ? https : http;
+
+            if (!["http:", "https:"].includes(parsed.protocol)) {
+                return reject(new Error("LOGO_URL_INVALID"));
+            }
+
+            const req = client.get(parsed, (res) => {
+                const statusCode = Number(res.statusCode || 0);
+
+                if ([301, 302, 303, 307, 308].includes(statusCode) && res.headers.location) {
+                    const redirectUrl = new URL(res.headers.location, parsed).toString();
+                    res.resume();
+                    return resolve(downloadImageBuffer(redirectUrl));
+                }
+
+                if (statusCode !== 200) {
+                    res.resume();
+                    return reject(new Error(`LOGO_DOWNLOAD_FAILED_${statusCode}`));
+                }
+
+                const contentType = String(res.headers["content-type"] || "")
+                    .split(";")[0]
+                    .toLowerCase();
+
+                if (!["image/png", "image/jpeg", "image/jpg"].includes(contentType)) {
+                    res.resume();
+                    return reject(new Error("LOGO_CONTENT_TYPE_NOT_SUPPORTED"));
+                }
+
+                const chunks = [];
+                let total = 0;
+
+                res.on("data", (chunk) => {
+                    total += chunk.length;
+
+                    if (total > MAX_LOGO_BYTES) {
+                        req.destroy(new Error("LOGO_TOO_LARGE"));
+                        return;
+                    }
+
+                    chunks.push(chunk);
+                });
+
+                res.on("end", () => {
+                    resolve(Buffer.concat(chunks));
+                });
+            });
+
+            req.setTimeout(8000, () => {
+                req.destroy(new Error("LOGO_DOWNLOAD_TIMEOUT"));
+            });
+
+            req.on("error", reject);
+        } catch (error) {
+            reject(error);
+        }
+    });
 };
 
 const getTaxRate = (order) => {
@@ -251,6 +318,32 @@ async function generateInvoicePDF(orderId, tenantId) {
         doc.pipe(stream);
 
         // Header: business
+// Header: logo + business
+        const businessLogoUrl = tenant?.business?.logoUrl || "";
+
+        if (businessLogoUrl) {
+            try {
+                const logoBuffer = await downloadImageBuffer(businessLogoUrl);
+
+                if (logoBuffer) {
+                    const logoWidth = 120;
+                    const logoHeight = 60;
+                    const logoX = (doc.page.width - logoWidth) / 2;
+                    const logoY = doc.y;
+
+                    doc.image(logoBuffer, logoX, logoY, {
+                        fit: [logoWidth, logoHeight],
+                        align: "center",
+                        valign: "center",
+                    });
+
+                    doc.y = logoY + logoHeight + 8;
+                }
+            } catch (logoError) {
+                console.warn("[PDF] No se pudo insertar logo:", logoError?.message);
+            }
+        }
+
         doc.fontSize(16).text(tenant?.business?.name || "Empresa", { align: "center" });
         doc.fontSize(10).text(`RNC: ${tenant?.business?.rnc || "N/A"}`, { align: "center" });
         doc.text(tenant?.business?.address || "", { align: "center" });
