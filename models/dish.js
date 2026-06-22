@@ -7,6 +7,7 @@ const dishSchema = new mongoose.Schema(
         // Para platos (menú). Para inventario lo dejaremos en 0 / "Inventario"
         price: { type: Number, required: true, min: 0 },
         category: { type: String, required: true, trim: true },
+        imageUrl: { type: String, default: "" },
 
         productionArea: {
             type: String,
