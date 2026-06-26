@@ -2685,8 +2685,26 @@ const getSalesByProductReport = async (req, res) => {
         const modernPaid = {
             ...baseOrderFilter,
             paymentStatus: "Pagado",
-            orderStatus: "Completado",
             paidAt: { $gte: start, $lte: end },
+        };
+        const modernPaidWithoutPaidAt = {
+            ...baseOrderFilter,
+            paymentStatus: "Pagado",
+            $and: [
+                ...(baseOrderFilter.$and || []),
+                {
+                    $or: [
+                        { paidAt: { $exists: false } },
+                        { paidAt: null },
+                    ],
+                },
+                {
+                    $or: [
+                        { invoicedAt: { $gte: start, $lte: end } },
+                        { createdAt: { $gte: start, $lte: end } },
+                    ],
+                },
+            ],
         };
 
         const legacyCompleted = {
@@ -2707,6 +2725,7 @@ const getSalesByProductReport = async (req, res) => {
         const match = {
             $or: [
                 modernPaid,
+                modernPaidWithoutPaidAt,
                 legacyCompleted,
                 legacyFiscal,
             ],
@@ -2726,7 +2745,6 @@ const getSalesByProductReport = async (req, res) => {
             }));
         }
 
-        if (presentation) itemMatch["items.presentation"] = presentation;
         const dishCollection = Dish.collection.name;
         const inventoryCategoryCollection = InventoryCategory.collection.name;
         const categoryFilterValue = String(category || "").trim();
@@ -2895,6 +2913,7 @@ const getSalesByProductReport = async (req, res) => {
 
             {
                 $group: {
+                    orders: { $addToSet: "$_id" },
                     _id: {
                         presentation: "$_pres",
                         product: "$_prod",
@@ -2925,6 +2944,7 @@ const getSalesByProductReport = async (req, res) => {
 
             {
                 $addFields: {
+                    orderCount: { $size: "$orders" },
                     category: {
                         $ifNull: [
                             { $arrayElemAt: ["$categories", 0] },
@@ -2982,6 +3002,7 @@ const getSalesByProductReport = async (req, res) => {
                     paymentMethod: "$_id.paymentMethod",
 
                     qty: 1,
+                    orderCount: 1,
                     unitCost: { $round: ["$unitCost", 2] },
                     unitPrice: { $round: ["$unitPrice", 2] },
                     revenue: { $round: ["$revenue", 2] },
