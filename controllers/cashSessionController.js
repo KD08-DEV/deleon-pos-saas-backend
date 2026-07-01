@@ -1018,9 +1018,15 @@ const adjustOpeningFloat = async (req, res, next) => {
             const addedTotal = Number(session.addedFloatTotal || 0);
             const expectedCashSales = Number(session.closing.expectedCashSales || 0);
             const countedTotal = Number(session.closing.countedTotal || 0);
+            const receivablePaymentsCash = Number(session.closing.receivablePaymentsCash || 0);
 
             const expectedInRegister = Number(
-                (openingFloat + addedTotal + expectedCashSales).toFixed(2)
+                (
+                    openingFloat +
+                    addedTotal +
+                    expectedCashSales +
+                    receivablePaymentsCash
+                ).toFixed(2)
             );
 
             const difference = Number(

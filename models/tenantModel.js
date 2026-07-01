@@ -54,8 +54,9 @@ const tenantSchema = new mongoose.Schema(
             issueDate: { type: String, default: null },
         },
 
-
-
+        counters: {
+            nextOrderNumber: { type: Number, default: 1 },
+        },
 
         features: {
             tax: {

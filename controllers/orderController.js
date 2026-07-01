@@ -934,9 +934,15 @@ const addOrder = async (req, res, next) => {
             };
         }
 
+// ✅ Toda orden real debe tener número de operación.
+// Esto NO es factura fiscal. Es para Ticket / Actualizar / Orden en progreso.
+        const assignedOperation = await allocateOperationSeq({ tenantId });
+
         const payload = {
             tenantId,
             clientId,
+            operationSeq: assignedOperation.operationSeq,
+            operationNumber: assignedOperation.operationNumber,
             customerId: resolvedCustomerId,
             customerDetails: resolvedCustomerDetails,
             orderStatus: finalOrderStatus,
@@ -1304,8 +1310,6 @@ async function allocateInternalSeq({ tenantId }) {
 
     const next = Number(tenant?.fiscal?.nextInvoiceNumber ?? 0);
 
-    // normal: asignado = next - 1
-    // fallback: si el tenant viejo tenía 0, asignado sería 0 (inválido)
     let assigned = next - 1;
     if (!Number.isFinite(assigned) || assigned <= 0) assigned = next;
 
@@ -1316,7 +1320,50 @@ async function allocateInternalSeq({ tenantId }) {
     }
 
     const internalNumber = String(assigned).padStart(8, "0");
-    return { internalSeq: assigned, internalNumber };
+
+    return {
+        internalSeq: assigned,
+        internalNumber,
+    };
+}
+
+async function allocateOperationSeq({ tenantId }) {
+    const tenant = await Tenant.findOneAndUpdate(
+        { tenantId },
+        [
+            {
+                $set: {
+                    "counters.nextOrderNumber": {
+                        $add: [
+                            { $ifNull: ["$counters.nextOrderNumber", 1] },
+                            1,
+                        ],
+                    },
+                },
+            },
+        ],
+        { new: true }
+    ).lean();
+
+    if (!tenant) {
+        const err = new Error("Tenant no encontrado para asignar número de orden.");
+        err.statusCode = 404;
+        throw err;
+    }
+
+    const next = Number(tenant?.counters?.nextOrderNumber ?? 0);
+    const assigned = next - 1;
+
+    if (!Number.isFinite(assigned) || assigned <= 0) {
+        const err = new Error("No se pudo asignar número de orden.");
+        err.statusCode = 500;
+        throw err;
+    }
+
+    return {
+        operationSeq: assigned,
+        operationNumber: String(assigned).padStart(8, "0"),
+    };
 }
 
 function getExistingInternalInvoiceNumber(order = {}) {
@@ -1623,9 +1670,29 @@ const updateOrder = async (req, res, next) => {
             $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
         };
 
-        // ✅ Orden actual primero (evita TDZ errors)
+// ✅ Primero buscamos la orden actual.
+// IMPORTANTE: current debe existir antes de leer current.items, current.paymentMethod, etc.
         const current = await Order.findOne(orderScope);
         if (!current) return next(createHttpError(404, "Order not found!"));
+
+        const incomingItemsForOperation = Array.isArray(req.body?.items)
+            ? req.body.items
+            : [];
+
+        const currentItemsForOperation = Array.isArray(current.items)
+            ? current.items
+            : [];
+
+        const shouldHaveOperationNumber =
+            incomingItemsForOperation.length > 0 ||
+            currentItemsForOperation.length > 0;
+
+        let assignedOperation = null;
+
+        if (!current.operationNumber && shouldHaveOperationNumber) {
+            assignedOperation = await allocateOperationSeq({ tenantId });
+        }
+
         const normalizedIncomingPaymentMethod = String(
             req.body?.paymentMethod ?? current?.paymentMethod ?? "Efectivo"
         ).trim();
@@ -1747,6 +1814,10 @@ const updateOrder = async (req, res, next) => {
                 ...(fiscalSafeFromClient || {}),
             },
         };
+        if (assignedOperation) {
+            safeUpdate.operationSeq = assignedOperation.operationSeq;
+            safeUpdate.operationNumber = assignedOperation.operationNumber;
+        }
 
         let nextCustomerId = current.customerId || null;
 
