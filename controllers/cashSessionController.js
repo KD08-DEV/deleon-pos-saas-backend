@@ -47,34 +47,81 @@ const getEffectivePaymentMethod = (o) => {
     return null;
 };
 function buildLegacyCashOrdersFilter({ tenantId, clientId, registerId, start, end, userId, role }) {
+    const paidAtMissing = {
+        $or: [
+            { paidAt: { $exists: false } },
+            { paidAt: null },
+            { paidAt: "" },
+        ],
+    };
+
+    const legacyPaymentStatusFilter = {
+        $or: [
+            { paymentStatus: { $exists: false } },
+            { paymentStatus: null },
+            { paymentStatus: "" },
+            { paymentStatus: "Pendiente" },
+        ],
+    };
+
     const baseFilter = {
         tenantId,
         clientId,
         registerId,
-        orderStatus: { $ne: "Cancelado" },
-        $or: [
+
+        isDraft: { $ne: true },
+        "items.0": { $exists: true },
+
+        $and: [
             {
-                paymentStatus: "Pagado",
-                orderStatus: "Completado",
-                paidAt: { $gte: start, $lte: end },
+                $or: [
+                    { orderStatus: { $exists: false } },
+                    { orderStatus: { $ne: "Cancelado" } },
+                ],
             },
             {
                 $or: [
                     { paymentStatus: { $exists: false } },
-                    { paymentStatus: null },
-                    { paymentStatus: "" },
-                    { paymentStatus: "Pendiente" },
+                    { paymentStatus: { $ne: "Anulado" } },
                 ],
+            },
+            {
+                $or: [
+                    { paymentMethod: { $exists: false } },
+                    { paymentMethod: { $ne: "Credito" } },
+                ],
+            },
+        ],
+
+        $or: [
+            // Venta moderna pagada:
+            // NO exigir orderStatus Completado.
+            // Si está pagada, debe contar para caja.
+            {
+                paymentStatus: "Pagado",
+                paidAt: { $gte: start, $lte: end },
+            },
+
+            // Venta pagada vieja sin paidAt.
+            {
+                paymentStatus: "Pagado",
+                ...paidAtMissing,
+                $or: [
+                    { invoicedAt: { $gte: start, $lte: end } },
+                    { createdAt: { $gte: start, $lte: end } },
+                ],
+            },
+
+            // Legacy: completada sin paymentStatus moderno.
+            {
+                ...legacyPaymentStatusFilter,
                 orderStatus: "Completado",
                 createdAt: { $gte: start, $lte: end },
             },
+
+            // Legacy: fiscal solicitada sin paymentStatus moderno.
             {
-                $or: [
-                    { paymentStatus: { $exists: false } },
-                    { paymentStatus: null },
-                    { paymentStatus: "" },
-                    { paymentStatus: "Pendiente" },
-                ],
+                ...legacyPaymentStatusFilter,
                 "fiscal.requested": true,
                 createdAt: { $gte: start, $lte: end },
             },
@@ -83,16 +130,12 @@ function buildLegacyCashOrdersFilter({ tenantId, clientId, registerId, start, en
 
     const cashierFilter = buildCashierOrdersFilter({ role, userId });
 
-    if (!Object.keys(cashierFilter).length) {
-        return baseFilter;
+    if (Object.keys(cashierFilter).length) {
+        baseFilter.$and.push(cashierFilter);
     }
 
-    return {
-        ...baseFilter,
-        $and: [cashierFilter],
-    };
+    return baseFilter;
 }
-
 const bcrypt = require("bcryptjs");
 const TenantSettings = require("../models/tenantSettingsModel");
 
@@ -288,9 +331,8 @@ const closeCashSession = async (req, res, next) => {
 
         // efectivo esperado en caja = fondo inicial + agregado + ventas en efectivo
         const expectedInRegister = Number(
-            (openingInitial + addedTotal + expectedCashSales + receivablePaymentsCash).toFixed(2)
+            (expectedCashSales + receivablePaymentsCash).toFixed(2)
         );
-
         const difference = Number((countedTotal - expectedInRegister).toFixed(2));
 
         session.closing = {
@@ -899,7 +941,7 @@ const addCashToSession = async (req, res, next) => {
             const receivablePaymentsTotal = Number(receivablePaymentsSummary?.total || 0);
 
             const expectedInRegister = Number(
-                (openingInitial + addedTotal + expectedCashSales + receivablePaymentsCash).toFixed(2)
+                (expectedCashSales + receivablePaymentsCash).toFixed(2)
             );
 
             const difference = Number((countedTotal - expectedInRegister).toFixed(2));
@@ -1021,12 +1063,7 @@ const adjustOpeningFloat = async (req, res, next) => {
             const receivablePaymentsCash = Number(session.closing.receivablePaymentsCash || 0);
 
             const expectedInRegister = Number(
-                (
-                    openingFloat +
-                    addedTotal +
-                    expectedCashSales +
-                    receivablePaymentsCash
-                ).toFixed(2)
+                (expectedCashSales + receivablePaymentsCash).toFixed(2)
             );
 
             const difference = Number(
@@ -1147,14 +1184,17 @@ const adjustCashSessionClosing = async (req, res, next) => {
         // Recalcular expectedCashSales con reglas “delivery efectivo cuenta como efectivo”
         const { start, end } = getRangeForDay(dateYMD);
 
-        const orders = await Order.find({
-            tenantId,
-            clientId,
-            registerId,
-            paidAt: { $gte: start, $lte: end },
-            paymentStatus: "Pagado",
-            orderStatus: "Completado",
-        }).select("paymentMethod paymentMethodType paymentMethodReal deliveryPaymentMethod payment.method paidWith bills.totalWithTax registerId paidAt");
+        const orders = await Order.find(
+            buildLegacyCashOrdersFilter({
+                tenantId,
+                clientId,
+                registerId,
+                start,
+                end,
+                userId,
+                role,
+            })
+        ).select("paymentMethod paymentMethodType paymentMethodReal deliveryPaymentMethod payment.method paidWith bills.totalWithTax registerId paidAt createdAt paymentStatus orderStatus fiscal");
 
         const expectedCashSales = Number(
             orders
@@ -1182,7 +1222,7 @@ const adjustCashSessionClosing = async (req, res, next) => {
         const receivablePaymentsTotal = Number(receivablePaymentsSummary?.total || 0);
 
         const expectedInRegister = Number(
-            (openingInitial + addedTotal + expectedCashSales + receivablePaymentsCash).toFixed(2)
+            (expectedCashSales + receivablePaymentsCash).toFixed(2)
         );
 
         const difference = Number((countedTotal - expectedInRegister).toFixed(2));

@@ -2825,9 +2825,32 @@ const getSalesByProductReport = async (req, res) => {
 
         const rows = await Order.aggregate([
             { $match: match },
-            { $unwind: "$items" },
-            ...(Object.keys(itemMatch).length ? [{ $match: itemMatch }] : []),
 
+            // IMPORTANTE:
+            // Esto debe ir ANTES del $unwind porque $map necesita que items sea un array.
+            {
+                $addFields: {
+                    _orderItemsSubtotal: {
+                        $sum: {
+                            $map: {
+                                input: {
+                                    $cond: [
+                                        { $isArray: "$items" },
+                                        "$items",
+                                        []
+                                    ],
+                                },
+                                as: "it",
+                                in: { $ifNull: ["$$it.price", 0] },
+                            },
+                        },
+                    },
+                },
+            },
+
+            { $unwind: "$items" },
+
+            ...(Object.keys(itemMatch).length ? [{ $match: itemMatch }] : []),
             {
                 $addFields: {
                     _dishObjectId: {
@@ -2970,7 +2993,81 @@ const getSalesByProductReport = async (req, res) => {
                     _qty: { $ifNull: ["$items.quantity", 0] },
                     _revenue: { $ifNull: ["$items.price", 0] },
                     _unitCost: { $ifNull: ["$items.unitCost", 0] },
-                    _tax: { $ifNull: ["$items.taxAmount", 0] },
+                    _lineRatio: {
+                        $cond: [
+                            { $gt: ["$_orderItemsSubtotal", 0] },
+                            {
+                                $divide: [
+                                    { $ifNull: ["$items.price", 0] },
+                                    "$_orderItemsSubtotal",
+                                ],
+                            },
+                            0,
+                        ],
+                    },
+
+                    _tax: {
+                        $cond: [
+                            { $gt: [{ $ifNull: ["$items.taxAmount", 0] }, 0] },
+                            { $ifNull: ["$items.taxAmount", 0] },
+                            {
+                                $multiply: [
+                                    { $ifNull: ["$bills.tax", 0] },
+                                    {
+                                        $cond: [
+                                            { $gt: ["$_orderItemsSubtotal", 0] },
+                                            { $divide: [{ $ifNull: ["$items.price", 0] }, "$_orderItemsSubtotal"] },
+                                            0,
+                                        ],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+
+                    _tip: {
+                        $multiply: [
+                            { $ifNull: ["$bills.tip", 0] },
+                            {
+                                $cond: [
+                                    { $gt: ["$_orderItemsSubtotal", 0] },
+                                    { $divide: [{ $ifNull: ["$items.price", 0] }, "$_orderItemsSubtotal"] },
+                                    0,
+                                ],
+                            },
+                        ],
+                    },
+                },
+
+            },
+            {
+                $addFields: {
+                    _tax: {
+                        $cond: [
+                            { $gt: [{ $ifNull: ["$items.taxAmount", 0] }, 0] },
+                            { $ifNull: ["$items.taxAmount", 0] },
+                            {
+                                $multiply: [
+                                    { $ifNull: ["$bills.tax", 0] },
+                                    "$_lineRatio",
+                                ],
+                            },
+                        ],
+                    },
+
+                    _tip: {
+                        $multiply: [
+                            { $ifNull: ["$bills.tip", 0] },
+                            "$_lineRatio",
+                        ],
+                    },
+
+                    _deliveryFeeShare: {
+                        $multiply: [
+                            { $ifNull: ["$bills.deliveryFee", 0] },
+                            "$_lineRatio",
+                        ],
+                    },
                 },
             },
 
@@ -2979,6 +3076,14 @@ const getSalesByProductReport = async (req, res) => {
             {
                 $addFields: {
                     _costTotal: { $multiply: ["$_qty", "$_unitCost"] },
+                    _grossRevenue: {
+                        $add: [
+                            "$_revenue",
+                            "$_tax",
+                            "$_tip",
+                            "$_deliveryFeeShare",
+                        ],
+                    },
                 },
             },
 
@@ -2990,6 +3095,9 @@ const getSalesByProductReport = async (req, res) => {
                         product: "$_prod",
                         paymentMethod: "$_pay",
                     },
+
+                    qty: { $sum: "$_qty" },
+
                     categories: {
                         $addToSet: {
                             $cond: [
@@ -3006,10 +3114,12 @@ const getSalesByProductReport = async (req, res) => {
                             ],
                         },
                     },
-                    qty: { $sum: "$_qty" },
                     revenue: { $sum: "$_revenue" },
+                    grossRevenue: { $sum: "$_grossRevenue" },
                     costTotal: { $sum: "$_costTotal" },
                     taxTotal: { $sum: "$_tax" },
+                    tipTotal: { $sum: "$_tip" },
+                    deliveryFeeTotal: { $sum: "$_deliveryFeeShare" },
                 },
             },
 
@@ -3077,11 +3187,14 @@ const getSalesByProductReport = async (req, res) => {
                     unitCost: { $round: ["$unitCost", 2] },
                     unitPrice: { $round: ["$unitPrice", 2] },
                     revenue: { $round: ["$revenue", 2] },
+                    grossRevenue: { $round: ["$grossRevenue", 2] },
                     costTotal: { $round: ["$costTotal", 2] },
                     profit: { $round: ["$profit", 2] },
                     costPct: { $round: ["$costPct", 2] },
                     profitPct: { $round: ["$profitPct", 2] },
                     taxTotal: { $round: ["$taxTotal", 2] },
+                    tipTotal: { $round: ["$tipTotal", 2] },
+                    deliveryFeeTotal: { $round: ["$deliveryFeeTotal", 2] },
                 },
             },
 
@@ -3098,7 +3211,10 @@ const getSalesByProductReport = async (req, res) => {
             },
         });
     } catch (err) {
-        console.error("getSalesByProductReport error:", err);
+        console.error("getSalesByProductReport error:", {
+            message: err?.message,
+            stack: err?.stack,
+        });
         return res.status(500).json({
             success: false,
             message: "Error interno",

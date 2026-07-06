@@ -19,7 +19,36 @@ const {
     getPlanFeatures,
 } = require("../middlewares/requirePlan");
 
+const normalizePaymentText = (v) =>
+    String(v || "")
+        .trim()
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "");
 
+function getEffectivePaymentMethodForReport(o = {}) {
+    const pm = normalizePaymentText(o?.paymentMethod);
+
+    if (pm === "efectivo" || pm === "cash") return "Efectivo";
+    if (pm === "tarjeta" || pm === "card") return "Tarjeta";
+    if (pm === "transferencia" || pm === "transfer") return "Transferencia";
+    if (pm === "credito" || pm === "credit") return "Credito";
+
+    const alt = normalizePaymentText(
+        o?.paymentMethodType ||
+        o?.paymentMethodReal ||
+        o?.deliveryPaymentMethod ||
+        o?.payment?.method ||
+        o?.paidWith
+    );
+
+    if (alt === "efectivo" || alt === "cash") return "Efectivo";
+    if (alt === "tarjeta" || alt === "card") return "Tarjeta";
+    if (alt === "transferencia" || alt === "transfer") return "Transferencia";
+    if (alt === "credito" || alt === "credit") return "Credito";
+
+    return o?.paymentMethod || "Otros";
+}
 function parseReportBoundary(value, endOfDay = false) {
     const raw = String(value || "").trim();
     if (!raw) return null;
@@ -40,6 +69,17 @@ function parseReportBoundary(value, endOfDay = false) {
     else d.setHours(0, 0, 0, 0);
 
     return d;
+}
+function formatYMDInReportTZ(value) {
+    const date = value instanceof Date ? value : new Date(value);
+
+    if (!value || Number.isNaN(date.getTime())) {
+        return null;
+    }
+
+    return date.toLocaleDateString("en-CA", {
+        timeZone: "America/Santo_Domingo",
+    });
 }
 function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, endDate }) {
     const rawClientId = String(clientId || "default").trim() || "default";
@@ -89,11 +129,30 @@ function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, en
             ? { createdAt: { $gte: startDate, $lte: endDate } }
             : {};
 
+    const invoiceDateRange =
+        startDate && endDate
+            ? {
+                $or: [
+                    { invoicedAt: { $gte: startDate, $lte: endDate } },
+                    { createdAt: { $gte: startDate, $lte: endDate } },
+                ],
+            }
+            : {};
+
     const paidAtMissing = {
         $or: [
             { paidAt: { $exists: false } },
             { paidAt: null },
             { paidAt: "" },
+        ],
+    };
+
+    const legacyPaymentStatusFilter = {
+        $or: [
+            { paymentStatus: { $exists: false } },
+            { paymentStatus: null },
+            { paymentStatus: "" },
+            { paymentStatus: "Pendiente" },
         ],
     };
 
@@ -105,13 +164,21 @@ function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, en
         $and: [
             clientScope,
 
-            // No traer canceladas/anuladas.
+            {
+                isDraft: { $ne: true },
+            },
+
+            {
+                "items.0": { $exists: true },
+            },
+
             {
                 $or: [
                     { orderStatus: { $exists: false } },
                     { orderStatus: { $nin: ["Cancelado", "Canceled", "Cancelled"] } },
                 ],
             },
+
             {
                 $or: [
                     { paymentStatus: { $exists: false } },
@@ -121,55 +188,48 @@ function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, en
 
             {
                 $or: [
-                    /*
-                     * Venta pagada moderna con paidAt.
-                     * No exigimos orderStatus Completado porque algunas ventas
-                     * ya están pagadas/facturadas pero el status queda En Progreso.
-                     */
+                    // Venta moderna pagada: usa paidAt
                     {
                         paymentStatus: "Pagado",
                         ...paidDateRange,
                     },
 
-                    /*
-                     * Venta pagada sin paidAt, usando createdAt.
-                     */
+                    // Venta pagada vieja sin paidAt: usa invoicedAt o createdAt
                     {
                         paymentStatus: "Pagado",
                         ...paidAtMissing,
-                        ...createdDateRange,
+                        ...invoiceDateRange,
                     },
 
-                    /*
-                     * Venta completada legacy.
-                     */
+                    // Legacy: completada pero sin paymentStatus moderno
                     {
+                        ...legacyPaymentStatusFilter,
                         orderStatus: "Completado",
                         ...createdDateRange,
                     },
 
-                    /*
-                     * Factura fiscal/e-CF emitida o solicitada.
-                     */
+                    // Legacy: fiscal solicitada pero sin paymentStatus moderno
                     {
+                        ...legacyPaymentStatusFilter,
                         "fiscal.requested": true,
                         ...createdDateRange,
                     },
 
-                    /*
-                     * Órdenes que tienen número de factura interno.
-                     */
+                    // Legacy: factura interna pero sin paymentStatus moderno
                     {
+                        ...legacyPaymentStatusFilter,
                         invoiceNumber: { $exists: true, $nin: [null, ""] },
                         ...createdDateRange,
                     },
 
                     {
+                        ...legacyPaymentStatusFilter,
                         facturaNo: { $exists: true, $nin: [null, ""] },
                         ...createdDateRange,
                     },
 
                     {
+                        ...legacyPaymentStatusFilter,
                         internalInvoiceNumber: { $exists: true, $nin: [null, ""] },
                         ...createdDateRange,
                     },
@@ -330,23 +390,26 @@ exports.getReports = async (req, res) => {
             netSales: Number((totalSales - mermaCost).toFixed(2)),
             avgTicket: Number(avgTicket.toFixed(2)),
             cashSales: orders
-                .filter((o) => o.paymentMethod === "Efectivo")
+                .filter((o) => getEffectivePaymentMethodForReport(o) === "Efectivo")
                 .reduce((s, o) => s + (Number(o.bills?.totalWithTax) || 0), 0),
 
             onlineSales: orders
-                .filter((o) => o.paymentMethod === "Tarjeta")
+                .filter((o) => getEffectivePaymentMethodForReport(o) === "Tarjeta")
                 .reduce((s, o) => s + (Number(o.bills?.totalWithTax) || 0), 0),
 
             transferSales: orders
-                .filter((o) => o.paymentMethod === "Transferencia")
+                .filter((o) => getEffectivePaymentMethodForReport(o) === "Transferencia")
                 .reduce((s, o) => s + (Number(o.bills?.totalWithTax) || 0), 0),
         };
 
         // 🔹 También agrupar por fecha (para gráficas)
         const groupedByDate = {};
         orders.forEach((o) => {
-            const refDate = o.paidAt || o.createdAt;
-            const date = new Date(refDate).toISOString().split("T")[0];
+            const refDate = o.paidAt || o.invoicedAt || o.createdAt;
+            const date = formatYMDInReportTZ(refDate);
+
+            if (!date) return;
+
             if (!groupedByDate[date]) groupedByDate[date] = 0;
             groupedByDate[date] += Number(o.bills?.totalWithTax) || 0;
         });
