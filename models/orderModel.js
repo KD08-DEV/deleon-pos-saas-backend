@@ -126,7 +126,11 @@ const orderSchema = new mongoose.Schema(
                 default: null,
             },
             requested: { type: Boolean, default: false },
-            ncfType: { type: String, default: "B02" },
+            ncfType: {
+                type: String,
+                enum: ["B01", "B02", null],
+                default: null,
+            },
             ncfNumber: { type: String, default: null },
             issuedAt: { type: Date, default: null },
 

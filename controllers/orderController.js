@@ -667,7 +667,7 @@ const addOrder = async (req, res, next) => {
 
         let fiscalPayload = {
             requested: false,
-            ncfType: "B02",
+            ncfType: null,
         };
 
         let topLevelNcfNumber = null;
