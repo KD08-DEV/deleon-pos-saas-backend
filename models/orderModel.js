@@ -204,6 +204,24 @@ const orderSchema = new mongoose.Schema(
 
 // Ordenar y consultar por tenant + fecha de creación
 orderSchema.index({ tenantId: 1, clientId: 1,createdAt: -1 });
+orderSchema.index({
+    tenantId: 1,
+    clientId: 1,
+    createdAt: -1,
+});
 
+orderSchema.index({
+    tenantId: 1,
+    clientId: 1,
+    orderStatus: 1,
+    createdAt: -1,
+});
+
+orderSchema.index({
+    tenantId: 1,
+    clientId: 1,
+    isDraft: 1,
+    createdAt: -1,
+});
 module.exports = mongoose.model("Order", orderSchema);
 

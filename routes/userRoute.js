@@ -18,6 +18,6 @@ router.post("/register",
     requireRole("Owner","Admin"),
     register
 );
-router.post("/register", verifyToken, register);
+
 
 module.exports = router;

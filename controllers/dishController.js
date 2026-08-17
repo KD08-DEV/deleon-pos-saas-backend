@@ -56,6 +56,172 @@ const normalizeProductionArea = (value) => {
     const v = String(value || "kitchen").trim().toLowerCase();
     return VALID_PRODUCTION_AREAS.includes(v) ? v : "kitchen";
 };
+const parseBooleanField = (value, fallback = false) => {
+    if (
+        value === undefined ||
+        value === null ||
+        value === ""
+    ) {
+        return fallback;
+    }
+
+    if (typeof value === "boolean") {
+        return value;
+    }
+
+    return String(value).trim().toLowerCase() === "true";
+};
+
+const parseArrayField = (value, fieldName) => {
+    if (value === undefined) {
+        return undefined;
+    }
+
+    if (value === null || value === "") {
+        return [];
+    }
+
+    if (Array.isArray(value)) {
+        return value;
+    }
+
+    try {
+        const parsed = JSON.parse(value);
+
+        if (!Array.isArray(parsed)) {
+            throw new Error(`${fieldName} debe ser un arreglo`);
+        }
+
+        return parsed;
+    } catch (error) {
+        throw createHttpError(
+            400,
+            `${fieldName} tiene un formato inválido`
+        );
+    }
+};
+
+const normalizeCustomizationInput = ({
+                                         customizationEnabled,
+                                         removableIngredients,
+                                         extras,
+                                     }) => {
+    const parsedIngredients =
+        parseArrayField(
+            removableIngredients,
+            "removableIngredients"
+        ) || [];
+
+    const parsedExtras =
+        parseArrayField(
+            extras,
+            "extras"
+        ) || [];
+
+    const normalizedIngredients = parsedIngredients
+        .map((ingredient) => {
+            const name = String(
+                ingredient?.name ||
+                ingredient?.label ||
+                ""
+            ).trim();
+
+            if (!name) {
+                return null;
+            }
+
+            const ingredientDishId =
+                ingredient?.ingredientDishId ||
+                ingredient?.dishId ||
+                null;
+
+            if (
+                ingredientDishId &&
+                !mongoose.Types.ObjectId.isValid(
+                    String(ingredientDishId)
+                )
+            ) {
+                throw createHttpError(
+                    400,
+                    `Ingrediente inválido: ${name}`
+                );
+            }
+
+            return {
+                ingredientDishId: ingredientDishId || null,
+                name,
+                active: ingredient?.active !== false,
+            };
+        })
+        .filter(Boolean);
+
+    const normalizedExtras = parsedExtras
+        .map((extra) => {
+            const name = String(
+                extra?.name ||
+                extra?.label ||
+                ""
+            ).trim();
+
+            if (!name) {
+                return null;
+            }
+
+            const extraDishId =
+                extra?.extraDishId ||
+                extra?.dishId ||
+                null;
+
+            if (
+                extraDishId &&
+                !mongoose.Types.ObjectId.isValid(
+                    String(extraDishId)
+                )
+            ) {
+                throw createHttpError(
+                    400,
+                    `Extra inválido: ${name}`
+                );
+            }
+
+            const price = Number(extra?.price || 0);
+
+            if (!Number.isFinite(price) || price < 0) {
+                throw createHttpError(
+                    400,
+                    `Precio inválido para el extra: ${name}`
+                );
+            }
+
+            const maxQuantityRaw =
+                Number(extra?.maxQuantity || 5);
+
+            const maxQuantity =
+                Number.isFinite(maxQuantityRaw) &&
+                maxQuantityRaw >= 1
+                    ? Math.floor(maxQuantityRaw)
+                    : 5;
+
+            return {
+                extraDishId: extraDishId || null,
+                name,
+                price: Number(price.toFixed(2)),
+                maxQuantity,
+                active: extra?.active !== false,
+            };
+        })
+        .filter(Boolean);
+
+    return {
+        enabled: parseBooleanField(
+            customizationEnabled,
+            false
+        ),
+
+        removableIngredients: normalizedIngredients,
+        extras: normalizedExtras,
+    };
+};
 
 const uploadToSupabase = async (tenantId, file) => {
     const ext = file.originalname.split(".").pop();
@@ -137,7 +303,9 @@ exports.addDish = async (req, res, next) => {
             category,
             inventoryCategoryId,
             productionArea,
-
+            customizationEnabled,
+            removableIngredients,
+            extras,
             sellMode,
             weightUnit,
             pricePerLb,
@@ -304,7 +472,17 @@ exports.addDish = async (req, res, next) => {
             stockMin !== undefined && stockMin !== null && stockMin !== ""
                 ? Number(stockMin)
                 : 0;
-
+        const customization = isInv
+            ? {
+                enabled: false,
+                removableIngredients: [],
+                extras: [],
+            }
+            : normalizeCustomizationInput({
+                customizationEnabled,
+                removableIngredients,
+                extras,
+            });
         const newDish = await Dish.create({
             name: String(name).trim(),
             price: finalPrice,
@@ -333,6 +511,8 @@ exports.addDish = async (req, res, next) => {
             avgCost: isInv || isDirectStockProduct ? avg : null,
             lastCost: isInv || isDirectStockProduct ? last : null,
             allowCustomPrice: allowCP,
+            customization,
+
 
             ...(sm !== undefined ? { sellMode: sm } : {}),
             ...(wu !== undefined ? { weightUnit: wu } : {}),
@@ -452,12 +632,16 @@ exports.updateDish = async (req, res, next) => {
             isInventoryItem,
             unit,
 
-            // NUEVO
+
             inventoryType,
             allowNegativeStock,
             stockMin,
             avgCost,
             lastCost,
+
+            customizationEnabled,
+            removableIngredients,
+            extras,
         } = req.body;
 
         const tenantId = req.user?.tenantId;
@@ -657,7 +841,37 @@ exports.updateDish = async (req, res, next) => {
         if (productionArea !== undefined) {
             dish.productionArea = normalizeProductionArea(productionArea);
         }
+        const hasCustomizationPayload =
+            customizationEnabled !== undefined ||
+            removableIngredients !== undefined ||
+            extras !== undefined;
 
+        if (hasCustomizationPayload) {
+            if (dish.isInventoryItem) {
+                dish.customization = {
+                    enabled: false,
+                    removableIngredients: [],
+                    extras: [],
+                };
+            } else {
+                dish.customization = normalizeCustomizationInput({
+                    customizationEnabled:
+                        customizationEnabled !== undefined
+                            ? customizationEnabled
+                            : dish?.customization?.enabled,
+
+                    removableIngredients:
+                        removableIngredients !== undefined
+                            ? removableIngredients
+                            : dish?.customization?.removableIngredients || [],
+
+                    extras:
+                        extras !== undefined
+                            ? extras
+                            : dish?.customization?.extras || [],
+                });
+            }
+        }
         const updated = await dish.save();
 
         res.status(200).json({

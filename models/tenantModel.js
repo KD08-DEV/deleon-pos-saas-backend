@@ -82,6 +82,12 @@ const tenantSchema = new mongoose.Schema(
                     default: "AT_COMPLETE",
                 },
             },
+            productCustomization: {
+                enabled: {
+                    type: Boolean,
+                    default: false,
+                },
+            },
             // Dentro de features.orderSources
             orderSources: {
                 pedidosYa: {

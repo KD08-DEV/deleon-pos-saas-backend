@@ -1139,30 +1139,53 @@ const getOrderById = async (req, res, next) => {
 
 const getOrders = async (req, res, next) => {
     try {
-        const tenantId = req.tenantId || req.user?.tenantId;
-        const clientId = req.clientId;
+        const tenantId =
+            req.tenantId ||
+            req.user?.tenantId;
+
+        const clientId =
+            req.clientId ||
+            "default";
 
         if (!tenantId) {
-            return next(createHttpError(401, "TENANT_NOT_FOUND"));
+            return next(
+                createHttpError(401, "TENANT_NOT_FOUND")
+            );
         }
 
-        const includeDrafts = String(req.query.includeDrafts || "") === "1";
-        const includeCancelled = String(req.query.includeCancelled || "1") === "1";
+        const includeDrafts =
+            String(req.query.includeDrafts || "") === "1";
 
-        const clientScope = clientId
-            ? {
-                $or: [
-                    { clientId },
-                    { clientId: { $exists: false } },
-                    { clientId: "default" },
-                ],
-            }
-            : {
-                $or: [
-                    { clientId: { $exists: false } },
-                    { clientId: "default" },
-                ],
-            };
+        const includeCancelled =
+            String(req.query.includeCancelled || "1") === "1";
+
+        const range = String(
+            req.query.range || "24h"
+        ).trim().toLowerCase();
+
+        const requestedLimit = Number(
+            req.query.limit || 120
+        );
+
+        const limit = Math.min(
+            Math.max(
+                Number.isFinite(requestedLimit)
+                    ? Math.floor(requestedLimit)
+                    : 120,
+                1
+            ),
+            500
+        );
+
+        const clientScope = {
+            $or: [
+                { clientId },
+                { clientId: "default" },
+                { clientId: { $exists: false } },
+                { clientId: null },
+                { clientId: "" },
+            ],
+        };
 
         const query = {
             tenantId,
@@ -1178,20 +1201,83 @@ const getOrders = async (req, res, next) => {
             query.orderStatus = { $ne: "Cancelado" };
         }
 
+        let startDate = null;
+
+        if (range === "24h") {
+            startDate = new Date(
+                Date.now() - 24 * 60 * 60 * 1000
+            );
+        }
+
+        if (range === "7d") {
+            startDate = new Date(
+                Date.now() - 7 * 24 * 60 * 60 * 1000
+            );
+        }
+
+        if (startDate) {
+            query.$and = [
+                {
+                    $or: [
+                        {
+                            createdAt: {
+                                $gte: startDate,
+                            },
+                        },
+
+                        // Nunca esconder una orden activa,
+                        // aunque tenga más tiempo.
+                        {
+                            orderStatus: {
+                                $in: [
+                                    "En Progreso",
+                                    "Listo",
+                                ],
+                            },
+                        },
+                    ],
+                },
+            ];
+        }
+
         const orders = await Order.find(query)
-            .sort({ createdAt: -1, _id: -1 })
-            .populate("table")
-            .populate("user", "name email role");
+            .sort({
+                createdAt: -1,
+                _id: -1,
+            })
+            .limit(limit)
+            .populate({
+                path: "table",
+                select:
+                    "tableNo tableNumber name type isVirtual virtualType",
+            })
+            .populate({
+                path: "user",
+                select: "name email role",
+            })
+            .lean();
+
+        res.set({
+            "Cache-Control":
+                "no-store, no-cache, must-revalidate, proxy-revalidate",
+            Pragma: "no-cache",
+            Expires: "0",
+        });
 
         return res.status(200).json({
             success: true,
+            count: orders.length,
             data: orders,
         });
     } catch (error) {
-        next(error);
+        console.error(
+            "[getOrders] error:",
+            error?.message || error
+        );
+
+        return next(error);
     }
 };
-
 // DELETE /api/order/:id
 const deleteOrder = async (req, res, next) => {
     try {

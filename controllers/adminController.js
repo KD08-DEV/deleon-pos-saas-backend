@@ -514,8 +514,14 @@ exports.updateEmployee = async (req, res) => {
             });
         }
 
-// Guardar rol anterior antes de modificar nada
-        const previousRole = employee.role;
+// Obtener el Membership actual para comparar el rol real del tenant
+        const currentMembership = await Membership.findOne({
+            user: employee._id,
+            tenantId: req.user.tenantId,
+        }).lean();
+
+// Membership es la fuente usada para permisos, límites y listado de empleados
+        const previousRole = currentMembership?.role || employee.role;
 
 // Preparar campos a actualizar
         const updateData = {};
@@ -631,65 +637,58 @@ exports.updateEmployee = async (req, res) => {
 
         const updatedEmployee = await User.findById(employee._id).select("name email phone role");
 
-// Actualizar membership si el rol cambió
-        const membershipRoleMap = {
-            Admin: "Admin",
-            Cajera: "Cajera",
-            Camarero: "Camarero",
-            Cocina: "Cocina",
+// Sincronizar siempre Membership con User
+        const allowedMembershipRoles = [
+            "Owner",
+            "Admin",
+            "Cajera",
+            "Camarero",
+            "Cocina",
+        ];
+
+        const effectiveMembershipRole = allowedMembershipRoles.includes(role)
+            ? role
+            : currentMembership?.role || employee.role || "Camarero";
+
+        const membershipSet = {
+            role: effectiveMembershipRole,
+            status: "active",
         };
-
-        const membershipSet = {};
-
-        if (role && role !== previousRole) {
-            membershipSet.role = membershipRoleMap[role] || role;
-        }
 
         if (permissions && typeof permissions === "object") {
             membershipSet.permissions = normalizePermissions(permissions);
         }
 
-        let updatedMembership = null;
-
-        if (Object.keys(membershipSet).length > 0) {
-            const membershipRoleMap = {
-                Admin: "Admin",
-                Cajera: "Cajera",
-                Camarero: "Camarero",
-                Cocina: "Cocina",
-            };
-
-            updatedMembership = await Membership.findOneAndUpdate(
-                {
+        const updatedMembership = await Membership.findOneAndUpdate(
+            {
+                user: employee._id,
+                tenantId: req.user.tenantId,
+            },
+            {
+                $set: membershipSet,
+                $setOnInsert: {
                     user: employee._id,
                     tenantId: req.user.tenantId,
+                    clientIds: ["default"],
                 },
-                {
-                    $set: {
-                        ...membershipSet,
-                        status: "active",
-                    },
-                    $setOnInsert: {
-                        user: employee._id,
-                        tenantId: req.user.tenantId,
-                        role: membershipRoleMap[role] || role || employee.role || "Camarero",
-                        clientIds: ["default"],
-                    },
-                },
-                {
-                    new: true,
-                    upsert: true,
-                }
-            ).lean();
-        }
+            },
+            {
+                new: true,
+                upsert: true,
+                runValidators: true,
+                setDefaultsOnInsert: true,
+            }
+        ).lean();
 
         res.status(200).json({
             success: true,
             message: "Empleado actualizado exitosamente",
             data: {
                 ...updatedEmployee.toObject(),
-                membershipRole: updatedMembership?.role || role || updatedEmployee.role,
-                permissions: updatedMembership?.permissions || membershipSet.permissions,
+                membershipRole: updatedMembership?.role || updatedEmployee.role,
+                permissions: normalizePermissions(
+                    updatedMembership?.permissions || DEFAULT_PERMISSIONS
+                ),
             },
         });
     } catch (error) {

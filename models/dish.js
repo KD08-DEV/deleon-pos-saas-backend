@@ -1,5 +1,63 @@
 const mongoose = require("mongoose");
+const removableIngredientSchema = new mongoose.Schema(
+    {
+        ingredientDishId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "dish",
+            default: null,
+        },
 
+        name: {
+            type: String,
+            required: true,
+            trim: true,
+        },
+
+        active: {
+            type: Boolean,
+            default: true,
+        },
+    },
+    {
+        _id: true,
+    }
+);
+
+const productExtraSchema = new mongoose.Schema(
+    {
+        extraDishId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "dish",
+            default: null,
+        },
+
+        name: {
+            type: String,
+            required: true,
+            trim: true,
+        },
+
+        price: {
+            type: Number,
+            default: 0,
+            min: 0,
+        },
+
+        maxQuantity: {
+            type: Number,
+            default: 5,
+            min: 1,
+        },
+
+        active: {
+            type: Boolean,
+            default: true,
+        },
+    },
+    {
+        _id: true,
+    }
+);
 const dishSchema = new mongoose.Schema(
     {
         name: { type: String, required: true, trim: true },
@@ -78,6 +136,23 @@ const dishSchema = new mongoose.Schema(
         clientId: { type: String, required: true, index: true },
 
         allowCustomPrice: { type: Boolean, default: false, index: true },
+        // Extras e ingredientes que el cliente puede retirar
+        customization: {
+            enabled: {
+                type: Boolean,
+                default: false,
+            },
+
+            removableIngredients: {
+                type: [removableIngredientSchema],
+                default: [],
+            },
+
+            extras: {
+                type: [productExtraSchema],
+                default: [],
+            },
+        },
         recipe: [
             {
                 ingredientDishId: {
