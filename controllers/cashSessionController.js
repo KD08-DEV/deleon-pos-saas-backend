@@ -457,9 +457,19 @@ const getDateFromReq = (req) => {
 };
 
 const getRegisterIdFromReadReq = (req) => {
-    return String(req.query?.registerId || req.body?.registerId || "")
+    const registerId = String(
+        req.query?.registerId ||
+        req.body?.registerId ||
+        ""
+    )
         .trim()
         .toUpperCase();
+
+    if (registerId === ALL_REGISTERS_ID) {
+        return "";
+    }
+
+    return registerId;
 };
 
 const getRegisterIdFromWriteReq = (req) => {
@@ -581,9 +591,13 @@ const getCurrentCashSession = async (req, res, next) => {
 
         const dateYMD = getDateFromReq(req);
         const registerId = getRegisterIdFromReadReq(req);
+        if (!isAdminLikeRole(role) && !registerId) {
+            return next(createHttpError(400, "MISSING_REGISTER_ID"));
+        }
 
         dbg("[GET cash-session/current] scope", { tenantId, clientId, userId, role });
         dbg("[GET cash-session/current] query", { dateYMD, registerId });
+
 
         const registerFilter = buildLegacyRegisterReadFilter(registerId);
         const cashierFilter = buildCashierSessionFilter({ role, userId });
@@ -705,7 +719,16 @@ const getPendingCashSession = async (req, res, next) => {
         const registerId = getRegisterIdFromReadReq(req) || "MAIN";
         const registerFilter = buildLegacyRegisterReadFilter(registerId);
         const cashierFilter = buildCashierSessionFilter({ role, userId });
-
+        console.log("[PENDING DEBUG]", {
+            tenantId,
+            clientId,
+            userId,
+            role,
+            dateYMD,
+            registerId,
+            cashierFilter,
+            registerFilter
+        });
         const pending = await CashSession.findOne({
             tenantId,
             clientId,
@@ -717,6 +740,8 @@ const getPendingCashSession = async (req, res, next) => {
             .sort({ dateYMD: -1, updatedAt: -1, createdAt: -1 })
             .populate("openedBy", "name role")
             .populate("movements.by", "name role");
+
+        console.log("[PENDING RESULT]", pending);
 
         return res.status(200).json({
             success: true,
