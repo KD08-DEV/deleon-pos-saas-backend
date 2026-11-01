@@ -4,6 +4,14 @@ const mongoose = require("mongoose");
 const AccountReceivable = require("../models/accountReceivableModel");
 const Order = require("../models/orderModel");
 const Customer = require("../models/customerModel");
+const Tenant = require("../models/tenantModel");
+const CashSession =
+    require("../models/cashSessionModel");
+
+const {
+    normalizePlan,
+    getPlanFeatures,
+} = require("../middlewares/requirePlan");
 
 const ALL_REGISTERS_ID = "__ALL_REGISTERS__";
 
@@ -28,7 +36,9 @@ function normalizeMethod(value) {
 }
 
 function normalizeRegisterId(value) {
-    return String(value || "MAIN").trim().toUpperCase() || "MAIN";
+    return String(value || "")
+        .trim()
+        .toUpperCase();
 }
 
 function isAdminLikeRole(role) {
@@ -86,6 +96,39 @@ async function createReceivableForOrder({ order, userId = null }) {
     const tenantId = order.tenantId;
     const clientId = order.clientId || "default";
 
+    const tenant = await Tenant.findOne({
+        tenantId,
+    })
+        .select("plan status")
+        .lean();
+
+    if (!tenant) {
+        throw createHttpError(
+            404,
+            "TENANT_NOT_FOUND"
+        );
+    }
+
+    if (tenant.status !== "active") {
+        throw createHttpError(
+            403,
+            "TENANT_SUSPENDED"
+        );
+    }
+
+    const plan = normalizePlan(
+        tenant.plan
+    );
+
+    const planFeatures =
+        getPlanFeatures(plan);
+
+    if (!planFeatures.accountsReceivable) {
+        throw createHttpError(
+            403,
+            "PLAN_FEATURE_ACCOUNTS_RECEIVABLE_NOT_ALLOWED"
+        );
+    }
     const customerId = order.customerId;
     if (!customerId) {
         throw createHttpError(400, "CUSTOMER_REQUIRED_FOR_CREDIT_SALE");
@@ -97,16 +140,26 @@ async function createReceivableForOrder({ order, userId = null }) {
         throw createHttpError(400, "INVALID_RECEIVABLE_AMOUNT");
     }
 
-    const existing = await AccountReceivable.findOne({
-        tenantId,
-        clientId,
-        orderId,
-        status: { $ne: "void" },
-    });
+    const existing =
+        await AccountReceivable.findOne({
+            tenantId,
+            clientId,
+            orderId,
+        });
 
     if (existing) {
+        if (
+            existing.status === "void"
+        ) {
+            throw createHttpError(
+                409,
+                "RECEIVABLE_ALREADY_VOIDED_FOR_ORDER"
+            );
+        }
+
         return existing;
     }
+
 
     const created = await AccountReceivable.create({
         tenantId,
@@ -299,7 +352,44 @@ async function addReceivablePayment(req, res, next) {
         }
 
         const method = normalizeMethod(req.body?.method || "Efectivo");
-        const registerId = normalizeRegisterId(req.body?.registerId || "MAIN");
+        const registerId =
+            normalizeRegisterId(
+                req.body?.registerId
+            );
+
+
+        if (
+            !registerId ||
+            registerId === ALL_REGISTERS_ID
+        ) {
+            return next(
+                createHttpError(
+                    400,
+                    "MISSING_REGISTER_ID_FOR_RECEIVABLE_PAYMENT"
+                )
+            );
+        }
+        const activeCashSession =
+            await CashSession.findOne({
+                tenantId,
+                clientId,
+                registerId,
+                status: "OPEN",
+            })
+                .sort({
+                    createdAt: -1,
+                })
+                .select("_id openedBy")
+                .lean();
+
+        if (!activeCashSession) {
+            return next(
+                createHttpError(
+                    409,
+                    "NO_OPEN_CASH_SESSION_FOR_REGISTER"
+                )
+            );
+        }
         const paidAt = req.body?.paidAt ? new Date(req.body.paidAt) : new Date();
 
         if (Number.isNaN(paidAt.getTime())) {
@@ -310,9 +400,8 @@ async function addReceivablePayment(req, res, next) {
             amount,
             method,
             registerId,
-            cashSessionId: mongoose.Types.ObjectId.isValid(req.body?.cashSessionId)
-                ? req.body.cashSessionId
-                : null,
+            cashSessionId:
+            activeCashSession._id,
             paidAt,
             receivedBy: userId,
             note: String(req.body?.note || "").trim(),

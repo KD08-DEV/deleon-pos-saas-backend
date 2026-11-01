@@ -20,6 +20,9 @@ const electronicTaxDocumentSchema = new mongoose.Schema(
                 enum: ["31", "32", "33", "34", "41", "43", "44", "45", "46", "47"],
                 required: true,
             },
+            // Entorno inmóvil capturado al EMITIR, no el entorno actual del tenant.
+            // Antiguos documentos conservan null y requieren revisión antes de reconciliar.
+            environment: { type: String, enum: ["internal_sandbox", "dgii_certification", "dgii_production"], default: undefined },
             sequenceNumber: { type: Number, default: null },
             eNCF: { type: String, default: null },
             status: {
@@ -83,6 +86,14 @@ const electronicTaxDocumentSchema = new mongoose.Schema(
             tip: { type: Number, default: 0 },
             discount: { type: Number, default: 0 },
             total: { type: Number, default: 0 },
+            // Snapshot fiscal para nuevos documentos, sin modificar los antiguos.
+            fiscalSummaryVersion: { type: Number, default: null },
+            taxable18: { type: Number, default: null },
+            taxable16: { type: Number, default: null },
+            exempt: { type: Number, default: null },
+            itbis18: { type: Number, default: null },
+            itbis16: { type: Number, default: null },
+            deliveryFee: { type: Number, default: null },
         },
 
 
@@ -117,6 +128,20 @@ const electronicTaxDocumentSchema = new mongoose.Schema(
 );
 
 electronicTaxDocumentSchema.index({ tenantId: 1, clientId: 1, "ecf.eNCF": 1 });
+// Unicidad COMPARTIDA por contribuyente, entre todas sus sucursales.
+// Se aplica a documentos nuevos con entorno explícito. Los históricos sin
+// 'ecf.environment' quedan fuera; revisar sus duplicados por separado.
+electronicTaxDocumentSchema.index(
+    { tenantId: 1, "ecf.environment": 1, "ecf.eNCF": 1 },
+    {
+        unique: true,
+        name: "ecf_new_tenant_environment_encf_unique",
+        partialFilterExpression: {
+            "ecf.environment": { $type: "string" },
+            "ecf.eNCF": { $type: "string" },
+        },
+    }
+);
 electronicTaxDocumentSchema.index({ tenantId: 1, clientId: 1, "ecf.trackId": 1 });
 electronicTaxDocumentSchema.index({ tenantId: 1, clientId: 1, createdAt: -1 });
 

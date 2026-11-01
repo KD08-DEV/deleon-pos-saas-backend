@@ -7,10 +7,15 @@ const verifyToken = require("../middlewares/tokenVerification");
 const requireScope = require("../middlewares/scope");
 const requireRole = require("../middlewares/requireRole");
 const { requireFeature } = require("../middlewares/requirePlan");
+const requireDominicanFiscal = require("../middlewares/requireDominicanFiscal");
+const {requireEcfPermission} = require("../middlewares/requireEcfPermission");
 
 const { exportAllInvoices } = require("../controllers/reportExportController");
 const { exportExcel } = require("../controllers/reportExportController");
 const { getFinanceSummary } = require("../controllers/summaryController");
+const { listCashCloseFiscalDocuments } = require("../controllers/cashCloseFiscalDocumentsController");
+const { listEcfIncidents } = require("../controllers/ecfIncidentController");
+const { getEcfBranchOverview } = require("../controllers/ecfBranchOverviewController");
 const {
     getEcfProfile,
     updateEcfProfile,
@@ -135,7 +140,45 @@ const upload = multer({
 });
 // Panel admin: nivel tenant
 router.use(verifyToken);
+const requireMembershipPermission = (permissionPath) => {
+    return (req, res, next) => {
+        const role = String(
+            req.scope?.membership?.role ||
+            req.user?.role ||
+            ""
+        ).trim();
 
+        // Owner/Admin siempre pasan.
+        if (
+            ["Owner", "Admin", "SuperAdmin"].includes(role)
+        ) {
+            return next();
+        }
+
+        const permissions =
+            req.scope?.membership?.permissions || {};
+
+        const allowed = String(permissionPath || "")
+            .split(".")
+            .reduce(
+                (acc, key) =>
+                    acc && acc[key] !== undefined
+                        ? acc[key]
+                        : undefined,
+                permissions
+            ) === true;
+
+        if (!allowed) {
+            return res.status(403).json({
+                success: false,
+                message: "No tienes permiso para acceder a este módulo.",
+                code: "PERMISSION_DENIED",
+            });
+        }
+
+        return next();
+    };
+};
 // =======================
 // LOGO DEL NEGOCIO / FACTURA
 // =======================
@@ -171,6 +214,39 @@ router.delete(
     requireScope({ level: "tenant" }),
     requireRole("Owner", "Admin"),
     deleteTenantLogo
+);
+
+// Consulta fiscal de SOLO LECTURA para el cierre. No mueve efectivo ni modifica comprobantes.
+router.get(
+    "/cash-close/fiscal-documents",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin", "Cajera"),
+    // Historial de cierre de SOLO lectura: accesible en la sucursal activa
+    // incluso si allí está desactivado e-CF. Nunca habilita emisión/conciliación.
+    requireDominicanFiscal({ branchRead: true }),
+    listCashCloseFiscalDocuments
+);
+
+// Consulta fiscal administrativa sin reenvío, modificación ni cambio de secuencia.
+router.get(
+    "/ecf/incidents",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner", "Admin"),
+    // Historial read-only por tenant/sede, incluso si la sede apagó e-CF.
+    // Nunca autoriza editar el perfil global, emitir ni conciliar documentos.
+    requireDominicanFiscal({ branchRead: true }),
+    listEcfIncidents
+);
+
+// Vista agregada y de solo lectura. Owner activo, tenant validado por requireScope.
+// No acepta filtros de tenant/sucursal enviados por el usuario.
+router.get(
+    "/ecf/branch-overview",
+    requireScope({ level: "tenant" }),
+    requireRole("Owner"),
+    requireFeature("fiscal"),
+    requireDominicanFiscal({ branchRead: true }),
+    getEcfBranchOverview
 );
 
 // =======================
@@ -256,13 +332,20 @@ router.patch(
 router.get(
     "/ecf/profile",
     requireScope({ level: "tenant" }),
+    requireFeature("fiscal"),
+    requireDominicanFiscal({ branchRead: true }),
     requireRole("Owner", "Admin"),
+    requireEcfPermission("manage"),
     getEcfProfile
 );
+
 router.post(
     "/ecf/profile/certificate",
     requireScope({ level: "tenant" }),
+    requireFeature("fiscal"),
+    requireDominicanFiscal(),
     requireRole("Owner", "Admin"),
+    requireEcfPermission("manage"),
     upload.single("certificate"),
     uploadEcfCertificate
 );
@@ -270,7 +353,10 @@ router.post(
 router.patch(
     "/ecf/profile",
     requireScope({ level: "tenant" }),
+    requireFeature("fiscal"),
+    requireDominicanFiscal(),
     requireRole("Owner", "Admin"),
+    requireEcfPermission("manage"),
     updateEcfProfile
 );
 
@@ -618,37 +704,47 @@ router.get(
 // =======================
 // CUENTAS POR COBRAR
 // =======================
+
 router.get(
     "/accounts-receivable/cash-summary",
     requireScope({ level: "tenant" }),
+    requireFeature("accountsReceivable"),
     requireRole("Owner", "Admin", "Cajera"),
+    requireMembershipPermission("accountsReceivable.view"),
     getReceivableCashSummary
 );
 
 router.get(
     "/accounts-receivable",
     requireScope({ level: "tenant" }),
+    requireFeature("accountsReceivable"),
     requireRole("Owner", "Admin", "Cajera"),
+    requireMembershipPermission("accountsReceivable.view"),
     listReceivables
 );
 
 router.get(
     "/accounts-receivable/summary",
     requireScope({ level: "tenant" }),
+    requireFeature("accountsReceivable"),
     requireRole("Owner", "Admin", "Cajera"),
+    requireMembershipPermission("accountsReceivable.view"),
     getReceivableSummary
 );
 
 router.post(
     "/accounts-receivable/:id/payments",
     requireScope({ level: "tenant" }),
+    requireFeature("accountsReceivable"),
     requireRole("Owner", "Admin", "Cajera"),
+    requireMembershipPermission("accountsReceivable.view"),
     addReceivablePayment
 );
 
 router.patch(
     "/accounts-receivable/:id/void",
     requireScope({ level: "tenant" }),
+    requireFeature("accountsReceivable"),
     requireRole("Owner", "Admin"),
     voidReceivable
 );

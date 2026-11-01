@@ -1,0 +1,44 @@
+{
+  "source": "Cinco archivos adjuntados por el usuario; versiones exactamente como se recibieron",
+  "schemas": {
+    "31": {
+      "nombre_original": "e-CF 31 v.1.0.xsd",
+      "sha256_original": "6f2909a93d84919518d2ae3c77fead4b35c3e8c95996b8af67b0040c2e2be298",
+      "sha256_compilable": "58b1b93309fc982a5a5ca6dda8f6d626a3d7f12df0361035c030a881043ef1e0",
+      "sha256_preflight": "717159b8ad656aeb887a4dda6e989e23326956209aa169ed40347fdbf3cf0912"
+    },
+    "32": {
+      "nombre_original": "e-CF 32 v.1.0.xsd",
+      "sha256_original": "151676df03c61335b4ac1eca97f99395488d57ea92793b49353602871e651f3c",
+      "sha256_compilable": "fb59e14cb6ac216ab6e23f31c83414e8ce68e417d0b61d906a3e82e0371e568b",
+      "sha256_preflight": "5daa6d430ad9fd65ee6942701437df8550db0b02b2af7b4c34ff03b38ede4e1a"
+    },
+    "33": {
+      "nombre_original": "e-CF 33 v.1.0.xsd",
+      "sha256_original": "087cd71beba11c19cf548e22b96363cb4aa210dc6f5c3c8a62122a42c88d2866",
+      "sha256_compilable": "1463a76dcf7e36cedcbf8c2a7c038e442f099865593a40f5a3a76cb6d476e5e1",
+      "sha256_preflight": "37c63ad1fa19318c37f2c2ae370f196aa06d946075c5465d24e9f1f06904eaf9"
+    },
+    "34": {
+      "nombre_original": "e-CF 34 v.1.0.xsd",
+      "sha256_original": "6c62ebabdea9a6f6d62ae85d9e1c2eb788f44f3f0b61945fe116700c4eaac2da",
+      "sha256_compilable": "db6ca0d0cc35196c97aac6dfe968fa809b60537c55b487c6ca2a4f6734aa5332",
+      "sha256_preflight": "8404f95e19890c2ada9f35118db4faf7506bf99cf12f5de858fb2ebd85117a1f"
+    },
+    "RFCE32": {
+      "nombre_original": "RFCE 32 v.1.0.xsd",
+      "sha256_original": "6aad535875661b05eef072963295202fc94b3b320b257791feb8d3c39a5f8ee6",
+      "sha256_compilable": "30b9ae65fd2d1ccdcd9340106069208302dda4989247be2a8be214c6bdbf73d4",
+      "sha256_preflight": "1a26917dab8c7d3ab3983c1a6e0e83e9ebecb7476ff45a20ef1e0e0574d2dd82"
+    }
+  },
+  "adaptaciones": {
+    "31": [
+      "Se elimina UN espacio inicial en nombre de simpleType IndicadorServicioTodoIncluidoType."
+    ],
+    "RFCE32": [
+      "Se cambia sintaxis PCRE no-capturante (?: por grupo XSD-compatible (, sin modificar alternativas de los patrones."
+    ]
+  },
+  "preflight": "Solo en validación previa, xs:any de firma del nodo raíz cambia minOccurs de 1 a 0; el XML firmado siempre se valida con el esquema compilable completo."
+}

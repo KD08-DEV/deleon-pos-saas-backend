@@ -4,12 +4,249 @@ function safe(value = "") {
     if (value === null || value === undefined) return "";
     return String(value);
 }
+function resolveLocalization({
+                                 localization = {},
+                                 locale,
+                                 currency,
+                             } = {}) {
+    return {
+        ...localization,
 
-function toMoney(value) {
-    const n = Number(value);
-    if (!Number.isFinite(n)) return "0.00";
-    return n.toFixed(2);
+        locale:
+            locale ||
+            localization?.locale ||
+            "es-DO",
+
+        currency:
+            currency ||
+            localization?.currency ||
+            "DOP",
+
+        weightUnit:
+            localization?.weightUnit ||
+            "lb",
+    };
 }
+
+function formatMoneyForPrint(
+    value,
+    localization = {}
+) {
+    const amount =
+        Number(value);
+
+    const safeAmount =
+        Number.isFinite(amount)
+            ? amount
+            : 0;
+
+    const locale =
+        localization.locale ||
+        "es-DO";
+
+    const currency =
+        localization.currency ||
+        "DOP";
+
+    try {
+        /*
+         * currencyDisplay:"code" es
+         * intencional en ESC/POS.
+         *
+         * Evita problemas de encoding
+         * con £, €, ¥ en impresoras
+         * térmicas antiguas.
+         */
+        return new Intl.NumberFormat(
+            locale,
+            {
+                style:
+                    "currency",
+
+                currency,
+
+                currencyDisplay:
+                    "code",
+            }
+        )
+            .format(
+                safeAmount
+            )
+            .replace(
+                /\u00a0/g,
+                " "
+            );
+    } catch {
+        return `${currency} ${safeAmount.toFixed(
+            2
+        )}`;
+    }
+}
+
+function getPaperWidth(
+    paperSize = "80mm"
+) {
+    if (
+        paperSize === "58mm"
+    ) {
+        return 32;
+    }
+
+    if (
+        paperSize === "A4"
+    ) {
+        return 80;
+    }
+
+    return 42;
+}
+
+function hr(
+    width = 42,
+    char = "-"
+) {
+    return String(
+        char || "-"
+    )
+        .slice(0, 1)
+        .repeat(width);
+}
+
+function twoCols(
+    left = "",
+    right = "",
+    width = 42
+) {
+    const leftText =
+        safe(left);
+
+    const rightText =
+        safe(right);
+
+    if (
+        rightText.length >=
+        width
+    ) {
+        return rightText.slice(
+            0,
+            width
+        );
+    }
+
+    const availableLeft =
+        Math.max(
+            0,
+            width -
+            rightText.length -
+            1
+        );
+
+    const finalLeft =
+        leftText.slice(
+            0,
+            availableLeft
+        );
+
+    const spaces =
+        Math.max(
+            1,
+            width -
+            finalLeft.length -
+            rightText.length
+        );
+
+    return (
+        finalLeft +
+        " ".repeat(spaces) +
+        rightText
+    );
+}
+
+function wrapItemLine(
+    name = "",
+    qty = "",
+    amount = "",
+    width = 42
+) {
+    const quantity =
+        safe(qty);
+
+    const money =
+        safe(amount);
+
+    const rightSide =
+        [quantity, money]
+            .filter(Boolean)
+            .join(" ");
+
+    const reserved =
+        rightSide
+            ? rightSide.length + 1
+            : 0;
+
+    const nameWidth =
+        Math.max(
+            8,
+            width -
+            reserved
+        );
+
+    const nameLines =
+        wrapText(
+            name,
+            nameWidth
+        );
+
+    if (
+        nameLines.length ===
+        0
+    ) {
+        return [
+            twoCols(
+                "",
+                rightSide,
+                width
+            ),
+        ];
+    }
+
+    const lines = [
+        twoCols(
+            nameLines[0],
+            rightSide,
+            width
+        ),
+    ];
+
+    for (
+        let i = 1;
+        i < nameLines.length;
+        i += 1
+    ) {
+        lines.push(
+            nameLines[i]
+        );
+    }
+
+    return lines;
+}
+
+function moneyLine(
+    label,
+    value,
+    width,
+    localization
+) {
+    return twoCols(
+        label,
+        formatMoneyForPrint(
+            value,
+            localization
+        ),
+        width
+    );
+}
+
 
 function padRight(text = "", width = 0) {
     const str = safe(text);
@@ -97,6 +334,9 @@ function buildTicketText({
                              rnc,
                              address,
                              phone,
+                             localization = {},
+                             locale,
+                             currency,
                              title = "",
                              orderId,
                              mesa,
@@ -114,6 +354,12 @@ function buildTicketText({
                              paperSize = "80mm",
                          }) {
     const width = getPaperWidth(paperSize);
+    const printLocalization =
+        resolveLocalization({
+            localization,
+            locale,
+            currency,
+        });
     const lines = [];
 
     const normalizedTitle = String(title || "").trim().toUpperCase();
@@ -150,10 +396,21 @@ function buildTicketText({
 
     for (const item of items) {
         const qty = item?.qty ?? item?.quantity ?? item?.amount ?? item?.cant ?? 1;
+        const qtyLabel =
+            item?.qtyType ===
+            "weight"
+                ? `${safe(qty)} ${
+                    item?.weightUnit ||
+                    printLocalization.weightUnit ||
+                    ""
+                }`.trim()
+                : safe(qty);
         const name = item?.name ?? item?.title ?? item?.description ?? "ITEM";
 
         if (isProductionCommand) {
-            wrapText(`${safe(qty)} x ${String(name).toUpperCase()}`, width).forEach((line) =>
+            wrapText(`${qtyLabel} x ${String(
+                name
+            ).toUpperCase()}`, width).forEach((line) =>
                 lines.push(line)
             );
         } else {
@@ -165,10 +422,15 @@ function buildTicketText({
 
             const amount =
                 effectiveShowItemPrices && rawAmount !== null && rawAmount !== undefined
-                    ? `RD$${toMoney(rawAmount)}`
+                    ? formatMoneyForPrint(
+                        rawAmount,
+                        printLocalization
+                    )
                     : "";
 
-            wrapItemLine(String(name).toUpperCase(), `x${safe(qty)}`, amount, width).forEach((line) =>
+            wrapItemLine(String(name).toUpperCase(), item?.qtyType === "weight"
+                ? qtyLabel
+                : `x${qtyLabel}`, amount, width).forEach((line) =>
                 lines.push(line)
             );
         }
@@ -183,20 +445,70 @@ function buildTicketText({
         lines.push("");
     }
 
-    if (!isProductionCommand && effectiveShowTotals) {
-        lines.push(hr(width, "-"));
+    if (
+        !isProductionCommand &&
+        effectiveShowTotals
+    ) {
+        lines.push(
+            hr(
+                width,
+                "-"
+            )
+        );
 
-        if (subtotal !== undefined && subtotal !== null) {
-            lines.push(moneyLine("Subtotal", subtotal, width));
+        if (
+            subtotal !== undefined &&
+            subtotal !== null
+        ) {
+            lines.push(
+                moneyLine(
+                    "Subtotal",
+                    subtotal,
+                    width,
+                    printLocalization
+                )
+            );
         }
-        if (tax !== undefined && tax !== null) {
-            lines.push(moneyLine("ITBIS", tax, width));
+
+        if (
+            tax !== undefined &&
+            tax !== null &&
+            Number(tax) > 0
+        ) {
+            lines.push(
+                moneyLine(
+                    "Impuestos",
+                    tax,
+                    width,
+                    printLocalization
+                )
+            );
         }
-        if (total !== undefined && total !== null) {
-            lines.push(moneyLine("TOTAL", total, width));
+
+        if (
+            total !== undefined &&
+            total !== null
+        ) {
+            lines.push(
+                moneyLine(
+                    "TOTAL",
+                    total,
+                    width,
+                    printLocalization
+                )
+            );
         }
+
         if (paymentMethod) {
-            lines.push(twoCols("Pago", safe(paymentMethod), width));
+            lines.push(
+                twoCols(
+                    "Pago",
+                    safe(
+                        paymentMethod
+                    ),
+                    width
+                )
+            );
         }
     }
 
@@ -211,6 +523,14 @@ function buildInvoiceText({
                               rnc,
                               address,
                               phone,
+                              localization = {},
+                              locale,
+                              currency,
+
+                              taxBreakdown = [],
+
+                              serviceChargeTotal = 0,
+                              serviceChargeBreakdown = [],
                               headerTitle,
                               isFiscal = false,
                               isPreInvoice = false,
@@ -245,6 +565,22 @@ function buildInvoiceText({
                               paperSize = "80mm",
                           }) {
     const width = getPaperWidth(paperSize);
+    const printLocalization =
+        resolveLocalization({
+            localization,
+            locale,
+            currency,
+        });
+
+    const resolvedTaxLabel =
+        taxBreakdown.length === 1
+            ? String(
+                taxBreakdown[0]?.name ||
+                taxBreakdown[0]?.label ||
+                taxBreakdown[0]?.code ||
+                "Impuestos"
+            )
+            : "Impuestos";
     const lines = [];
 
 
@@ -306,41 +642,213 @@ function buildInvoiceText({
     for (const item of items) {
         const name = safe(item?.name || "Producto");
         const qty = Number(item?.qty || item?.quantity || 1);
+        const qtyLabel =
+            item?.qtyType ===
+            "weight"
+                ? `${qty} ${
+                    item?.weightUnit ||
+                    printLocalization.weightUnit ||
+                    ""
+                }`.trim()
+                : String(qty);
         const amount =
             Number(item?.total ?? item?.price ?? item?.unitPrice ?? 0);
 
-        wrapItemLine(name, `${qty}`, `RD$${toMoney(amount)}`, width).forEach((line) =>
+        wrapItemLine(
+            name,
+            qtyLabel,
+
+            formatMoneyForPrint(
+                amount,
+                printLocalization
+            ),
+
+            width
+        ).forEach((line) =>
             lines.push(line)
         );
 
         if (taxEnabled && Number(item?.tax || 0) > 0) {
-            lines.push(twoCols("  ITBIS", `RD$${toMoney(item.tax)}`, width));
+            lines.push(
+                twoCols(
+                    "  Impuesto",
+
+                    formatMoneyForPrint(
+                        item.tax,
+                        printLocalization
+                    ),
+
+                    width
+                )
+            );
         }
 
         lines.push("");
     }
 
-    lines.push(hr(width, "-"));
-    lines.push(moneyLine("Subtotal", subtotal, width));
+    lines.push(
+        hr(
+            width,
+            "-"
+        )
+    );
 
-    if (Number(discount) > 0) {
-        lines.push(moneyLine("Descuento", -Math.abs(Number(discount)), width));
-    }
-    if (Number(tip) > 0) {
-        lines.push(moneyLine("Propina", tip, width));
-    }
-    if (taxEnabled && Number(tax) > 0) {
-        lines.push(moneyLine("ITBIS", tax, width));
-    }
-    if (isAppDelivery && Number(commissionAmount) > 0) {
-        lines.push(moneyLine(`Comision ${safe(commissionPct)}%`, commissionAmount, width));
-    }
-    if (showShipping && Number(shippingFee) > 0) {
-        lines.push(moneyLine("Envio", shippingFee, width));
+    lines.push(
+        moneyLine(
+            "Subtotal",
+            subtotal,
+            width,
+            printLocalization
+        )
+    );
+
+    if (
+        Number(discount) > 0
+    ) {
+        lines.push(
+            moneyLine(
+                "Descuento",
+                -Math.abs(
+                    Number(
+                        discount
+                    )
+                ),
+                width,
+                printLocalization
+            )
+        );
     }
 
-    lines.push(hr(width, "="));
-    lines.push(moneyLine("TOTAL A PAGAR", totalToPay, width));
+    if (
+        Number(tip) > 0
+    ) {
+        lines.push(
+            moneyLine(
+                "Propina",
+                tip,
+                width,
+                printLocalization
+            )
+        );
+    }
+
+    if (
+        taxEnabled &&
+        Number(tax) > 0
+    ) {
+        lines.push(
+            moneyLine(
+                resolvedTaxLabel,
+                tax,
+                width,
+                printLocalization
+            )
+        );
+    }
+
+    /*
+     * Service Charges
+     *
+     * Cada cargo se imprime por separado
+     * cuando tenemos breakdown.
+     */
+    if (
+        Array.isArray(
+            serviceChargeBreakdown
+        ) &&
+        serviceChargeBreakdown.length >
+        0
+    ) {
+        serviceChargeBreakdown.forEach(
+            (charge) => {
+                const amount =
+                    Number(
+                        charge?.amount ??
+                        charge?.total ??
+                        0
+                    );
+
+                if (
+                    !Number.isFinite(
+                        amount
+                    ) ||
+                    amount <= 0
+                ) {
+                    return;
+                }
+
+                const name =
+                    String(
+                        charge?.name ||
+                        charge?.label ||
+                        charge?.code ||
+                        "Cargo por servicio"
+                    ).trim();
+
+                lines.push(
+                    moneyLine(
+                        name,
+                        amount,
+                        width,
+                        printLocalization
+                    )
+                );
+            }
+        );
+    } else if (
+        Number(
+            serviceChargeTotal
+        ) > 0
+    ) {
+        lines.push(
+            moneyLine(
+                "Cargo por servicio",
+                serviceChargeTotal,
+                width,
+                printLocalization
+            )
+        );
+    }
+
+    if (
+        showShipping &&
+        Number(
+            shippingFee
+        ) > 0
+    ) {
+        lines.push(
+            moneyLine(
+                "Envío",
+                shippingFee,
+                width,
+                printLocalization
+            )
+        );
+    }
+
+    /*
+     * IMPORTANTE:
+     *
+     * commissionAmount NO se imprime.
+     * Es un costo del negocio,
+     * no un cargo al cliente.
+     */
+
+    lines.push(
+        hr(
+            width,
+            "="
+        )
+    );
+
+    lines.push(
+        moneyLine(
+            "TOTAL A PAGAR",
+            totalToPay,
+            width,
+            printLocalization
+        )
+    );
     if (paymentMethod) {
         lines.push(twoCols("Metodo:", safe(paymentMethod), width));
     }
@@ -367,10 +875,50 @@ function buildEscPosText(text = "") {
     return Buffer.from(payload, "binary");
 }
 
+// F8-14: permitir conexiones TCP desde el backend solo a impresoras LAN
+// explicitamente configuradas. DeLeonBridge local es independiente.
+function isPrivatePrinterIPv4(address) {
+    if (net.isIP(address) !== 4) return false;
+    const octets = address.split(".").map(Number);
+    const [first, second] = octets;
+    return first === 10 ||
+        (first === 172 && second >= 16 && second <= 31) ||
+        (first === 192 && second === 168);
+}
+
+function validatedPrintTarget(ip, port) {
+    const address = typeof ip === "string" ? ip.trim() : "";
+    if (!address) throw new Error("PRINTER_IP_REQUIRED");
+
+    const parsedPort = Number(port);
+    if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+        throw new Error("NETWORK_PRINT_INVALID_PORT");
+    }
+
+    // No DNS, loopback, link-local, cloud metadata, IPv6 ni IP publica.
+    if (!isPrivatePrinterIPv4(address)) {
+        throw new Error("NETWORK_PRINT_PRIVATE_IPV4_REQUIRED");
+    }
+
+    const allowedTargets = String(process.env.BACKEND_PRINT_ALLOWED_TARGETS || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+    if (!allowedTargets.includes(`${address}:${parsedPort}`)) {
+        throw new Error("NETWORK_PRINT_TARGET_NOT_ALLOWED");
+    }
+
+    return { ip: address, port: parsedPort };
+}
+
 function sendToNetworkPrinter({ ip, port = 9100, payload, timeoutMs = 12000 }) {
     return new Promise((resolve, reject) => {
-        if (!ip) {
-            return reject(new Error("PRINTER_IP_REQUIRED"));
+        let target;
+        try {
+            // El rechazo sucede antes de construir o conectar el socket.
+            target = validatedPrintTarget(ip, port);
+        } catch (error) {
+            return reject(error);
         }
 
         const socket = new net.Socket();
@@ -455,7 +1003,7 @@ function sendToNetworkPrinter({ ip, port = 9100, payload, timeoutMs = 12000 }) {
             return fail(new Error("NETWORK_SOCKET_CLOSED_BEFORE_PRINT_COMPLETED"));
         });
 
-        socket.connect(Number(port || 9100), ip);
+        socket.connect(target.port, target.ip);
     });
 }
 

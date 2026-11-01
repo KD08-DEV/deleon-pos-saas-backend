@@ -9,14 +9,26 @@ module.exports = function requireScope(opts = { level: "client" }) {
                 return next();
             }
 
-            const tenantId = req.headers["x-tenant-id"] || req.user?.tenantId;
+            const tenantId = req.user?.tenantId;
+            if (req.headers["x-tenant-id"] && req.headers["x-tenant-id"] !== tenantId) {
+                return res.status(403).json({ message: "Tenant access denied" });
+            }
 
-            const clientId =
-                req.headers["x-client-id"] ||
-                req.params.clientId ||
-                req.query.clientId ||
-                req.body?.clientId ||
-                "default";
+            // En rutas administrativas de sucursales el clientId de la URL es el
+            // recurso de destino, NO la sucursal activa del navegador.
+            const requestedClients = [
+                req.headers["x-client-id"],
+                ...(opts.ignoreRouteClientId ? [] : [req.params.clientId]),
+                req.query.clientId,
+                req.body?.clientId,
+            ].filter((v) => v !== undefined && v !== null && v !== "").map(String);
+            if (requestedClients.length && requestedClients.some((v) => v !== requestedClients[0])) {
+                return res.status(403).json({ message: "Conflicting branch scope" });
+            }
+            const clientId = req.clientId || requestedClients[0] || "default";
+            if (req.clientId && requestedClients.some((v) => v !== req.clientId)) {
+                return res.status(403).json({ message: "Branch access denied" });
+            }
 
             if (!tenantId) {
                 return res.status(400).json({ message: "Missing tenantId" });
@@ -37,10 +49,18 @@ module.exports = function requireScope(opts = { level: "client" }) {
                 return res.status(403).json({ message: "No membership" });
             }
 
+            if (clientId !== "default") {
+                const Client = require("../models/clientModel");
+                const exists = await Client.exists({ tenantId, clientId: String(clientId), isActive: true });
+                if (!exists) return res.status(403).json({ message: "Branch unavailable" });
+            }
             const role = membership.role;
             const isOwnerOrAdmin = role === "Owner" || role === "Admin";
 
-            if (opts.level === "client") {
+            // Every route must respect branch membership, even when the route only
+            // requests tenant-level access. A tenant-scoped endpoint may still
+            // consume x-client-id in downstream controllers.
+            if (true) {
                 const normalizedClientId = String(clientId || "default");
 
                 const membershipClientIds = Array.isArray(membership.clientIds)

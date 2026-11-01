@@ -15,6 +15,19 @@ const permissionSchema = new mongoose.Schema(
         },
         orders: {
             cancel: { type: Boolean, default: false }, // Cancelar órdenes
+            edit: { type: Boolean, default: false }, // Corregir órdenes normales
+        },
+        fiscal: {
+            ecfIssue: { type: Boolean, default: false },
+            creditNote: { type: Boolean, default: false },
+            debitNote: { type: Boolean, default: false },
+            manage: { type: Boolean, default: false }, // reservado a Owner/Admin
+        },
+        accountsReceivable: {
+            view: {
+                type: Boolean,
+                default: false,
+            },
         },
     },
     { _id: false }
@@ -62,6 +75,11 @@ const membershipSchema = new mongoose.Schema(
                 },
                 orders: {
                     cancel: false,
+                    edit: false,
+                },
+                fiscal: { ecfIssue:false, creditNote:false, debitNote:false, manage:false },
+                accountsReceivable: {
+                    view: false,
                 },
             }),
         },

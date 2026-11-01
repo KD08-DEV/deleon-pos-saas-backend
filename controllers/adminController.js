@@ -5,7 +5,16 @@ const Membership = require("../models/membershipModel");
 const Dish = require("../models/dish");
 const Table = require("../models/tableModel");
 const Tenant = require("../models/tenantModel");
+const {
+    getTenantTimezone,
+    getUtcRangeForYMDRange,
+    getYMDInTimeZone,
+} = require(
+    "../utils/timezone"
+);
 const TIERS = require("../config/planTiers");
+const { membershipFilter, visibleInBranch, validateBranchIds } = require("../services/employeeBranchAccess");
+const Client = require("../models/clientModel");
 const InventoryMovement = require("../models/inventoryMovementModel");
 const createHttpError = require("http-errors");
 const bcrypt = require("bcrypt");
@@ -49,38 +58,6 @@ function getEffectivePaymentMethodForReport(o = {}) {
 
     return o?.paymentMethod || "Otros";
 }
-function parseReportBoundary(value, endOfDay = false) {
-    const raw = String(value || "").trim();
-    if (!raw) return null;
-
-    const tzOffset = process.env.REPORT_TZ_OFFSET || "-04:00";
-
-    // Soporta YYYY-MM-DD y también YYYY-MM-DDT...
-    const ymdMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/);
-    if (ymdMatch) {
-        const ymd = ymdMatch[1];
-        return new Date(`${ymd}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}${tzOffset}`);
-    }
-
-    const d = new Date(raw);
-    if (Number.isNaN(d.getTime())) return null;
-
-    if (endOfDay) d.setHours(23, 59, 59, 999);
-    else d.setHours(0, 0, 0, 0);
-
-    return d;
-}
-function formatYMDInReportTZ(value) {
-    const date = value instanceof Date ? value : new Date(value);
-
-    if (!value || Number.isNaN(date.getTime())) {
-        return null;
-    }
-
-    return date.toLocaleDateString("en-CA", {
-        timeZone: "America/Santo_Domingo",
-    });
-}
 function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, endDate }) {
     const rawClientId = String(clientId || "default").trim() || "default";
 
@@ -91,15 +68,9 @@ function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, en
             ? ""
             : rawRegister;
 
-    const clientScope = {
-        $or: [
-            { clientId: rawClientId },
-            { clientId: "default" },
-            { clientId: { $exists: false } },
-            { clientId: null },
-            { clientId: "" },
-        ],
-    };
+    const clientScope = rawClientId === "default"
+        ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+        : { clientId: rawClientId };
 
     let registerScope = {};
 
@@ -238,6 +209,156 @@ function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, en
         ],
     };
 }
+function buildCreditReportFilter({
+                                     tenantId,
+                                     clientId,
+                                     registerId,
+                                     startDate,
+                                     endDate,
+                                 }) {
+    const rawClientId =
+        String(clientId || "default").trim() ||
+        "default";
+
+    const rawRegister =
+        registerId
+            ? String(registerId)
+                .trim()
+                .toUpperCase()
+            : "";
+
+    const normalizedRegister =
+        !rawRegister ||
+        rawRegister ===
+        "__ALL_REGISTERS__" ||
+        rawRegister === "ALL"
+            ? ""
+            : rawRegister;
+
+    const clientScope = rawClientId === "default"
+        ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+        : { clientId: rawClientId };
+
+    let registerScope = {};
+
+    if (normalizedRegister) {
+        if (
+            normalizedRegister === "MAIN" ||
+            normalizedRegister === "DEFAULT"
+        ) {
+            registerScope = {
+                $or: [
+                    { registerId: "MAIN" },
+                    { registerId: "default" },
+                    {
+                        registerId: {
+                            $exists: false,
+                        },
+                    },
+                    { registerId: null },
+                    { registerId: "" },
+                ],
+            };
+        } else {
+            registerScope = {
+                registerId:
+                normalizedRegister,
+            };
+        }
+    }
+
+    const andConditions = [
+        clientScope,
+
+        {
+            isDraft: {
+                $ne: true,
+            },
+        },
+
+        {
+            "items.0": {
+                $exists: true,
+            },
+        },
+
+        {
+            orderStatus: {
+                $nin: [
+                    "Cancelado",
+                    "Canceled",
+                    "Cancelled",
+                ],
+            },
+        },
+
+        {
+            paymentStatus: {
+                $ne: "Anulado",
+            },
+        },
+
+        {
+            paymentMethod: {
+                $regex:
+                    "^(Credito|Crédito|Credit)$",
+                $options: "i",
+            },
+        },
+    ];
+
+    if (startDate && endDate) {
+        andConditions.push({
+            $or: [
+                {
+                    invoicedAt: {
+                        $gte: startDate,
+                        $lte: endDate,
+                    },
+                },
+
+                {
+                    $and: [
+                        {
+                            $or: [
+                                {
+                                    invoicedAt: {
+                                        $exists:
+                                            false,
+                                    },
+                                },
+                                {
+                                    invoicedAt:
+                                        null,
+                                },
+                                {
+                                    invoicedAt:
+                                        "",
+                                },
+                            ],
+                        },
+                        {
+                            createdAt: {
+                                $gte:
+                                startDate,
+                                $lte:
+                                endDate,
+                            },
+                        },
+                    ],
+                },
+            ],
+        });
+    }
+
+    return {
+        tenantId,
+
+        ...registerScope,
+
+        $and: andConditions,
+    };
+}
 // 🔹 Obtener reportes (ventas filtradas + resumen diario)
 exports.getReports = async (req, res) => {
     try {
@@ -255,6 +376,20 @@ exports.getReports = async (req, res) => {
         };
         const tenantId = req.user.tenantId;
         const clientId = getClientId(req);
+        const tenant =
+            await Tenant
+                .findOne({
+                    tenantId,
+                })
+                .select(
+                    "localization.timezone"
+                )
+                .lean();
+
+        const timezone =
+            getTenantTimezone(
+                tenant
+            );
 
         // ✅ MERMA (waste) por rango de fechas (costo y cantidad)
         const rawClientId = String(clientId || "default").trim() || "default";
@@ -262,25 +397,52 @@ exports.getReports = async (req, res) => {
         const mermaFilter = {
             tenantId,
             type: "waste",
-            $or: [
-                { clientId: rawClientId },
-                { clientId: "default" },
-                { clientId: { $exists: false } },
-                { clientId: null },
-                { clientId: "" },
-            ],
+            ...(rawClientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId: rawClientId }),
         };
 
-        const startDate = from ? parseReportBoundary(from, false) : null;
-        const endDate = to ? parseReportBoundary(to, true) : null;
+        let startDate =
+            null;
 
-        if ((from && !startDate) || (to && !endDate)) {
-            return res.status(400).json({
-                success: false,
-                message: "INVALID_REPORT_DATE_RANGE",
-                details: { from, to },
-            });
+        let endDate =
+            null;
+
+        if (
+            from ||
+            to
+        ) {
+            const range =
+                getUtcRangeForYMDRange(
+                    from || to,
+                    to || from,
+                    timezone
+                );
+
+            if (!range) {
+                return res
+                    .status(400)
+                    .json({
+                        success: false,
+
+                        message:
+                            "INVALID_REPORT_DATE_RANGE",
+
+                        details: {
+                            from,
+                            to,
+                        },
+                    });
+            }
+
+            startDate =
+                range.start;
+
+            endDate =
+                range.end;
         }
+
+
 
         if (startDate && endDate) {
             mermaFilter.createdAt = { $gte: startDate, $lte: endDate };
@@ -309,67 +471,140 @@ exports.getReports = async (req, res) => {
             startDate,
             endDate,
         });
+        const creditFilter = buildCreditReportFilter({
+            tenantId,
+            clientId,
+            registerId,
+            startDate,
+            endDate,
+        });
 
-// Crédito NO es venta cobrada.
-// Las ventas a crédito viven en Cuentas por Cobrar.
+        const normalizedRequestedMethod =
+            normalizePaymentText(method);
+
+        const creditMethodRequested =
+            normalizedRequestedMethod === "credito" ||
+            normalizedRequestedMethod === "credit";
+
+// ==========================================
+// EXCLUIR CRÉDITO DE LAS VENTAS COBRADAS
+// ==========================================
         filter.$and = [
-            ...(Array.isArray(filter.$and) ? filter.$and : []),
+            ...(Array.isArray(filter.$and)
+                ? filter.$and
+                : []),
+
             {
-                $or: [
-                    { paymentMethod: { $exists: false } },
-                    { paymentMethod: { $ne: "Credito" } },
+                $nor: [
+                    {
+                        paymentMethod: {
+                            $regex: "^(Credito|Crédito|Credit)$",
+                            $options: "i",
+                        },
+                    },
                 ],
             },
         ];
 
+// ==========================================
+// FILTRO POR MÉTODO DE PAGO
+// ==========================================
+// Si pidieron Crédito, NO filtramos `filter`
+// porque esas ventas salen de `creditFilter`.
+        if (
+            method &&
+            !creditMethodRequested
+        ) {
+            filter.$and.push({
+                paymentMethod: method,
+            });
+        }
+
 // Filtrar por método de pago.
 // Si alguien intenta pedir Crédito aquí, devolvemos vacío,
 // porque Crédito no pertenece a ventas cobradas.
-        if (method) {
-            if (String(method).trim() === "Credito") {
-                return res.status(200).json({
-                    success: true,
-                    count: 0,
-                    dailySummary: {
-                        totalSales: 0,
-                        totalTax: 0,
-                        orderCount: 0,
-                        totalCommission: 0,
-                        totalNet: 0,
-                        mermaQty,
-                        mermaCost,
-                        netSales: 0,
-                        avgTicket: 0,
-                        cashSales: 0,
-                        onlineSales: 0,
-                        transferSales: 0,
-                    },
-                    salesByDate: {},
-                    data: [],
-                });
-            }
-
-            filter.$and.push({ paymentMethod: method });
-        }
 
         // ✅ Buscar por nombre del usuario (match con populate)
         let userIds = [];
+
         if (user) {
-            const matchedUsers = await User.find({
-                tenantId: req.user.tenantId,
-                name: { $regex: user.trim(), $options: "i" },
-            }).select("_id");
-            userIds = matchedUsers.map((u) => u._id);
-            if (userIds.length > 0) filter.user = { $in: userIds };
-            else return res.status(200).json({ success: true, data: [] }); // si no hay coincidencias
+            const matchedUsers =
+                await User.find({
+                    tenantId:
+                    req.user.tenantId,
+
+                    name: {
+                        $regex:
+                            user.trim(),
+
+                        $options:
+                            "i",
+                    },
+                }).select("_id");
+
+            userIds =
+                matchedUsers.map(
+                    (u) => u._id
+                );
+
+            if (userIds.length > 0) {
+                const userFilter = {
+                    $in: userIds,
+                };
+
+                filter.user =
+                    userFilter;
+
+                creditFilter.user =
+                    userFilter;
+            } else {
+                // Fuerza ambas consultas
+                // a devolver vacío.
+                filter._id = {
+                    $exists: false,
+                };
+
+                creditFilter._id = {
+                    $exists: false,
+                };
+            }
         }
 
         // Buscar órdenes que cumplan con los filtros
-        const orders = await Order.find(filter)
-            .populate("user", "name role email")
-            .populate("table", "tableNumber virtualType type isVirtual name")
+        const orders =
+            creditMethodRequested
+                ? []
+                : await Order.find(filter)
+                    .populate(
+                        "user",
+                        "name role email"
+                    )
+                    .populate(
+                        "table",
+                        "tableNumber virtualType type isVirtual name"
+                    )
+                    .sort({
+                        paidAt: -1,
+                        createdAt: -1,
+                    });
 
-            .sort({ paidAt: -1, createdAt: -1 });
+        const creditOrders =
+            method &&
+            !creditMethodRequested
+                ? []
+                : await Order.find(creditFilter)
+                    .populate(
+                        "user",
+                        "name role email"
+                    )
+                    .populate(
+                        "table",
+                        "tableNumber virtualType type isVirtual name"
+                    )
+                    .sort({
+                        invoicedAt: -1,
+                        createdAt: -1,
+                    });
         // Calcular totales
         const totalSales = orders.reduce((sum, o) => sum + (Number(o.bills?.totalWithTax) || 0), 0);
         const totalTax = orders.reduce((sum, o) => sum + (Number(o.bills?.tax) || 0), 0);
@@ -377,6 +612,22 @@ exports.getReports = async (req, res) => {
         const totalNet = orders.reduce((sum, o) => sum + (Number(o.netTotal) || 0), 0);
         const orderCount = orders.length;
         const avgTicket = orderCount > 0 ? totalSales / orderCount : 0;
+        const creditSales =
+            creditOrders.reduce(
+                (sum, order) =>
+                    sum +
+                    (
+                        Number(
+                            order
+                                ?.bills
+                                ?.totalWithTax
+                        ) || 0
+                    ),
+                0
+            );
+
+        const creditOrderCount =
+            creditOrders.length;
 
         // 🔹 Cierre de caja diario (resumen)
         const dailySummary = {
@@ -385,6 +636,8 @@ exports.getReports = async (req, res) => {
             orderCount,
             totalCommission,
             totalNet,
+            creditSales,
+            creditOrderCount,
             mermaQty,
             mermaCost,
             netSales: Number((totalSales - mermaCost).toFixed(2)),
@@ -406,7 +659,11 @@ exports.getReports = async (req, res) => {
         const groupedByDate = {};
         orders.forEach((o) => {
             const refDate = o.paidAt || o.invoicedAt || o.createdAt;
-            const date = formatYMDInReportTZ(refDate);
+            const date =
+                getYMDInTimeZone(
+                    refDate,
+                    timezone
+                );
 
             if (!date) return;
 
@@ -416,12 +673,27 @@ exports.getReports = async (req, res) => {
 
         res.status(200).json({
             success: true,
-            count: orderCount,
+
+            // Ventas cobradas
+            count:
+            orderCount,
+
+            // Ventas a crédito
+            creditCount:
+            creditOrderCount,
+
             dailySummary,
 
+            salesByDate:
+            groupedByDate,
 
-            salesByDate: groupedByDate, // { '2025-10-27': 512, '2025-10-26': 430, ... }
-            data: orders,
+            // Dinero cobrado
+            data:
+            orders,
+
+            // Ventas realizadas a crédito
+            creditData:
+            creditOrders,
         });
     } catch (error) {
         console.error("❌ Error al obtener reportes:", error);
@@ -435,59 +707,42 @@ exports.getReports = async (req, res) => {
 // 🔹 Obtener todos los empleados (sin incluir al admin)
 exports.getEmployees = async (req, res) => {
     try {
-        const tenantId = req.user.tenantId;
-
-        const employees = await User.find({ tenantId })
-            .select("_id name email phone role")
-            .lean();
-
-        const memberships = await Membership.find({
-            tenantId,
-            user: { $in: employees.map((e) => e._id) },
-            status: "active",
-        })
-            .select("user role clientIds permissions status")
-            .lean();
-
-        const membershipByUserId = new Map(
-            memberships.map((m) => [String(m.user), m])
-        );
-
-        const data = employees.map((employee) => {
-            const membership = membershipByUserId.get(String(employee._id));
-
-            return {
-                ...employee,
-                membershipRole: membership?.role || employee.role,
-                clientIds: membership?.clientIds || [],
-                permissions: normalizePermissions(membership?.permissions || DEFAULT_PERMISSIONS),
-            };
-        });
-
-        res.status(200).json({
-            success: true,
-            data,
-        });
+        const tenantId = req.scope.tenantId;
+        const clientId = req.scope.clientId;
+        const memberships = await Membership.find(membershipFilter(tenantId, clientId))
+            .select("user role clientIds permissions status").lean();
+        const members = memberships.filter(m => visibleInBranch(m, clientId));
+        const users = await User.find({ tenantId, _id: { $in: members.map(m => m.user) } })
+            .select("_id name email phone role").lean();
+        const byId = new Map(users.map(u => [String(u._id), u]));
+        const data = members.filter(m => byId.has(String(m.user))).map(m => ({
+            ...byId.get(String(m.user)), membershipRole: m.role,
+            clientIds: Array.isArray(m.clientIds) && m.clientIds.length ? m.clientIds : ["default"],
+            permissions: normalizePermissions(m.permissions || DEFAULT_PERMISSIONS),
+        }));
+        return res.json({ success: true, data });
     } catch (error) {
-        console.error("❌ Error al obtener empleados:", error);
-        res.status(500).json({
-            success: false,
-            message: "Error al obtener empleados",
-        });
+        console.error("GET_EMPLOYEES_FAILED:", error);
+        return res.status(500).json({ success: false, message: "Error al obtener empleados" });
     }
 };
 
-// 🔹 Obtener todos los usuarios (incluye admin)
+// Users/cashier selector must observe the same branch filter as Employees.
 exports.getUsers = async (req, res) => {
     try {
-        const users = await User.find({ tenantId: req.user.tenantId })
-            .select("name email phone role");
-        res.status(200).json({ success:true, data:users });
+        const tenantId = req.scope.tenantId;
+        const clientId = req.scope.clientId;
+        const memberships = await Membership.find(membershipFilter(tenantId, clientId))
+            .select("user role clientIds status").lean();
+        const members = memberships.filter(m => visibleInBranch(m, clientId));
+        const users = await User.find({ tenantId, _id: { $in: members.map(m => m.user) } })
+            .select("_id name email phone role").lean();
+        const byUser = new Map(members.map(m => [String(m.user), m]));
+        const data = users.map(u => ({ ...u, role: byUser.get(String(u._id))?.role || u.role }));
+        return res.json({ success: true, data });
     } catch (error) {
-        console.error("❌ Error al obtener usuarios:", error);
-        res
-            .status(500)
-            .json({ success: false, message: "Error al obtener usuarios" });
+        console.error("GET_USERS_FAILED:", error);
+        return res.status(500).json({ success: false, message: "Error al obtener usuarios" });
     }
 };
 
@@ -495,7 +750,7 @@ exports.getUsers = async (req, res) => {
 exports.updateEmployee = async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, email, phone, role, password, permissions } = req.body;
+        const { name, email, phone, role, password, permissions, clientIds } = req.body;
 
 
         // Verificar que el empleado existe y pertenece al mismo tenant
@@ -503,6 +758,40 @@ exports.updateEmployee = async (req, res) => {
         
         if (!employee) {
             return res.status(404).json({ success: false, message: "Empleado no encontrado" });
+        }
+
+        // PATCH is limited to users visible in the active branch, not every user in tenant.
+        const memberInBranch = await Membership.findOne({ user: employee._id, tenantId: req.scope.tenantId, status: "active" });
+        if (!visibleInBranch(memberInBranch, req.scope.clientId)) {
+            return res.status(404).json({ success: false, code: "EMPLOYEE_NOT_IN_BRANCH", message: "Empleado no asignado a esta sucursal" });
+        }
+        let verifiedClientIds;
+        if (clientIds !== undefined) {
+            verifiedClientIds = validateBranchIds(clientIds);
+            if (!verifiedClientIds) return res.status(400).json({ code: "INVALID_BRANCH_ASSIGNMENT" });
+            const secondaryIds = verifiedClientIds.filter(id => id !== "default");
+            if (secondaryIds.length) {
+                const available = await Client.countDocuments({ tenantId: req.scope.tenantId, clientId: { $in: secondaryIds }, isActive: true });
+                if (available !== secondaryIds.length) return res.status(400).json({ code: "INVALID_BRANCH_ASSIGNMENT" });
+            }
+            // Owner/Admin tienen alcance global por membresía. Un PATCH de permisos
+            // no debe fallar si un cliente antiguo reenvía sin cambios clientIds.
+            // Bloquear únicamente un cambio REAL de las asignaciones globales.
+            const activeRole = role || memberInBranch.role;
+            if (["Owner", "Admin"].includes(memberInBranch.role) ||
+                ["Owner", "Admin"].includes(activeRole)) {
+                const currentClientIds = validateBranchIds(
+                    Array.isArray(memberInBranch.clientIds) && memberInBranch.clientIds.length
+                        ? memberInBranch.clientIds : ["default"]
+                ) || ["default"];
+                const sameIds = verifiedClientIds.length === currentClientIds.length &&
+                    verifiedClientIds.every(id => currentClientIds.includes(id));
+                if (!sameIds) {
+                    return res.status(403).json({ success: false, code: "GLOBAL_ADMIN_ASSIGNMENT_READ_ONLY",
+                        message: "Los administradores globales no pueden cambiar sus sucursales desde Empleados" });
+                }
+                verifiedClientIds = undefined;
+            }
         }
 
         // No permitir editar al Admin principal (puedes ajustar esta lógica)
@@ -547,15 +836,18 @@ exports.updateEmployee = async (req, res) => {
             updateData.email = normalizedEmail;
         }
 
-        if (phone) {
-            const phoneNum = Number(phone);
-            if (isNaN(phoneNum) || phoneNum.toString().length !== 10) {
+        if (phone !== undefined) {
+            // El schema User guarda phone como STRING (7..15 dígitos), no como Number.
+            // Soportar formato legible y prefijos internacionales sin perder ceros.
+            const digits = String(phone ?? "").replace(/\D/g, "");
+            if (digits && !/^\d{7,15}$/.test(digits)) {
                 return res.status(400).json({
                     success: false,
-                    message: "El teléfono debe ser un número de 10 dígitos"
+                    code: "INVALID_PHONE",
+                    message: "El teléfono debe contener entre 7 y 15 dígitos"
                 });
             }
-            updateData.phone = phoneNum;
+            updateData.phone = digits;
         }
 
         if (role && ["Admin", "Camarero", "Cajera", "Cocina"].includes(role)) {
@@ -567,7 +859,7 @@ exports.updateEmployee = async (req, res) => {
             const tenantId = req.user.tenantId;
 
             const tenant = await Tenant.findOne({ tenantId }).select("plan");
-            const tier = TIERS[tenant?.plan] || TIERS.emprendedor;
+            const tier = TIERS[normalizePlan(tenant?.plan)] || TIERS.emprendedor;
             const limits = tier.limits || {};
 
             // Excluir al usuario que estás editando del conteo
@@ -654,31 +946,48 @@ exports.updateEmployee = async (req, res) => {
             role: effectiveMembershipRole,
             status: "active",
         };
+        if (verifiedClientIds) membershipSet.clientIds = verifiedClientIds;
 
         if (permissions && typeof permissions === "object") {
             membershipSet.permissions = normalizePermissions(permissions);
+            // No conceder permisos DGII a negocios extranjeros ni planes sin fiscal.
+            const fiscalTenant = await Tenant.findOne({ tenantId: req.user.tenantId })
+                .select("plan localization.countryCode").lean();
+            const fiscalDelegationAllowed =
+                String(fiscalTenant?.localization?.countryCode || "DO").toUpperCase() === "DO" &&
+                getPlanFeatures(fiscalTenant?.plan).fiscal === true &&
+                effectiveMembershipRole === "Cajera";
+            if (!fiscalDelegationAllowed) {
+                membershipSet.permissions.fiscal = { ecfIssue:false,creditNote:false,debitNote:false,manage:false };
+            }
+        } else if (effectiveMembershipRole !== "Cajera") {
+            // Al cambiar el rol sin enviar el objeto permissions, revocar igual.
+            membershipSet["permissions.fiscal"] = {
+                ecfIssue:false,creditNote:false,debitNote:false,manage:false,
+            };
         }
 
+        // La membresía activa fue validada arriba. NO crearla otra vez durante
+        // una edición: $set.clientIds y $setOnInsert.clientIds colisionan en
+        // MongoDB y generan un error 500 al guardar permisos de cajeras.
         const updatedMembership = await Membership.findOneAndUpdate(
             {
+                _id: memberInBranch._id,
                 user: employee._id,
-                tenantId: req.user.tenantId,
+                tenantId: req.scope.tenantId,
+                status: "active",
             },
-            {
-                $set: membershipSet,
-                $setOnInsert: {
-                    user: employee._id,
-                    tenantId: req.user.tenantId,
-                    clientIds: ["default"],
-                },
-            },
+            { $set: membershipSet },
             {
                 new: true,
-                upsert: true,
+                upsert: false,
                 runValidators: true,
-                setDefaultsOnInsert: true,
             }
         ).lean();
+        if (!updatedMembership) {
+            return res.status(409).json({ success: false, code: "EMPLOYEE_MEMBERSHIP_CHANGED",
+                message: "La asignación del empleado cambió. Actualiza la lista y vuelve a intentar." });
+        }
 
         res.status(200).json({
             success: true,
@@ -712,14 +1021,1060 @@ exports.updateEmployee = async (req, res) => {
         });
     }
 };
+const DEFAULT_LOCALIZATION = {
+    countryCode: "DO",
+    language: "es",
+    locale: "es-DO",
+    currency: "DOP",
+    timezone: "America/Santo_Domingo",
+    dateFormat: "DD/MM/YYYY",
+    timeFormat: "12h",
+    measurementSystem: "imperial",
+    weightUnit: "lb",
+};
+
+function normalizeTenantLocalization(
+    tenant
+) {
+    const current =
+        tenant?.localization || {};
+
+    return {
+        countryCode:
+            String(
+                current.countryCode ||
+                DEFAULT_LOCALIZATION.countryCode
+            )
+                .trim()
+                .toUpperCase(),
+
+        language:
+            String(
+                current.language ||
+                DEFAULT_LOCALIZATION.language
+            )
+                .trim()
+                .toLowerCase(),
+
+        locale:
+            String(
+                current.locale ||
+                DEFAULT_LOCALIZATION.locale
+            ).trim(),
+
+        currency:
+            String(
+                current.currency ||
+                DEFAULT_LOCALIZATION.currency
+            )
+                .trim()
+                .toUpperCase(),
+
+        timezone:
+            String(
+                current.timezone ||
+                DEFAULT_LOCALIZATION.timezone
+            ).trim(),
+
+        dateFormat:
+            String(
+                current.dateFormat ||
+                DEFAULT_LOCALIZATION.dateFormat
+            ).trim(),
+
+        timeFormat:
+            String(
+                current.timeFormat ||
+                DEFAULT_LOCALIZATION.timeFormat
+            ).trim(),
+
+        measurementSystem:
+            String(
+                current.measurementSystem ||
+                DEFAULT_LOCALIZATION
+                    .measurementSystem
+            ).trim(),
+
+        weightUnit:
+            String(
+                current.weightUnit ||
+                DEFAULT_LOCALIZATION.weightUnit
+            ).trim(),
+    };
+}
+
+function normalizeLegacyTaxPercent(
+    value
+) {
+    const number =
+        Number(value);
+
+    if (!Number.isFinite(number)) {
+        return 18;
+    }
+
+    // Legacy guarda:
+    // 0.18 = 18%
+    if (
+        number >= 0 &&
+        number <= 1
+    ) {
+        return Number(
+            (number * 100)
+                .toFixed(4)
+        );
+    }
+
+    return number;
+}
+
+function normalizeTenantTaxConfig(
+    tenant
+) {
+    const storedTaxes =
+        Array.isArray(
+            tenant?.taxConfig?.taxes
+        )
+            ? tenant.taxConfig.taxes
+            : [];
+
+    if (storedTaxes.length > 0) {
+        const taxes =
+            storedTaxes.map(
+                (tax) => ({
+                    id:
+                        String(
+                            tax?.id || ""
+                        ).trim(),
+
+                    name:
+                        String(
+                            tax?.name || ""
+                        ).trim(),
+
+                    code:
+                        String(
+                            tax?.code || ""
+                        )
+                            .trim()
+                            .toUpperCase(),
+
+                    ratePercent:
+                        Number(
+                            tax?.ratePercent ||
+                            0
+                        ),
+
+                    active:
+                        tax?.active !==
+                        false,
+
+                    includedInPrice:
+                        tax
+                            ?.includedInPrice ===
+                        true,
+
+                    appliesToDeliveryFee:
+                        tax
+                            ?.appliesToDeliveryFee ===
+                        true,
+                })
+            );
+
+        const activeTaxes =
+            taxes.filter(
+                (tax) =>
+                    tax.active
+            );
+
+        const requestedDefault =
+            String(
+                tenant
+                    ?.taxConfig
+                    ?.defaultTaxId ||
+                ""
+            ).trim();
+
+        const validDefault =
+            activeTaxes.some(
+                (tax) =>
+                    tax.id ===
+                    requestedDefault
+            )
+                ? requestedDefault
+                : (
+                    activeTaxes[0]
+                        ?.id ||
+                    null
+                );
+
+        return {
+            enabled:
+                typeof tenant
+                    ?.taxConfig
+                    ?.enabled ===
+                "boolean"
+                    ? tenant
+                        .taxConfig
+                        .enabled
+                    : true,
+
+            defaultTaxId:
+            validDefault,
+
+            taxes,
+        };
+    }
+
+    // ==========================================
+    // COMPATIBILIDAD CON CLIENTES EXISTENTES
+    // ==========================================
+    //
+    // Si todavía no existe taxConfig,
+    // convertimos virtualmente el antiguo
+    // features.tax en un impuesto genérico.
+    //
+    // No modifica MongoDB hasta que el usuario
+    // guarde Configuración Fiscal.
+    // ==========================================
+
+    const legacyEnabled =
+        typeof tenant
+            ?.features
+            ?.tax
+            ?.enabled ===
+        "boolean"
+            ? tenant
+                .features
+                .tax
+                .enabled
+            : true;
+
+    const legacyRate =
+        normalizeLegacyTaxPercent(
+            tenant
+                ?.features
+                ?.tax
+                ?.rate ??
+            0.18
+        );
+
+    const localization =
+        normalizeTenantLocalization(
+            tenant
+        );
+
+    const isDominican =
+        localization.countryCode ===
+        "DO";
+
+    const legacyTax = {
+        id:
+            "legacy_default_tax",
+
+        name:
+            isDominican
+                ? "ITBIS"
+                : "Tax",
+
+        code:
+            isDominican
+                ? "ITBIS"
+                : "TAX",
+
+        ratePercent:
+        legacyRate,
+
+        active:
+            true,
+
+        includedInPrice:
+            false,
+
+        appliesToDeliveryFee:
+            true,
+    };
+
+    return {
+        enabled:
+        legacyEnabled,
+
+        defaultTaxId:
+        legacyTax.id,
+
+        taxes: [
+            legacyTax,
+        ],
+    };
+}
+function normalizeTaxIdentifierInput(
+    raw = {},
+    {
+        required = false,
+        fallbackCountryCode = "",
+    } = {}
+) {
+    const type =
+        String(
+            raw?.type || ""
+        )
+            .trim()
+            .toUpperCase()
+            .replace(
+                /[^A-Z0-9_-]/g,
+                "_"
+            )
+            .slice(
+                0,
+                40
+            );
+
+    const label =
+        String(
+            raw?.label || ""
+        )
+            .trim()
+            .slice(
+                0,
+                80
+            );
+
+    const value =
+        String(
+            raw?.value || ""
+        )
+            .trim()
+            .slice(
+                0,
+                120
+            );
+
+    const countryCode =
+        String(
+            raw?.countryCode ||
+            fallbackCountryCode ||
+            ""
+        )
+            .trim()
+            .toUpperCase();
+
+    if (
+        countryCode &&
+        !/^[A-Z]{2}$/.test(
+            countryCode
+        )
+    ) {
+        throw createHttpError(
+            400,
+            "TAX_IDENTITY_COUNTRY_INVALID"
+        );
+    }
+
+    if (
+        required &&
+        !type
+    ) {
+        throw createHttpError(
+            400,
+            "TAX_IDENTITY_TYPE_REQUIRED"
+        );
+    }
+
+    if (
+        required &&
+        !value
+    ) {
+        throw createHttpError(
+            400,
+            "TAX_IDENTITY_VALUE_REQUIRED"
+        );
+    }
+
+    if (
+        !type &&
+        !label &&
+        !value
+    ) {
+        return null;
+    }
+
+    return {
+        type,
+
+        label:
+            label ||
+            type,
+
+        value,
+
+        countryCode,
+
+        active:
+            raw?.active !==
+            false,
+    };
+}
+
+
+function validateTaxIdentityInput(
+    raw = {},
+    fallbackCountryCode = "DO"
+) {
+    const enabled =
+        raw?.enabled ===
+        true;
+
+    const countryCode =
+        String(
+            raw?.countryCode ||
+            fallbackCountryCode ||
+            "DO"
+        )
+            .trim()
+            .toUpperCase();
+
+    if (
+        !/^[A-Z]{2}$/.test(
+            countryCode
+        )
+    ) {
+        throw createHttpError(
+            400,
+            "TAX_IDENTITY_COUNTRY_INVALID"
+        );
+    }
+
+    const legalName =
+        String(
+            raw?.legalName || ""
+        )
+            .trim()
+            .slice(
+                0,
+                160
+            );
+
+    if (
+        enabled &&
+        !legalName
+    ) {
+        throw createHttpError(
+            400,
+            "TAX_IDENTITY_LEGAL_NAME_REQUIRED"
+        );
+    }
+
+    const primaryTaxId =
+        normalizeTaxIdentifierInput(
+            raw?.primaryTaxId,
+            {
+                required:
+                enabled,
+
+                fallbackCountryCode:
+                countryCode,
+            }
+        );
+
+    const incomingAdditional =
+        Array.isArray(
+            raw?.additionalTaxIds
+        )
+            ? raw.additionalTaxIds
+            : [];
+
+    if (
+        incomingAdditional.length >
+        10
+    ) {
+        throw createHttpError(
+            400,
+            "TOO_MANY_TAX_IDENTIFIERS"
+        );
+    }
+
+    const additionalTaxIds =
+        incomingAdditional
+            .map(
+                (
+                    identifier
+                ) =>
+                    normalizeTaxIdentifierInput(
+                        identifier,
+                        {
+                            required:
+                                false,
+
+                            fallbackCountryCode:
+                            countryCode,
+                        }
+                    )
+            )
+            .filter(Boolean);
+
+    return {
+        enabled,
+        countryCode,
+        legalName,
+        primaryTaxId,
+        additionalTaxIds,
+    };
+}
+function normalizeTenantTaxIdentity(
+    tenant
+) {
+    const raw =
+        tenant?.taxIdentity ||
+        {};
+
+    const localization =
+        normalizeTenantLocalization(
+            tenant
+        );
+
+    const legacyRnc =
+        String(
+            tenant
+                ?.business
+                ?.rnc ||
+            tenant
+                ?.fiscal
+                ?.rnc ||
+            ""
+        ).trim();
+
+    const hasNewIdentity =
+        Boolean(
+            raw?.legalName ||
+            raw?.primaryTaxId
+                ?.value ||
+            (
+                Array.isArray(
+                    raw
+                        ?.additionalTaxIds
+                ) &&
+                raw
+                    .additionalTaxIds
+                    .length >
+                0
+            )
+        );
+
+    if (
+        hasNewIdentity
+    ) {
+        return {
+            enabled:
+                raw.enabled ===
+                true,
+
+            countryCode:
+                String(
+                    raw.countryCode ||
+                    localization
+                        .countryCode
+                )
+                    .trim()
+                    .toUpperCase(),
+
+            legalName:
+                String(
+                    raw.legalName ||
+                    tenant
+                        ?.business
+                        ?.name ||
+                    tenant?.name ||
+                    ""
+                ).trim(),
+
+            primaryTaxId:
+                raw.primaryTaxId ||
+                null,
+
+            additionalTaxIds:
+                Array.isArray(
+                    raw
+                        .additionalTaxIds
+                )
+                    ? raw
+                        .additionalTaxIds
+                    : [],
+        };
+    }
+
+    /*
+     * Compatibilidad legacy RD.
+     *
+     * No modifica MongoDB.
+     * Solo presenta el RNC viejo
+     * como taxIdentity hasta que
+     * el usuario guarde la pantalla.
+     */
+    return {
+        enabled:
+            Boolean(
+                legacyRnc
+            ),
+
+        countryCode:
+        localization
+            .countryCode,
+
+        legalName:
+            String(
+                tenant
+                    ?.business
+                    ?.name ||
+                tenant?.name ||
+                ""
+            ).trim(),
+
+        primaryTaxId:
+            legacyRnc
+                ? {
+                    type:
+                        "RNC",
+
+                    label:
+                        "RNC",
+
+                    value:
+                    legacyRnc,
+
+                    countryCode:
+                        "DO",
+
+                    active:
+                        true,
+                }
+                : null,
+
+        additionalTaxIds:
+            [],
+    };
+}
+function validateLocalizationInput(
+    raw = {}
+) {
+    const countryCode =
+        String(
+            raw.countryCode || ""
+        )
+            .trim()
+            .toUpperCase();
+
+    if (
+        !/^[A-Z]{2}$/.test(
+            countryCode
+        )
+    ) {
+        throw new Error(
+            "Código de país inválido. Usa 2 letras, por ejemplo DO, US o GB."
+        );
+    }
+
+    const language =
+        String(
+            raw.language || ""
+        )
+            .trim()
+            .toLowerCase();
+
+    if (
+        !/^[a-z]{2,3}$/.test(
+            language
+        )
+    ) {
+        throw new Error(
+            "Idioma inválido."
+        );
+    }
+
+    const locale =
+        String(
+            raw.locale || ""
+        ).trim();
+
+    try {
+        new Intl.NumberFormat(
+            locale
+        );
+    } catch {
+        throw new Error(
+            "Locale inválido."
+        );
+    }
+
+    const currency =
+        String(
+            raw.currency || ""
+        )
+            .trim()
+            .toUpperCase();
+
+    if (
+        !/^[A-Z]{3}$/.test(
+            currency
+        )
+    ) {
+        throw new Error(
+            "Moneda inválida."
+        );
+    }
+
+    try {
+        new Intl.NumberFormat(
+            locale,
+            {
+                style:
+                    "currency",
+
+                currency,
+            }
+        );
+    } catch {
+        throw new Error(
+            "Moneda no soportada."
+        );
+    }
+
+    const timezone =
+        String(
+            raw.timezone || ""
+        ).trim();
+
+    try {
+        new Intl.DateTimeFormat(
+            locale,
+            {
+                timeZone:
+                timezone,
+            }
+        );
+    } catch {
+        throw new Error(
+            "Zona horaria inválida."
+        );
+    }
+
+    const dateFormat =
+        String(
+            raw.dateFormat || ""
+        ).trim();
+
+    if (
+        ![
+            "DD/MM/YYYY",
+            "MM/DD/YYYY",
+            "YYYY-MM-DD",
+        ].includes(
+            dateFormat
+        )
+    ) {
+        throw new Error(
+            "Formato de fecha inválido."
+        );
+    }
+
+    const timeFormat =
+        String(
+            raw.timeFormat || ""
+        ).trim();
+
+    if (
+        ![
+            "12h",
+            "24h",
+        ].includes(
+            timeFormat
+        )
+    ) {
+        throw new Error(
+            "Formato de hora inválido."
+        );
+    }
+
+    const measurementSystem =
+        String(
+            raw.measurementSystem ||
+            ""
+        ).trim();
+
+    if (
+        ![
+            "metric",
+            "imperial",
+        ].includes(
+            measurementSystem
+        )
+    ) {
+        throw new Error(
+            "Sistema de medidas inválido."
+        );
+    }
+
+    const weightUnit =
+        String(
+            raw.weightUnit || ""
+        ).trim();
+
+    if (
+        ![
+            "lb",
+            "kg",
+        ].includes(
+            weightUnit
+        )
+    ) {
+        throw new Error(
+            "Unidad de peso inválida."
+        );
+    }
+
+    return {
+        countryCode,
+        language,
+        locale,
+        currency,
+        timezone,
+        dateFormat,
+        timeFormat,
+        measurementSystem,
+        weightUnit,
+    };
+}
+
+function normalizeTaxCode(
+    value
+) {
+    return String(
+        value || ""
+    )
+        .trim()
+        .toUpperCase()
+        .replace(
+            /[^A-Z0-9_-]/g,
+            "_"
+        )
+        .slice(
+            0,
+            30
+        );
+}
+
+function validateTaxConfigInput(
+    raw = {}
+) {
+    const enabled =
+        raw.enabled !==
+        false;
+
+    const incomingTaxes =
+        Array.isArray(
+            raw.taxes
+        )
+            ? raw.taxes
+            : [];
+
+    if (
+        incomingTaxes.length >
+        20
+    ) {
+        throw new Error(
+            "Puedes configurar un máximo de 20 impuestos."
+        );
+    }
+
+    const usedIds =
+        new Set();
+
+    const usedCodes =
+        new Set();
+
+    const taxes =
+        incomingTaxes.map(
+            (
+                tax,
+                index
+            ) => {
+                let id =
+                    String(
+                        tax?.id ||
+                        ""
+                    ).trim();
+
+                if (!id) {
+                    id =
+                        `tax_${crypto.randomUUID()}`;
+                }
+
+                if (
+                    usedIds.has(id)
+                ) {
+                    throw new Error(
+                        `El impuesto #${index + 1} tiene un ID duplicado.`
+                    );
+                }
+
+                usedIds.add(id);
+
+                const name =
+                    String(
+                        tax?.name ||
+                        ""
+                    ).trim();
+
+                if (!name) {
+                    throw new Error(
+                        `El impuesto #${index + 1} necesita un nombre.`
+                    );
+                }
+
+                const code =
+                    normalizeTaxCode(
+                        tax?.code ||
+                        name
+                    );
+
+                if (!code) {
+                    throw new Error(
+                        `El impuesto "${name}" necesita un código.`
+                    );
+                }
+
+                if (
+                    usedCodes.has(
+                        code
+                    )
+                ) {
+                    throw new Error(
+                        `El código ${code} está repetido.`
+                    );
+                }
+
+                usedCodes.add(
+                    code
+                );
+
+                const ratePercent =
+                    Number(
+                        tax
+                            ?.ratePercent
+                    );
+
+                if (
+                    !Number.isFinite(
+                        ratePercent
+                    ) ||
+                    ratePercent <
+                    0 ||
+                    ratePercent >
+                    100
+                ) {
+                    throw new Error(
+                        `Porcentaje inválido para "${name}".`
+                    );
+                }
+
+                return {
+                    id,
+
+                    name:
+                        name.slice(
+                            0,
+                            80
+                        ),
+
+                    code,
+
+                    ratePercent:
+                        Number(
+                            ratePercent
+                                .toFixed(4)
+                        ),
+
+                    active:
+                        tax?.active !==
+                        false,
+
+                    includedInPrice:
+                        tax
+                            ?.includedInPrice ===
+                        true,
+
+                    appliesToDeliveryFee:
+                        tax
+                            ?.appliesToDeliveryFee ===
+                        true,
+                };
+            }
+        );
+
+    const activeTaxes =
+        taxes.filter(
+            (tax) =>
+                tax.active
+        );
+
+    if (
+        enabled &&
+        activeTaxes.length === 0
+    ) {
+        throw new Error(
+            "Si los impuestos están activos, debes tener al menos un impuesto activo."
+        );
+    }
+
+    let defaultTaxId =
+        String(
+            raw.defaultTaxId ||
+            ""
+        ).trim();
+
+    if (
+        !activeTaxes.some(
+            (tax) =>
+                tax.id ===
+                defaultTaxId
+        )
+    ) {
+        defaultTaxId =
+            activeTaxes[0]?.id ||
+            null;
+    }
+
+    return {
+        enabled,
+        defaultTaxId,
+        taxes,
+    };
+}
 exports.getFiscalConfig = async (req, res) => {
     try {
         const tenantId = req.user.tenantId;
-        const tenant = await Tenant.findOne({ tenantId }).select("plan fiscal features business name");
+        const tenant =
+            await Tenant.findOne({
+                tenantId,
+            }).select(
+                "plan fiscal features business localization taxConfig taxIdentity name"
+            );
         const normalizedPlan = normalizePlan(tenant?.plan);
         const planFeatures = getPlanFeatures(normalizedPlan);
 
         const f = tenant?.features || {};
+        const localization =
+            normalizeTenantLocalization(
+                tenant
+            );
+
+        const taxConfig =
+            normalizeTenantTaxConfig(
+                tenant
+            );
+        const taxIdentity =
+            normalizeTenantTaxIdentity(
+                tenant
+            );
         const norm = {
             ...f,
             tax: {
@@ -769,12 +2124,29 @@ exports.getFiscalConfig = async (req, res) => {
 
         return res.json({
             success: true,
+
             data: {
-                plan: normalizedPlan,
+                plan:
+                normalizedPlan,
+
                 planFeatures,
-                fiscal: tenant?.fiscal || null,
-                features: norm,
-                business: tenant?.business || null,
+
+                localization,
+
+                taxIdentity,
+
+                taxConfig,
+
+                fiscal:
+                    tenant?.fiscal ||
+                    null,
+
+                features:
+                norm,
+
+                business:
+                    tenant?.business ||
+                    null,
             },
         });
     } catch (e) {
@@ -782,13 +2154,178 @@ exports.getFiscalConfig = async (req, res) => {
     }
 };
 
+function normalizeServiceChargesInput(
+    raw
+) {
+    const enabled =
+        raw?.enabled ===
+        true;
 
+    const charges =
+        Array.isArray(
+            raw?.charges
+        )
+            ? raw.charges
+            : [];
+
+    if (
+        charges.length >
+        20
+    ) {
+        throw createHttpError(
+            400,
+            "TOO_MANY_SERVICE_CHARGES"
+        );
+    }
+
+    const ids =
+        new Set();
+
+    const codes =
+        new Set();
+
+    const normalized =
+        charges.map(
+            (
+                charge,
+                index
+            ) => {
+                const id =
+                    String(
+                        charge?.id ||
+                        `charge_${index + 1}`
+                    ).trim();
+
+                const name =
+                    String(
+                        charge?.name ||
+                        ""
+                    ).trim();
+
+                const code =
+                    String(
+                        charge?.code ||
+                        ""
+                    )
+                        .trim()
+                        .toUpperCase();
+
+                const ratePercent =
+                    Number(
+                        charge
+                            ?.ratePercent
+                    );
+
+                if (!id) {
+                    throw createHttpError(
+                        400,
+                        "SERVICE_CHARGE_ID_REQUIRED"
+                    );
+                }
+
+                if (!name) {
+                    throw createHttpError(
+                        400,
+                        "SERVICE_CHARGE_NAME_REQUIRED"
+                    );
+                }
+
+                if (!code) {
+                    throw createHttpError(
+                        400,
+                        "SERVICE_CHARGE_CODE_REQUIRED"
+                    );
+                }
+
+                if (
+                    !Number.isFinite(
+                        ratePercent
+                    ) ||
+                    ratePercent < 0 ||
+                    ratePercent > 100
+                ) {
+                    throw createHttpError(
+                        400,
+                        "SERVICE_CHARGE_RATE_INVALID"
+                    );
+                }
+
+                if (
+                    ids.has(id)
+                ) {
+                    throw createHttpError(
+                        400,
+                        "SERVICE_CHARGE_ID_DUPLICATED"
+                    );
+                }
+
+                if (
+                    codes.has(code)
+                ) {
+                    throw createHttpError(
+                        400,
+                        "SERVICE_CHARGE_CODE_DUPLICATED"
+                    );
+                }
+
+                ids.add(id);
+                codes.add(code);
+
+                return {
+                    id,
+
+                    name,
+
+                    code,
+
+                    ratePercent,
+
+                    active:
+                        charge?.active !==
+                        false,
+
+                    calculationBase:
+                        charge
+                            ?.calculationBase ===
+                        "AFTER_TAX"
+                            ? "AFTER_TAX"
+                            : "NET",
+                    appliesToDeliveryOrders:
+                        charge
+                            ?.appliesToDeliveryOrders !==
+                        false,
+
+                    appliesToDeliveryFee:
+                        charge
+                            ?.appliesToDeliveryFee ===
+                        true,
+
+                    addToTotal:
+                        charge
+                            ?.addToTotal !==
+                        false,
+                };
+            }
+        );
+
+    return {
+        enabled,
+        charges:
+        normalized,
+    };
+}
 
 exports.updateFiscalConfig = async (req, res) => {
+
     try {
         const tenantId = req.user.tenantId;
 
-        const tenantPrev = await Tenant.findOne({ tenantId }).select("plan features fiscal business");
+        const tenantPrev =
+            await Tenant.findOne({
+                tenantId,
+            }).select(
+                "plan features fiscal business localization taxConfig taxIdentity"
+            );
 
         if (!tenantPrev) {
             return res.status(404).json({
@@ -804,6 +2341,99 @@ exports.updateFiscalConfig = async (req, res) => {
 
         const $set = {};
 
+        // ======================================================
+// LOCALIZACIÓN
+// ======================================================
+
+        if (
+            req.body?.localization &&
+            typeof req.body
+                .localization ===
+            "object"
+        ) {
+            const localization =
+                validateLocalizationInput(
+                    req.body
+                        .localization
+                );
+
+            $set[
+                "localization.countryCode"
+                ] =
+                localization.countryCode;
+
+            $set[
+                "localization.language"
+                ] =
+                localization.language;
+
+            $set[
+                "localization.locale"
+                ] =
+                localization.locale;
+
+            $set[
+                "localization.currency"
+                ] =
+                localization.currency;
+
+            $set[
+                "localization.timezone"
+                ] =
+                localization.timezone;
+
+            $set[
+                "localization.dateFormat"
+                ] =
+                localization.dateFormat;
+
+            $set[
+                "localization.timeFormat"
+                ] =
+                localization.timeFormat;
+
+            $set[
+                "localization.measurementSystem"
+                ] =
+                localization
+                    .measurementSystem;
+
+            $set[
+                "localization.weightUnit"
+                ] =
+                localization.weightUnit;
+        }
+        // ======================================================
+        // IDENTIDAD FISCAL INTERNACIONAL
+        // ======================================================
+
+        if (
+            req.body?.taxIdentity &&
+            typeof req.body
+                .taxIdentity ===
+            "object"
+        ) {
+            const fallbackCountryCode =
+                req.body
+                    ?.localization
+                    ?.countryCode ||
+                tenantPrev
+                    ?.localization
+                    ?.countryCode ||
+                "DO";
+
+            const taxIdentity =
+                validateTaxIdentityInput(
+                    req.body
+                        .taxIdentity,
+                    fallbackCountryCode
+                );
+
+            $set[
+                "taxIdentity"
+                ] =
+                taxIdentity;
+        }
         // =========================
         // CONFIGURACIÓN GENERAL
         // Disponible para todos los planes
@@ -845,6 +2475,70 @@ exports.updateFiscalConfig = async (req, res) => {
         $set["features.discount.enabled"] = currentDiscountEnabled;
         $set["features.preInvoice.enabled"] = currentPreInvoiceEnabled;
 
+        // ======================================================
+// MOTOR DE IMPUESTOS GENÉRICO
+// ======================================================
+
+        if (
+            req.body?.taxConfig &&
+            typeof req.body
+                .taxConfig ===
+            "object"
+        ) {
+            const taxConfig =
+                validateTaxConfigInput(
+                    req.body.taxConfig
+                );
+            const previousIds = new Set((tenantPrev?.taxConfig?.taxes || []).map((tax) => String(tax.id)));
+            const nextIds = new Set((taxConfig.taxes || []).map((tax) => String(tax.id)));
+            const removedIds = [...previousIds].filter((id) => !nextIds.has(id));
+            if (removedIds.length) {
+                const linkedProducts = await Dish.countDocuments({
+                    tenantId, taxId: { $in: removedIds }
+                });
+                if (linkedProducts) {
+                    return res.status(409).json({ success: false, code: "TAX_ASSIGNED_TO_PRODUCTS",
+                        message: "El impuesto está asignado a productos. Reasígnalos o desactiva el impuesto antes de eliminarlo.",
+                        linkedProducts });
+                }
+            }
+
+            $set["taxConfig"] =
+                taxConfig;
+
+            // Compatibilidad temporal:
+            // Bill.jsx todavía mira
+            // features.tax.enabled.
+            //
+            // En Fase 2B eliminaremos
+            // esta dependencia.
+            $set[
+                "features.tax.enabled"
+                ] =
+                taxConfig.enabled;
+        }
+        // ======================================================
+        // CARGOS AUTOMÁTICOS / SERVICE CHARGES
+        // ======================================================
+
+        if (
+            req.body
+                ?.features
+                ?.serviceCharges !==
+            undefined
+        ) {
+            const serviceCharges =
+                normalizeServiceChargesInput(
+                    req.body
+                        .features
+                        .serviceCharges
+                );
+
+            $set[
+                "features.serviceCharges"
+                ] =
+                serviceCharges;
+        }
         // Delivery interno: permitido para todos los planes
         if (orderSources?.delivery) {
             if (typeof orderSources.delivery.enabled === "boolean") {
@@ -859,6 +2553,7 @@ exports.updateFiscalConfig = async (req, res) => {
                 $set["features.orderSources.delivery.defaultFee"] = fee;
             }
         }
+
 
         // PedidosYa: permitido para todos los planes
         if (orderSources?.pedidosYa) {
@@ -962,30 +2657,82 @@ exports.updateFiscalConfig = async (req, res) => {
             Object.assign($set, buildUpdateForType("B02", ncfConfig.B02));
         }
 
-        const updated = await Tenant.findOneAndUpdate(
-            { tenantId },
-            { $set },
-            { new: true }
-        ).select("plan fiscal features business");
+        const updated =
+            await Tenant.findOneAndUpdate(
+                {
+                    tenantId,
+                },
+                {
+                    $set,
+                },
+                {
+                    new: true,
+                }
+            ).select(
+                "plan fiscal features business localization taxConfig taxIdentity"
+            );
 
         const io = req.app.get("io");
         if (io) {
-            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", {
-                tenantId,
-                features: updated.features,
-                fiscal: updated.fiscal,
-                business: updated.business,
-            });
+            io.to(
+                `tenant:${tenantId}`
+            ).emit(
+                "tenant:configUpdated",
+                {
+                    tenantId,
+
+                    localization:
+                    updated.localization,
+
+                    taxIdentity:
+                    updated.taxIdentity,
+
+                    taxConfig:
+                    updated.taxConfig,
+
+                    features:
+                    updated.features,
+
+                    fiscal:
+                    updated.fiscal,
+
+                    business:
+                    updated.business,
+                }
+            );
         }
 
         return res.json({
             success: true,
+
             data: {
-                plan: normalizePlan(updated.plan),
-                planFeatures: getPlanFeatures(updated.plan),
-                fiscal: updated.fiscal,
-                features: updated.features,
-                business: updated.business,
+                plan:
+                    normalizePlan(
+                        updated.plan
+                    ),
+
+                planFeatures:
+                    getPlanFeatures(
+                        updated.plan
+                    ),
+
+                localization:
+                updated.localization,
+
+                taxIdentity:
+                updated.taxIdentity,
+
+                taxConfig:
+                updated.taxConfig,
+
+                fiscal:
+                updated.fiscal,
+
+                features:
+                updated.features,
+
+                business:
+                updated.business,
             },
         });
     } catch (e) {
@@ -1009,6 +2756,11 @@ const DEFAULT_PERMISSIONS = {
     },
     orders: {
         cancel: false,
+        edit: false,
+    },
+    fiscal: { ecfIssue:false, creditNote:false, debitNote:false, manage:false },
+    accountsReceivable: {
+        view: false,
     },
 };
 
@@ -1027,6 +2779,18 @@ function normalizePermissions(permissions = {}) {
         },
         orders: {
             cancel: Boolean(permissions?.orders?.cancel),
+            edit: Boolean(permissions?.orders?.edit),
+        },
+        fiscal: {
+            ecfIssue: Boolean(permissions?.fiscal?.ecfIssue),
+            creditNote: Boolean(permissions?.fiscal?.creditNote),
+            debitNote: Boolean(permissions?.fiscal?.debitNote),
+            manage: false, // nunca delegar el control de certificados
+        },
+        accountsReceivable: {
+            view: Boolean(
+                permissions?.accountsReceivable?.view
+            ),
         },
     };
 }
@@ -1071,6 +2835,7 @@ exports.getUsage = async (req, res) => {
             data: {
                 plan: normalizedPlan,
                 features,
+                countryCode: String(tenant.localization?.countryCode || "DO").toUpperCase(),
                 currentUser,
                 limits: {
                     maxUsers: limits.maxUsers ?? null,
@@ -1239,6 +3004,7 @@ exports.uploadTenantLogo = async (req, res) => {
             .toBuffer();
 
         const tenant = await Tenant.findOne({ tenantId }).select("business");
+
 
         if (!tenant) {
             return res.status(404).json({

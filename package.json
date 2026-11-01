@@ -32,6 +32,7 @@
     "jsonwebtoken": "^9.0.2",
     "jspdf": "^3.0.3",
     "jspdf-autotable": "^5.0.2",
+    "libxml2-wasm": "^0.7.2",
     "mongoose": "^8.9.5",
     "multer": "^2.0.2",
     "node-forge": "^1.4.0",

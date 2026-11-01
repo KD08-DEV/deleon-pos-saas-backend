@@ -6,6 +6,7 @@ const tableSchema = new mongoose.Schema(
         status: { type: String, default: "Disponible" },
         seats: { type: Number, required: true, min: 1 },
         currentOrder: { type: mongoose.Schema.Types.ObjectId, ref: "Order", default: null },
+        tableSessionId: {type:String,default:null,index:true},
         area: { type: String, default: "General", trim: true },
 
 

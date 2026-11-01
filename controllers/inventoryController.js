@@ -863,131 +863,76 @@ exports.listMovements = async (req, res, next) => {
         next(e);
     }
 };
-// GET /api/inventory/consumption?from=&to=
-
 // GET /api/inventory/consumption?from=&to=&inventoryCategoryId=&page=&limit=
+// FUENTE DE VERDAD: movimientos de inventario causados por ventas.
+// Incluye extras y recetas, pero nunca un plato comercial sin stock.
 exports.consumption = async (req, res, next) => {
     try {
         const tenantId = getTenantId(req);
         const clientId = req.scope?.clientId || req.clientId || "default";
-
         if (!tenantId) return next(createHttpError(401, "TENANT_NOT_FOUND"));
-
         const { from, to, inventoryCategoryId } = req.query;
-
         const page = Math.max(Number(req.query.page || 1), 1);
         const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 100);
         const skip = (page - 1) * limit;
-
-        const match = {
-            tenantId,
-            clientId,
-            orderStatus: "Completado",
-        };
-
+        const match = { tenantId, clientId, $or: [
+            { type: "sale", sourceType: "order" },
+            { type: "adjust", sourceType: { $in: ["order_correction", "order_cancel"] } },
+        ] };
         if (from || to) {
             match.createdAt = {};
-            if (from) match.createdAt.$gte = new Date(from);
-            if (to) match.createdAt.$lt = new Date(to);
+            if (from) {
+                const d = new Date(from);
+                if (!Number.isFinite(d.getTime())) return next(createHttpError(400, "INVALID_FROM_DATE"));
+                match.createdAt.$gte = d;
+            }
+            if (to) {
+                const d = new Date(to);
+                if (!Number.isFinite(d.getTime())) return next(createHttpError(400, "INVALID_TO_DATE"));
+                match.createdAt.$lt = d;
+            }
         }
-
-        const dishCollection = Dish.collection.name;
         const InventoryCategory = require("../models/inventoryCategoryModel");
-        const inventoryCategoryCollection = InventoryCategory.collection.name;
-
         const pipeline = [
             { $match: match },
-            { $unwind: "$items" },
-            { $match: { "items.dishId": { $ne: null } } },
-            {
-                $group: {
-                    _id: "$items.dishId",
-                    qtySold: { $sum: { $ifNull: ["$items.quantity", 0] } },
-                    revenue: { $sum: { $ifNull: ["$items.price", 0] } },
-                    lines: { $sum: 1 },
-                },
-            },
-            {
-                $lookup: {
-                    from: dishCollection,
-                    localField: "_id",
-                    foreignField: "_id",
-                    as: "dish",
-                },
-            },
-            { $unwind: { path: "$dish", preserveNullAndEmptyArrays: true } },
-            {
-                $lookup: {
-                    from: inventoryCategoryCollection,
-                    localField: "dish.inventoryCategoryId",
-                    foreignField: "_id",
-                    as: "inventoryCategory",
-                },
-            },
+            { $group: {
+                _id: "$itemId",
+                qtySold: { $sum: { $multiply: [ -1, { $ifNull: ["$qtySigned", { $multiply: [-1,"$qty"] }] } ] } },
+                revenue: { $sum: { $multiply: [ -1, { $ifNull: ["$qtySigned", { $multiply: [-1,"$qty"] }] }, { $ifNull: ["$unitCost",0] } ] } },
+                lines: { $sum: 1 },
+            } },
+            { $lookup: { from: Dish.collection.name, localField: "_id", foreignField: "_id", as: "dish" } },
+            { $unwind: "$dish" },
+            { $match: { "dish.tenantId": tenantId, "dish.clientId": clientId } },
+            { $lookup: { from: InventoryCategory.collection.name, localField: "dish.inventoryCategoryId", foreignField: "_id", as: "inventoryCategory" } },
             { $unwind: { path: "$inventoryCategory", preserveNullAndEmptyArrays: true } },
         ];
-
-        if (inventoryCategoryId && mongoose.Types.ObjectId.isValid(inventoryCategoryId)) {
-            pipeline.push({
-                $match: {
-                    "dish.inventoryCategoryId": new mongoose.Types.ObjectId(inventoryCategoryId),
-                },
-            });
+        if (inventoryCategoryId) {
+            if (!mongoose.Types.ObjectId.isValid(inventoryCategoryId)) return next(createHttpError(400, "INVALID_INVENTORY_CATEGORY"));
+            pipeline.push({ $match: { "dish.inventoryCategoryId": new mongoose.Types.ObjectId(inventoryCategoryId) } });
         }
-
         pipeline.push(
-            {
-                $project: {
-                    dishId: "$_id",
-                    name: { $ifNull: ["$dish.name", "(Plato eliminado)"] },
-                    category: "$dish.category",
-                    imageUrl: "$dish.imageUrl",
-                    price: "$dish.price",
-
-                    inventoryCategoryId: "$dish.inventoryCategoryId",
-                    inventoryCategoryName: "$inventoryCategory.name",
-
-                    qtySold: 1,
-                    revenue: 1,
-                    lines: 1,
-                },
-            },
+            { $match: { qtySold: { $gt: 0.000001 } } },
+            { $project: {
+                dishId: "$_id", name: "$dish.name", category: "$dish.category", imageUrl: "$dish.imageUrl",
+                price: "$dish.price", inventoryCategoryId: "$dish.inventoryCategoryId",
+                inventoryCategoryName: "$inventoryCategory.name", qtySold: 1, revenue: 1, lines: 1,
+            } },
             { $sort: { qtySold: -1, name: 1 } },
-            {
-                $facet: {
-                    rows: [
-                        { $skip: skip },
-                        { $limit: limit },
-                    ],
-                    totalRows: [
-                        { $count: "count" },
-                    ],
-                },
-            }
+            { $facet: {
+                rows: [{ $skip: skip }, { $limit: limit }],
+                totalRows: [{ $count: "count" }],
+            } }
         );
-
-        const result = await Order.aggregate(pipeline);
-
+        const result = await InventoryMovement.aggregate(pipeline);
         const rows = result?.[0]?.rows || [];
         const total = result?.[0]?.totalRows?.[0]?.count || 0;
         const totalPages = Math.max(Math.ceil(total / limit), 1);
-
-        return res.json({
-            success: true,
-            rows,
-            pagination: {
-                page,
-                limit,
-                total,
-                totalPages,
-                hasPrev: page > 1,
-                hasNext: page < totalPages,
-            },
-        });
-    } catch (e) {
-        next(e);
-    }
+        return res.json({ success: true, rows, pagination: { page, limit, total, totalPages,
+            hasPrev: page > 1, hasNext: page < totalPages } });
+    } catch (e) { next(e); }
 };
+
 // POST /api/inventory/merma
 // Registra MERMA como movimiento tipo "waste" (usa Dish como itemId)
 exports.createMerma = async (req, res, next) => {

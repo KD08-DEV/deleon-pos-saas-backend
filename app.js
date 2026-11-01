@@ -38,46 +38,49 @@ const io = new Server(server, {
 // 🔹 Guardar io para usarlo en controllers sin circular imports
 app.set("io", io);
 
-// 🔹 Auth/tenant room
+// Authenticated realtime rooms. Client-provided tenantId is never trusted.
+const jwt = require("jsonwebtoken");
+const User = require("./models/userModel");
+const Membership = require("./models/membershipModel");
+const Tenant = require("./models/tenantModel");
+io.use(async (socket, next) => {
+    try {
+        const token = socket.handshake.auth?.token;
+        if (!token || !config.accessTokenSecret) return next(new Error("AUTH_REQUIRED"));
+        const decoded = jwt.verify(token, config.accessTokenSecret);
+        if (decoded.super || !decoded._id || !decoded.sid) return next(new Error("AUTH_REQUIRED"));
+        const user = await User.findById(decoded._id).select("tenantId activeSessionId").lean();
+        if (!user || !user.activeSessionId || user.activeSessionId !== decoded.sid) {
+            return next(new Error("SESSION_EXPIRED"));
+        }
+        const [tenant, membership] = await Promise.all([
+            Tenant.findOne({ tenantId: user.tenantId, status: "active" }).select("tenantId").lean(),
+            Membership.findOne({ tenantId: user.tenantId, user: user._id, status: "active" }).lean(),
+        ]);
+        if (!tenant || !membership) return next(new Error("ACCESS_DENIED"));
+        const clientId = String(socket.handshake.auth?.clientId || "default");
+        const adminLike = ["Owner", "Admin"].includes(membership.role);
+        const allowedIds = (membership.clientIds || []).map(String);
+        if (!adminLike && !(clientId === "default" && !allowedIds.length) && !allowedIds.includes(clientId)) {
+            return next(new Error("BRANCH_DENIED"));
+        }
+        if (clientId !== "default") {
+            const Client = require("./models/clientModel");
+            if (!await Client.exists({ tenantId: user.tenantId, clientId, isActive: true })) {
+                return next(new Error("BRANCH_DENIED"));
+            }
+        }
+        socket.data.tenantId = user.tenantId;
+        socket.data.clientId = clientId;
+        socket.data.userId = String(user._id);
+        return next();
+    } catch (error) { return next(new Error("INVALID_TOKEN")); }
+});
 io.on("connection", (socket) => {
-
-
-    // 1) Recibe tenantId desde el cliente (handshake)
-    const tenantId =
-        socket.handshake.auth?.tenantId ||
-        socket.handshake.headers["x-tenant-id"];
-
-
-
-    if (!tenantId) {
-
-        socket.disconnect(true);
-        return;
-    }
-
-    // 2) Room por tenant
-    const room = `tenant:${tenantId}`;
-    socket.join(room);
-
-
-    // ✅ Forward: cuando un cliente emite, el server lo rebroadcastea al tenant
-    // (Así funciona "al instante" sin navegar/refresh)
-    socket.on("tenant:tablesUpdated", (payload = {}) => {
-        io.to(room).emit("tenant:tablesUpdated", { tenantId, ...payload });
-    });
-
-    socket.on("tenant:orderUpdated", (payload = {}) => {
-        io.to(room).emit("tenant:orderUpdated", { tenantId, ...payload });
-    });
-
-    // (Opcional) fiscal config también, si algún cliente lo emite
-    socket.on("tenant:configUpdated", (payload = {}) => {
-        io.to(room).emit("tenant:configUpdated", { tenantId, ...payload });
-    });
-
-    socket.on("disconnect", () => {
-        // opcional log
-    });
+    const { tenantId, clientId } = socket.data;
+    socket.join(`tenant:${tenantId}`); // Existing controller server-side events remain supported.
+    socket.join(`tenant:${tenantId}:branch:${clientId}`);
+    // No client-supplied event payload is broadcast across other users/branches.
 });
 
 // Middlewares

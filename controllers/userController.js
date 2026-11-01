@@ -6,10 +6,12 @@ const config = require("../config/config");
 const { v4: uuidv4 } = require("uuid");
 const Tenant = require("../models/tenantModel");
 const Membership = require("../models/membershipModel");
+const { selected } = require("../services/employeeBranchAccess");
 const TIERS = require("../config/planTiers");
+const { resolveTenantLocalization } = require("../config/tenantLocales");
 
 function getPlanLimits(plan) {
-    const tier = TIERS[plan] || TIERS.emprendedor;
+    const tier = TIERS[String(plan || "emprendedor").trim().toLowerCase()] || TIERS.emprendedor;
     return {
         admins: tier.limits.maxAdmins,
         cajeras: tier.limits.maxCashiers,
@@ -33,6 +35,9 @@ const DEFAULT_PERMISSIONS = {
     orders: {
         cancel: false,
     },
+    accountsReceivable: {
+        view: false,
+    },
 };
 
 function normalizePermissions(permissions = {}) {
@@ -50,6 +55,11 @@ function normalizePermissions(permissions = {}) {
         },
         orders: {
             cancel: Boolean(permissions?.orders?.cancel),
+        },
+        accountsReceivable: {
+            view: Boolean(
+                permissions?.accountsReceivable?.view
+            ),
         },
     };
 }
@@ -80,6 +90,14 @@ const register = async (req, res, next) => {
         if (req.user && req.user.role === "SuperAdmin" && role === "Admin") {
             const companyName = tenantName || `${name}'s Business`;
             const tenantPlan = (plan || "emprendedor").toLowerCase();
+            const tenantTier =
+                TIERS[tenantPlan] ||
+                TIERS.emprendedor;
+
+            const planAllowsFiscal =
+                Boolean(
+                    tenantTier?.features?.fiscal
+                );
 
             // 1) Validar plan
             const allowedPlans = ["emprendedor", "estandar", "premium", "pro"];
@@ -100,7 +118,9 @@ const register = async (req, res, next) => {
             tenantId = uuidv4();
 
             // ✅ FISCAL INFO (nuevo formato)
-            const fiscalPayload = req.body.fiscal || {};
+            const localization = resolveTenantLocalization(req.body.localization || {});
+            const isDominican = localization.countryCode === "DO";
+            const fiscalPayload = isDominican ? (req.body.fiscal || {}) : {};
 
             const normalizeCfg = (cfg = {}) => {
                 const start = Number(cfg.start) || 1;
@@ -111,7 +131,9 @@ const register = async (req, res, next) => {
             };
 
             const fiscalToSave = {
-                enabled: Boolean(fiscalPayload.enabled),
+                enabled:
+                    isDominican && planAllowsFiscal &&
+                    Boolean(fiscalPayload.enabled),
                 nextInvoiceNumber: Number(fiscalPayload.nextInvoiceNumber) || 1,
                 ncfConfig: {
                     B01: normalizeCfg(fiscalPayload.ncfConfig?.B01),
@@ -120,7 +142,10 @@ const register = async (req, res, next) => {
             };
 
             // Si fiscal.enabled es false => apagamos los tipos
-            if (!fiscalToSave.enabled) {
+            if (
+                !planAllowsFiscal ||
+                !fiscalToSave.enabled
+            ) {
                 fiscalToSave.ncfConfig.B01.active = false;
                 fiscalToSave.ncfConfig.B02.active = false;
             }
@@ -131,11 +156,12 @@ const register = async (req, res, next) => {
                 name: companyName,
                 plan: tenantPlan,
                 status: "active",
+                localization,
 
                 // BUSINESS INFO
                 business: {
                     name: req.body.business?.name || null,
-                    rnc: req.body.business?.rnc || null,
+                    rnc: isDominican ? (req.body.business?.rnc || null) : null,
                     address: req.body.business?.address || null,
                     phone: req.body.business?.phone || null,
                 },
@@ -147,7 +173,7 @@ const register = async (req, res, next) => {
         }
 
         // 🔥 CASO 2: Admin de empresa crea empleados en SU tenant
-        else if (req.user && req.user.role === "Admin") {
+        else if (req.scope?.membership && ["Owner", "Admin"].includes(req.scope.membership.role)) {
             tenantId = req.user.tenantId;
 
             if (!tenantId) {
@@ -160,6 +186,12 @@ const register = async (req, res, next) => {
             }
 
             const limits = getPlanLimits(tenant.plan);
+            // Always use the branch validated by requireScope, never an untrusted tenant/branch in POST data.
+            const activeClientId = selected(req.scope?.clientId);
+            if (req.body.clientIds !== undefined &&
+                (!Array.isArray(req.body.clientIds) || req.body.clientIds.length !== 1 || String(req.body.clientIds[0]) !== activeClientId)) {
+                return next(createHttpError(403, "BRANCH_ASSIGNMENT_MISMATCH"));
+            }
 
             // 🔐 Límite TOTAL de usuarios del tenant
             const totalUsers = await Membership.countDocuments({
@@ -183,7 +215,7 @@ const register = async (req, res, next) => {
                     role: { $in: ["Owner", "Admin"] },
                     status: "active",
                 });
-                if (countAdmins >= limits.admins) {
+                if (limits.admins !== null && countAdmins >= limits.admins) {
                     return next(createHttpError(403, "Admin limit reached for this plan!"));
                 }
                 membershipRole = "Admin";
@@ -193,7 +225,7 @@ const register = async (req, res, next) => {
                     role: "Cajera",
                     status: "active",
                 });
-                if (countCashiers >= limits.cajeras) {
+                if (limits.cajeras !== null && countCashiers >= limits.cajeras) {
                     return next(
                         createHttpError(
                             403,
@@ -263,18 +295,23 @@ const register = async (req, res, next) => {
         });
 
         // Crear membership
-        await Membership.create({
-            user: newUser._id,
-            tenantId,
-            role: membershipRole,
-            clientIds: ["default"],
-            status: "active",
-        });
+        try {
+            await Membership.create({
+                user: newUser._id,
+                tenantId,
+                role: membershipRole,
+                clientIds: [req.scope?.clientId || "default"],
+                status: "active",
+            });
+        } catch (membershipError) {
+            await User.deleteOne({ _id: newUser._id, tenantId });
+            throw membershipError;
+        }
 
         return res.status(201).json({
             success: true,
             message: "New user created!",
-            data: newUser,
+            data: { _id: newUser._id, name: newUser.name, email: newUser.email, phone: newUser.phone, role: newUser.role, tenantId: newUser.tenantId },
         });
     } catch (error) {
         return next(error);
@@ -310,10 +347,10 @@ const login = async (req, res, next) => {
             );
 
             res.cookie("accessToken", accessToken, {
-                maxAge: 1000 * 60 * 60 * 24 * 30,
+                maxAge: 1000 * 60 * 60 * 24,
                 httpOnly: true,
                 sameSite: "lax",
-                secure: false,
+                secure: config.nodeEnv === "production",
             });
 
             return res.status(200).json({
@@ -334,7 +371,7 @@ const login = async (req, res, next) => {
                 { emailKey },
                 { email: { $regex: buildEmailRegex(cleanEmail) } }, // fallback para usuarios viejos
             ],
-        });
+        }).select("+password");
 
         if (!isUserPresent) {
             return next(createHttpError(401, "Invalid Credentials"));
@@ -352,8 +389,19 @@ const login = async (req, res, next) => {
             status: "active",
         }).lean();
 
+        // El login no debe crear una sesión cuando la membresía está
+        // suspendida, pendiente o ya no existe.
+        if (!membership) {
+            return next(createHttpError(403, "Account membership unavailable"));
+        }
+        const tenant = await Tenant.findOne({ tenantId: isUserPresent.tenantId })
+            .select("status").lean();
+        if (!tenant || tenant.status !== "active") {
+            return next(createHttpError(403, "Business unavailable"));
+        }
+
         const normalizedPermissions = normalizePermissions(
-            membership?.permissions || DEFAULT_PERMISSIONS
+            membership.permissions || DEFAULT_PERMISSIONS
         );
 
         const { deviceId } = req.body;
@@ -383,10 +431,10 @@ const login = async (req, res, next) => {
         );
 
         res.cookie("accessToken", accessToken, {
-            maxAge: 1000 * 60 * 60 * 24 * 30,
+            maxAge: 1000 * 60 * 60 * 24,
             httpOnly: true,
             sameSite: "lax",
-            secure: false,
+            secure: config.nodeEnv === "production",
         });
 
         return res.status(200).json({
@@ -424,7 +472,7 @@ const getUserData = async (req, res, next) => {
             });
         }
 
-        const user = await User.findById(req.user._id).lean();
+        const user = await User.findById(req.user._id).select("-activeSessionId -activeDeviceId").lean();
 
         if (!user) {
             return next(createHttpError(404, "USER_NOT_FOUND"));
@@ -460,7 +508,7 @@ const getUserData = async (req, res, next) => {
 
 const logout = async (req, res, next) => {
     try {
-        await User.updateOne(
+        if (req.user.role !== "SuperAdmin") await User.updateOne(
             { _id: req.user._id },
             { $set: { activeSessionId: null, activeDeviceId: null } }
         );
@@ -509,6 +557,16 @@ const updateTenantFeatures = async (req, res, next) => {
             return res.status(400).json({ success: false, message: "fiscalEnabled must be boolean" });
         }
 
+        if (fiscalEnabled === true) {
+            const tenantForCountry = await Tenant.findOne({ tenantId }).select("plan localization.countryCode").lean();
+            if (!tenantForCountry) return res.status(404).json({ message: "Tenant not found" });
+            if (String(tenantForCountry.localization?.countryCode || "DO").toUpperCase() !== "DO") {
+                return res.status(403).json({ code: "DGII_ONLY_DOMINICAN_REPUBLIC" });
+            }
+            if (!TIERS[tenantForCountry.plan]?.features?.fiscal) {
+                return res.status(403).json({ code: "PLAN_FISCAL_DENIED" });
+            }
+        }
         // Construir $set solo con lo que venga
         const $set = {};
         if (taxEnabled !== undefined) $set["features.tax.enabled"] = taxEnabled;

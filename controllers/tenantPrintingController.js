@@ -1,5 +1,16 @@
 const Printer = require("../models/printerModel");
 const networkPrintService = require("../services/networkPrintService");
+const Tenant =
+    require(
+        "../models/tenantModel"
+    );
+
+const {
+    getTenantLocalization,
+    formatDateTime,
+} = require(
+    "../utils/localization"
+);
 console.log("[networkPrintService keys]", Object.keys(networkPrintService || {}));
 function normalizePrinterPayload(body = {}) {
     return {
@@ -278,6 +289,20 @@ exports.setDefaultPrinter = async (req, res) => {
 exports.testNetworkPrinter = async (req, res) => {
     try {
         const tenantId = req.user?.tenantId || req.tenantId;
+        const tenant =
+            await Tenant
+                .findOne({
+                    tenantId,
+                })
+                .select(
+                    "localization"
+                )
+                .lean();
+
+        const localization =
+            getTenantLocalization(
+                tenant
+            );
         const clientId = req.headers["x-client-id"] || "default";
 
         const printer = await Printer.findOne({
@@ -308,7 +333,10 @@ exports.testNetworkPrinter = async (req, res) => {
             `Nombre: ${printer.name || ""}`,
             `IP: ${printer.ip || ""}`,
             `Port: ${printer.port || 9100}`,
-            `Fecha: ${new Date().toLocaleString()}`,
+            `Fecha: ${formatDateTime(
+                new Date(),
+                localization
+            )}`,
             "==========================================",
         ].join("\n");
 
@@ -378,6 +406,9 @@ exports.printNetworkTicket = async (req, res) => {
             fecha,
             salaArea,
             orderNote,
+            localization,
+            locale,
+            currency,
             items,
         } = req.body || {};
 
@@ -396,6 +427,19 @@ exports.printNetworkTicket = async (req, res) => {
                 item?.dishName ||
                 "ITEM"
             ).trim(),
+            qtyType:
+                item?.qtyType ||
+                "unit",
+
+            weightUnit:
+                item?.qtyType ===
+                "weight"
+                    ? String(
+                        item?.weightUnit ||
+                        localization?.weightUnit ||
+                        ""
+                    ).trim()
+                    : "",
             qty: Number(item?.qty ?? item?.quantity ?? item?.amount ?? item?.cant ?? 1) || 1,
             modifiers: Array.isArray(item?.modifiers)
                 ? item.modifiers.map((mod) => ({
@@ -424,7 +468,9 @@ exports.printNetworkTicket = async (req, res) => {
             salaArea: String(salaArea || "N/A").trim(),
             orderNote: String(orderNote || "").trim(),
             items: normalizedItems,
-
+            localization,
+            locale,
+            currency,
             subtotal: undefined,
             tax: undefined,
             total: undefined,
@@ -554,16 +600,41 @@ exports.printNetworkInvoice = async (req, res) => {
             const lineTotal = explicitLineTotal > 0 ? explicitLineTotal : unitPrice * qty;
 
             return {
-                name: String(
-                    item?.name ||
-                    item?.title ||
-                    item?.description ||
-                    item?.dishName ||
-                    "Producto"
-                ).trim(),
+                name:
+                    String(
+                        item?.name ||
+                        item?.title ||
+                        item?.description ||
+                        item?.dishName ||
+                        "Producto"
+                    ).trim(),
+
                 qty,
-                price: Number(lineTotal.toFixed(2)),
-                tax: Number(item?.tax || 0) || 0,
+
+                qtyType:
+                    item?.qtyType ||
+                    "unit",
+
+                weightUnit:
+                    item?.qtyType ===
+                    "weight"
+                        ? String(
+                            item?.weightUnit ||
+                            body?.localization
+                                ?.weightUnit ||
+                            ""
+                        ).trim()
+                        : "",
+
+                price:
+                    Number(
+                        lineTotal.toFixed(2)
+                    ),
+
+                tax:
+                    Number(
+                        item?.tax || 0
+                    ) || 0,
             };
         });
 
@@ -572,7 +643,35 @@ exports.printNetworkInvoice = async (req, res) => {
             rnc: String(body.rnc || "").trim(),
             address: String(body.address || "").trim(),
             phone: String(body.phone || "").trim(),
+            localization:
+                body.localization ||
+                {},
 
+            locale:
+            body.locale,
+
+            currency:
+            body.currency,
+
+            taxBreakdown:
+                Array.isArray(
+                    body.taxBreakdown
+                )
+                    ? body.taxBreakdown
+                    : [],
+
+            serviceChargeTotal:
+                Number(
+                    body.serviceChargeTotal ||
+                    0
+                ) || 0,
+
+            serviceChargeBreakdown:
+                Array.isArray(
+                    body.serviceChargeBreakdown
+                )
+                    ? body.serviceChargeBreakdown
+                    : [],
             headerTitle: resolvedHeaderTitle,
             isFiscal: resolvedIsFiscal,
             isPreInvoice: resolvedIsPreInvoice,
