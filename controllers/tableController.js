@@ -1,4 +1,5 @@
 const Table = require("../models/tableModel");
+const Order = require("../models/orderModel");
 const createHttpError = require("http-errors");
 const mongoose = require("mongoose");
 const Tenant = require("../models/tenantModel");
@@ -12,7 +13,7 @@ const addTable = async (req, res, next) => {
         if (!seats || Number(seats) < 1)
             return next(createHttpError(400, "Please provide seats (>= 1)!"));
 
-        const clientId = req.clientId || "default";
+        const clientId = req.clientId;
 
         // 🔒 límites por plan: mesas
         const tenant = await Tenant.findOne({ tenantId: req.user.tenantId });
@@ -56,7 +57,7 @@ const addTable = async (req, res, next) => {
 };
 const getTables = async (req, res, next) => {
     try {
-        const clientId = req.clientId || "default";
+        const clientId = req.clientId;
         const tenantId = req.tenantId || req.user?.tenantId;
 
         const tables = await Table.find({
@@ -67,6 +68,7 @@ const getTables = async (req, res, next) => {
                 path: "currentOrder",
                 model: "Order",
                 select: "_id customerDetails orderStatus total createdAt",
+                match: { tenantId, clientId },
             })
             .lean();
 
@@ -121,7 +123,7 @@ const getTables = async (req, res, next) => {
 
 const deleteTable = async (req, res, next) => {
     try {
-        const clientId = req.clientId || "default";
+        const clientId = req.clientId;
         const { id } = req.params;
 
         if (!mongoose.Types.ObjectId.isValid(id)) {
@@ -144,10 +146,17 @@ const updateTable = async (req, res, next) => {
     try {
         const { status, orderId, area } = req.body;
         const { id } = req.params;
-        const clientId = req.clientId || "default";
+        const clientId = req.clientId;
 
         if (!mongoose.Types.ObjectId.isValid(id)) {
             return next(createHttpError(400, "Invalid table id"));
+        }
+
+        // Evitar vincular una orden ajena, aunque un cliente falsifique el ID.
+        if (orderId !== undefined && orderId !== null && orderId !== "" && status !== "Disponible") {
+            if (!mongoose.Types.ObjectId.isValid(orderId)) return next(createHttpError(400, "INVALID_ORDER_ID"));
+            const sameBranchOrder = await Order.findOne({ _id: orderId, tenantId: req.tenantId, clientId }).select("_id");
+            if (!sameBranchOrder) return next(createHttpError(403, "ORDER_NOT_IN_SELECTED_BRANCH"));
         }
 
         const update = {};
@@ -159,6 +168,15 @@ const updateTable = async (req, res, next) => {
         }
 
         if (status === "Disponible") {
+            const tableBeforeRelease = await Table.findOne({ _id:id, tenantId:req.user.tenantId, clientId });
+            if (!tableBeforeRelease) return next(createHttpError(404, "TABLE_NOT_IN_SELECTED_BRANCH"));
+            if (tableBeforeRelease.tableSessionId) {
+                const openSibling = await Order.exists({ tenantId:req.user.tenantId, clientId,
+                    table:tableBeforeRelease._id, tableSessionId:tableBeforeRelease.tableSessionId,
+                    paymentStatus:"Pendiente", orderStatus:{$ne:"Cancelado"}, "items.0":{$exists:true} });
+                if (openSibling) return next(createHttpError(409,"TABLE_HAS_UNPAID_ACCOUNTS"));
+            }
+            update.tableSessionId = null;
             update.status = "Disponible";
             update.currentOrder = null;
 
@@ -167,6 +185,8 @@ const updateTable = async (req, res, next) => {
                 update,
                 { new: true }
             );
+
+            if (!table) return next(createHttpError(404, "TABLE_NOT_IN_SELECTED_BRANCH"));
 
             const io = req.app?.get?.("io");
             io?.to?.(`tenant:${req.user.tenantId}`)?.emit?.("tenant:tablesUpdated", {
@@ -192,6 +212,8 @@ const updateTable = async (req, res, next) => {
             update,
             { new: true }
         );
+
+        if (!table) return next(createHttpError(404, "TABLE_NOT_IN_SELECTED_BRANCH"));
 
         const io = req.app?.get?.("io");
         io?.to?.(`tenant:${req.user.tenantId}`)?.emit?.("tenant:tablesUpdated", {

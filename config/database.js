@@ -4,7 +4,9 @@ const config = require("./config");
 const connectDB = async () => {
     try {
         const conn = await mongoose.connect(config.databaseURI, {
-            serverSelectionTimeoutMS: 5000, // Recomendado para Render + Atlas
+            serverSelectionTimeoutMS: 5000,
+            autoIndex: false,
+            autoCreate: false,
         });
 
         console.log(`✅ MongoDB Connected: ${conn.connection.host}`);

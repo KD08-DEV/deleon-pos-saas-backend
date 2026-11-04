@@ -7,13 +7,61 @@ const {
     summarizeReceivablePaymentsForCash,
     summarizeCreditSalesForCash,
 } = require("./accountReceivableController");
+const Tenant =
+    require(
+        "../models/tenantModel"
+    );
 
-const getRangeForDay = (dateYMD) => {
-    const tzOffset = process.env.REPORT_TZ_OFFSET || "-04:00"; // República Dominicana
-    const start = new Date(`${dateYMD}T00:00:00.000${tzOffset}`);
-    const end = new Date(`${dateYMD}T23:59:59.999${tzOffset}`);
-    return { start, end };
-};
+const {
+    getTenantTimezone,
+    getUtcRangeForYMDRange,
+} = require(
+    "../utils/timezone"
+);
+const getRangeForDay =
+    async (
+        tenantId,
+        dateYMD
+    ) => {
+        const tenant =
+            await Tenant
+                .findOne({
+                    tenantId,
+                })
+                .select(
+                    "localization.timezone"
+                )
+                .lean();
+
+        const timezone =
+            getTenantTimezone(
+                tenant
+            );
+
+        const range =
+            getUtcRangeForYMDRange(
+                dateYMD,
+                dateYMD,
+                timezone
+            );
+
+        if (!range) {
+            throw createHttpError(
+                400,
+                "INVALID_DATE_RANGE"
+            );
+        }
+
+        return {
+            start:
+            range.start,
+
+            end:
+            range.end,
+
+            timezone,
+        };
+    };
 const normalize = (v) => String(v || "").trim().toLowerCase();
 
 const coerceMoney = (v) => {
@@ -105,10 +153,14 @@ function buildLegacyCashOrdersFilter({ tenantId, clientId, registerId, start, en
             // Venta pagada vieja sin paidAt.
             {
                 paymentStatus: "Pagado",
-                ...paidAtMissing,
-                $or: [
-                    { invoicedAt: { $gte: start, $lte: end } },
-                    { createdAt: { $gte: start, $lte: end } },
+                $and: [
+                    paidAtMissing,
+                    {
+                        $or: [
+                            { invoicedAt: { $gte: start, $lte: end } },
+                            { createdAt: { $gte: start, $lte: end } },
+                        ],
+                    },
                 ],
             },
 
@@ -273,7 +325,10 @@ const closeCashSession = async (req, res, next) => {
         }
 
         // Ventas en efectivo del día (excluye canceladas)
-        const { start, end } = getRangeForDay(dateYMD);
+        const { start, end } = await getRangeForDay(
+            tenantId,
+            dateYMD
+        );
         const targetCashierId = session.openedBy ? String(session.openedBy) : String(userId || "");
 
         const cashOwnerUserId = isAdminLikeRole(role)
@@ -553,8 +608,7 @@ const getCashSessionByDate = async (req, res, next) => {
         const dateYMD = getDateFromReq(req);
         const registerId = getRegisterIdFromReadReq(req);
 
-        dbg("[GET cash-session] scope", { tenantId, clientId, userId, role });
-        dbg("[GET cash-session] query", { dateYMD, registerId });
+
 
         const registerFilter = buildLegacyRegisterReadFilter(registerId);
         const cashierFilter = buildCashierSessionFilter({ role, userId });
@@ -572,7 +626,6 @@ const getCashSessionByDate = async (req, res, next) => {
             .populate("closing.adjustedBy", "name role")
             .populate("movements.by", "name role");
 
-        dbg("[GET cash-session] response", { found: !!session });
 
         return res.status(200).json({ success: true, data: session });
     } catch (err) {
@@ -948,7 +1001,10 @@ const addCashToSession = async (req, res, next) => {
             const expectedCashSales = Number(session.closing.expectedCashSales || 0);
             const countedTotal = Number(session.closing.countedTotal || 0);
 
-            const { start, end } = getRangeForDay(dateYMD);
+            const { start, end } = await getRangeForDay(
+                tenantId,
+                dateYMD
+            );
             const receivablePaymentsSummary = await summarizeReceivablePaymentsForCash({
                 tenantId,
                 clientId,
@@ -1177,7 +1233,11 @@ const adjustCashSessionClosing = async (req, res, next) => {
                     const count = Number(d?.count);
 
                     return {
-                        label: String(d?.label || `RD$ ${value}`).trim(),
+                        label:
+                            String(
+                                d?.label ||
+                                value
+                            ).trim(),
                         value,
                         count,
                     };
@@ -1207,7 +1267,10 @@ const adjustCashSessionClosing = async (req, res, next) => {
         }
 
         // Recalcular expectedCashSales con reglas “delivery efectivo cuenta como efectivo”
-        const { start, end } = getRangeForDay(dateYMD);
+        const { start, end } =await getRangeForDay(
+            tenantId,
+            dateYMD
+        );
 
         const orders = await Order.find(
             buildLegacyCashOrdersFilter({

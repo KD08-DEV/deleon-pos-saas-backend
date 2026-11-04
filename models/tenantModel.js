@@ -1,6 +1,172 @@
 const mongoose = require("mongoose");
 const { v4: uuidv4 } = require("uuid");
+// ======================================================
+// IMPUESTOS CONFIGURABLES
+// ======================================================
+const serviceChargeDefinitionSchema =
+    new mongoose.Schema(
+        {
+            id: {
+                type: String,
+                required: true,
+                trim: true,
+            },
 
+            name: {
+                type: String,
+                required: true,
+                trim: true,
+            },
+
+            code: {
+                type: String,
+                required: true,
+                trim: true,
+                uppercase: true,
+            },
+
+            ratePercent: {
+                type: Number,
+                required: true,
+                min: 0,
+                max: 100,
+            },
+
+            active: {
+                type: Boolean,
+                default: true,
+            },
+
+            calculationBase: {
+                type: String,
+                enum: [
+                    "NET",
+                    "AFTER_TAX",
+                ],
+                default: "NET",
+            },
+            appliesToDeliveryOrders: {
+                type: Boolean,
+                default: true,
+            },
+
+            appliesToDeliveryFee: {
+                type: Boolean,
+                default: false,
+            },
+
+            addToTotal: {
+                type: Boolean,
+                default: true,
+            },
+        },
+        {
+            _id: false,
+        }
+    );
+const taxDefinitionSchema =
+    new mongoose.Schema(
+        {
+            id: {
+                type: String,
+                required: true,
+                trim: true,
+            },
+
+            name: {
+                type: String,
+                required: true,
+                trim: true,
+            },
+
+            code: {
+                type: String,
+                required: true,
+                trim: true,
+                uppercase: true,
+            },
+
+            // Guardamos porcentaje humano:
+            // 18 = 18%
+            // 7.5 = 7.5%
+            // 0 = exento
+            ratePercent: {
+                type: Number,
+                required: true,
+                min: 0,
+                max: 100,
+            },
+
+            active: {
+                type: Boolean,
+                default: true,
+            },
+
+            // Ej:
+            // UK normalmente puede manejar
+            // precios con VAT incluido.
+            includedInPrice: {
+                type: Boolean,
+                default: false,
+            },
+
+            // Decide si este impuesto también
+            // aplica al cargo de delivery.
+            appliesToDeliveryFee: {
+                type: Boolean,
+                default: false,
+            },
+        },
+        {
+            _id: false,
+        }
+    );
+// ======================================================
+// IDENTIFICACIÓN FISCAL INTERNACIONAL
+// ======================================================
+
+const taxIdentifierSchema =
+    new mongoose.Schema(
+        {
+            type: {
+                type: String,
+                trim: true,
+                uppercase: true,
+                maxlength: 40,
+                default: "",
+            },
+
+            label: {
+                type: String,
+                trim: true,
+                maxlength: 80,
+                default: "",
+            },
+
+            value: {
+                type: String,
+                trim: true,
+                maxlength: 120,
+                default: "",
+            },
+
+            countryCode: {
+                type: String,
+                trim: true,
+                uppercase: true,
+                maxlength: 2,
+                default: "",
+            },
+
+            active: {
+                type: Boolean,
+                default: true,
+            },
+        },
+        {
+            _id: false,
+        }
+    );
 const tenantSchema = new mongoose.Schema(
     {
         tenantId: {
@@ -12,6 +178,173 @@ const tenantSchema = new mongoose.Schema(
 
 
         name: { type: String, required: true, trim: true },
+        // ======================================================
+// LOCALIZACIÓN INTERNACIONAL
+// ======================================================
+
+        localization: {
+            countryCode: {
+                type: String,
+                trim: true,
+                uppercase: true,
+                default: "DO",
+            },
+
+            language: {
+                type: String,
+                trim: true,
+                lowercase: true,
+                default: "es",
+            },
+
+            locale: {
+                type: String,
+                trim: true,
+                default: "es-DO",
+            },
+
+            currency: {
+                type: String,
+                trim: true,
+                uppercase: true,
+                default: "DOP",
+            },
+
+            timezone: {
+                type: String,
+                trim: true,
+                default: "America/Santo_Domingo",
+            },
+
+            dateFormat: {
+                type: String,
+
+                enum: [
+                    "DD/MM/YYYY",
+                    "MM/DD/YYYY",
+                    "YYYY-MM-DD",
+                ],
+
+                default:
+                    "DD/MM/YYYY",
+            },
+
+            timeFormat: {
+                type: String,
+
+                enum: [
+                    "12h",
+                    "24h",
+                ],
+
+                default:
+                    "12h",
+            },
+
+            measurementSystem: {
+                type: String,
+
+                enum: [
+                    "metric",
+                    "imperial",
+                ],
+
+                default:
+                    "imperial",
+            },
+
+            weightUnit: {
+                type: String,
+
+                enum: [
+                    "lb",
+                    "kg",
+                ],
+
+                default:
+                    "lb",
+            },
+        },
+
+        // ======================================================
+// IDENTIDAD FISCAL INTERNACIONAL
+// ======================================================
+//
+// No representa el impuesto.
+//
+// Ejemplos:
+// DO → RNC
+// US → EIN
+// GB → VAT
+// AU → ABN
+// CO → NIT
+// MX → RFC
+//
+// DGII / NCF / e-CF siguen viviendo
+// independientemente en tenant.fiscal.
+// ======================================================
+
+        taxIdentity: {
+            enabled: {
+                type: Boolean,
+                default: false,
+            },
+
+            countryCode: {
+                type: String,
+                trim: true,
+                uppercase: true,
+                default: "DO",
+            },
+
+            legalName: {
+                type: String,
+                trim: true,
+                maxlength: 160,
+                default: "",
+            },
+
+            primaryTaxId: {
+                type: taxIdentifierSchema,
+                default: null,
+            },
+
+            additionalTaxIds: {
+                type: [taxIdentifierSchema],
+                default: [],
+            },
+        },
+
+// ======================================================
+// MOTOR GENÉRICO DE IMPUESTOS
+// ======================================================
+//
+// IMPORTANTE:
+// No depende del país.
+//
+// El usuario decide:
+// - nombre
+// - porcentaje
+// - si está incluido
+// - cuál es el predeterminado
+// ======================================================
+
+        taxConfig: {
+            enabled: {
+                type: Boolean,
+                default: true,
+            },
+
+            defaultTaxId: {
+                type: String,
+                default: null,
+            },
+
+            taxes: {
+                type: [taxDefinitionSchema],
+                default: [],
+            },
+        },
 
         // pos-backend/models/tenantModel.js
 
@@ -67,6 +400,19 @@ const tenantSchema = new mongoose.Schema(
             discount: {
                 enabled: { type: Boolean, default: true },
                 allowToggle: { type: Boolean, default: true },
+            },
+            serviceCharges: {
+                enabled: {
+                    type: Boolean,
+                    default: false,
+                },
+
+                charges: {
+                    type: [
+                        serviceChargeDefinitionSchema
+                    ],
+                    default: [],
+                },
             },
             tip: {
                 enabled: { type: Boolean, default: true },

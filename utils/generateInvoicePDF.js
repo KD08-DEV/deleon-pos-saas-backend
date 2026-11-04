@@ -1,4 +1,5 @@
 const PDFDocument = require("pdfkit");
+const { invoiceLineBreakdown } = require("./invoiceExtras");
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
@@ -32,11 +33,320 @@ const normalizeMongoDate = (val) => {
     return null;
 };
 
-const moneyRD = (n) => {
-    const x = Number(n || 0);
-    return `RD$${x.toFixed(2)}`;
+const getPdfLocalization = (
+    tenant = {}
+) => {
+    const raw =
+        tenant?.localization ||
+        {};
+
+    return {
+        countryCode:
+            String(
+                raw.countryCode ||
+                "DO"
+            )
+                .trim()
+                .toUpperCase(),
+        weightUnit:
+            raw.weightUnit ||
+            (
+                raw.measurementSystem ===
+                "metric"
+                    ? "kg"
+                    : "lb"
+            ),
+
+        locale:
+            String(
+                raw.locale ||
+                "es-DO"
+            ).trim(),
+
+        currency:
+            String(
+                raw.currency ||
+                "DOP"
+            )
+                .trim()
+                .toUpperCase(),
+
+        timezone:
+            String(
+                raw.timezone ||
+                "America/Santo_Domingo"
+            ).trim(),
+
+        timeFormat:
+            raw.timeFormat ===
+            "24h"
+                ? "24h"
+                : "12h",
+    };
 };
-const MAX_LOGO_BYTES = 2 * 1024 * 1024;
+
+// ======================================================
+// TAX IDENTITY PARA PDF
+// ======================================================
+
+const normalizePdfTaxIdentity = (
+    raw,
+    fallbackCountryCode = ""
+) => {
+    if (
+        !raw ||
+        typeof raw !== "object"
+    ) {
+        return null;
+    }
+
+
+    const source =
+        raw?.primaryTaxId &&
+        typeof raw.primaryTaxId === "object"
+            ? raw.primaryTaxId
+            : raw;
+
+
+    const value =
+        String(
+            source?.value ||
+            ""
+        ).trim();
+
+
+    if (!value) {
+        return null;
+    }
+
+
+    const type =
+        String(
+            source?.type ||
+            "TAX_ID"
+        )
+            .trim()
+            .toUpperCase();
+
+
+    return {
+        countryCode:
+            String(
+                source?.countryCode ||
+                raw?.countryCode ||
+                fallbackCountryCode ||
+                ""
+            )
+                .trim()
+                .toUpperCase(),
+
+        type,
+
+        label:
+            String(
+                source?.label ||
+                type ||
+                "Tax ID"
+            ).trim(),
+
+        value,
+    };
+};
+
+
+// ======================================================
+// NEGOCIO
+// ======================================================
+
+const getPdfBusinessTaxIdentity = (
+    tenant = {}
+) => {
+    if (
+        tenant
+            ?.taxIdentity
+            ?.enabled === true
+    ) {
+        const identity =
+            normalizePdfTaxIdentity(
+                tenant.taxIdentity,
+
+                tenant
+                    ?.taxIdentity
+                    ?.countryCode ||
+                tenant
+                    ?.localization
+                    ?.countryCode ||
+                ""
+            );
+
+
+        if (identity) {
+            return identity;
+        }
+    }
+
+
+    const legacy =
+        String(
+            tenant
+                ?.business
+                ?.rnc ||
+            tenant
+                ?.fiscal
+                ?.rnc ||
+            ""
+        ).trim();
+
+
+    if (!legacy) {
+        return null;
+    }
+
+
+    return {
+        countryCode:
+            "DO",
+
+        type:
+            "RNC",
+
+        label:
+            "RNC",
+
+        value:
+        legacy,
+    };
+};
+
+
+// ======================================================
+// CLIENTE
+// ======================================================
+
+const getPdfCustomerTaxIdentity = (
+    order = {}
+) => {
+    const identity =
+        normalizePdfTaxIdentity(
+            order
+                ?.customerDetails
+                ?.taxIdentity
+        );
+
+
+    if (identity) {
+        return identity;
+    }
+
+
+    const legacy =
+        String(
+            order
+                ?.customerDetails
+                ?.rncCedula ||
+            order
+                ?.customerDetails
+                ?.rnc ||
+            order
+                ?.customerRNC ||
+            ""
+        ).trim();
+
+
+    if (!legacy) {
+        return null;
+    }
+
+
+    const digits =
+        legacy.replace(
+            /\D/g,
+            ""
+        );
+
+
+    let type =
+        "RNC_CEDULA";
+
+    let label =
+        "RNC / Cédula";
+
+
+    if (
+        digits.length === 9
+    ) {
+        type =
+            "RNC";
+
+        label =
+            "RNC";
+    }
+
+
+    if (
+        digits.length === 11
+    ) {
+        type =
+            "CEDULA";
+
+        label =
+            "Cédula";
+    }
+
+
+    return {
+        countryCode:
+            "DO",
+
+        type,
+
+        label,
+
+        value:
+        legacy,
+    };
+};
+
+const money = (
+    value,
+    localization = {}
+) => {
+    const amount =
+        Number(value);
+
+    const safeAmount =
+        Number.isFinite(
+            amount
+        )
+            ? amount
+            : 0;
+
+    const locale =
+        localization?.locale ||
+        "es-DO";
+
+    const currency =
+        localization?.currency ||
+        "DOP";
+
+    try {
+        return new Intl.NumberFormat(
+            locale,
+            {
+                style:
+                    "currency",
+
+                currency,
+            }
+        ).format(
+            safeAmount
+        );
+    } catch {
+        return `${currency} ${safeAmount.toFixed(
+            2
+        )}`;
+    }
+};const MAX_LOGO_BYTES = 2 * 1024 * 1024;
 
 const downloadImageBuffer = (url) => {
     return new Promise((resolve, reject) => {
@@ -142,12 +452,53 @@ const fmtDateUTC = new Intl.DateTimeFormat("es-DO", {
     year: "numeric",
 });
 
-const formatDateTimeDO = (dateLike) => {
-    const d = normalizeMongoDate(dateLike);
-    if (!d) return "N/A";
-    return `${fmtDateDO.format(d)}, ${fmtTimeDO.format(d)}`;
-};
+const formatDateTime = (
+    dateLike,
+    localization
+) => {
+    const date =
+        normalizeMongoDate(
+            dateLike
+        );
 
+    if (!date) {
+        return "N/A";
+    }
+
+    try {
+        return new Intl.DateTimeFormat(
+            localization.locale,
+            {
+                timeZone:
+                localization.timezone,
+
+                day:
+                    "2-digit",
+
+                month:
+                    "2-digit",
+
+                year:
+                    "numeric",
+
+                hour:
+                    "2-digit",
+
+                minute:
+                    "2-digit",
+
+                hour12:
+                    localization
+                        .timeFormat !==
+                    "24h",
+            }
+        ).format(
+            date
+        );
+    } catch {
+        return date.toLocaleString();
+    }
+};
 const formatDateUTC = (dateLike) => {
     const d = normalizeMongoDate(dateLike);
     if (!d) return "N/A";
@@ -168,6 +519,34 @@ async function generateInvoicePDF(orderId, tenantId) {
         if (!order) throw new Error("Orden no encontrada para generar PDF.");
 
         const tenant = await Tenant.findOne({ tenantId });
+        const businessTaxIdentity =
+            getPdfBusinessTaxIdentity(
+                tenant
+            );
+
+
+        const businessTaxLabel =
+            businessTaxIdentity
+                ?.label ||
+            businessTaxIdentity
+                ?.type ||
+            "Tax ID";
+
+
+        const businessTaxValue =
+            businessTaxIdentity
+                ?.value ||
+            "";
+        const localization =
+            getPdfLocalization(
+                tenant
+            );
+        const moneyPdf =
+            (value) =>
+                money(
+                    value,
+                    localization
+                );
         if (!tenant) throw new Error("Tenant no encontrado para generar PDF.");
 
         const ecfDoc = await ElectronicTaxDocument.findOne({
@@ -261,11 +640,23 @@ async function generateInvoicePDF(orderId, tenantId) {
             order?.client?.name ||
             "Consumidor Final";
 
-        const customerRnc =
-            order?.customerDetails?.rncCedula ||
-            order?.customerDetails?.rnc ||
-            order?.client?.rnc ||
-            order?.customerRNC ||
+        const customerTaxIdentity =
+            getPdfCustomerTaxIdentity(
+                order
+            );
+
+
+        const customerTaxLabel =
+            customerTaxIdentity
+                ?.label ||
+            customerTaxIdentity
+                ?.type ||
+            "Tax ID";
+
+
+        const customerTaxValue =
+            customerTaxIdentity
+                ?.value ||
             "";
 
         const customerPhone =
@@ -286,6 +677,41 @@ async function generateInvoicePDF(orderId, tenantId) {
         const discount = Number(order?.bills?.discount ?? 0);
         const tip = Number(order?.bills?.tipAmount ?? order?.bills?.tip ?? 0);
         const totalTax = Number(order?.bills?.tax ?? 0);
+        const taxBreakdown =
+            Array.isArray(
+                order?.bills
+                    ?.taxBreakdown
+            )
+                ? order.bills
+                    .taxBreakdown
+                : [];
+
+        const serviceChargeBreakdown =
+            Array.isArray(
+                order?.bills
+                    ?.serviceChargeBreakdown
+            )
+                ? order.bills
+                    .serviceChargeBreakdown
+                : [];
+
+        const serviceChargeTotal =
+            Number(
+                order?.bills
+                    ?.serviceChargeTotal ??
+                0
+            );
+
+        const resolvedTaxLabel =
+            taxBreakdown.length === 1
+                ? String(
+                    taxBreakdown[0]
+                        ?.name ||
+                    taxBreakdown[0]
+                        ?.code ||
+                    "Impuestos"
+                )
+                : "Impuestos";
         const deliveryFee = Number(order?.bills?.deliveryFee ?? 0);
 
 
@@ -304,7 +730,8 @@ async function generateInvoicePDF(orderId, tenantId) {
         const commissionAmount = Number(order?.commissionAmount ?? 0);
 
     // total a pagar: si es delivery, normalmente el cliente paga total + comisión
-        const totalToPay = isDelivery ? (grandTotal + commissionAmount) : grandTotal;
+        const totalToPay =
+            grandTotal;
         // ----- create pdf -----
         const doc = new PDFDocument({ size: "A4", margin: 50 });
 
@@ -345,7 +772,19 @@ async function generateInvoicePDF(orderId, tenantId) {
         }
 
         doc.fontSize(16).text(tenant?.business?.name || "Empresa", { align: "center" });
-        doc.fontSize(10).text(`RNC: ${tenant?.business?.rnc || "N/A"}`, { align: "center" });
+        if (
+            businessTaxValue
+        ) {
+            doc
+                .fontSize(10)
+                .text(
+                    `${businessTaxLabel}: ${businessTaxValue}`,
+                    {
+                        align:
+                            "center",
+                    }
+                );
+        }
         doc.text(tenant?.business?.address || "", { align: "center" });
         doc.text(tenant?.business?.phone || "", { align: "center" });
 
@@ -381,7 +820,12 @@ async function generateInvoicePDF(orderId, tenantId) {
 
         doc.text(`Sucursal: ${branchName} · Punto de emision: ${emissionPoint}`);
 
-        doc.text(`Fecha/Hora: ${formatDateTimeDO(order?.invoicedAt || order?.paidAt || order?.createdAt)}`);
+        doc.text(`Fecha/Hora: ${formatDateTime(
+            order?.invoicedAt ||
+            order?.paidAt ||
+            order?.createdAt,
+            localization
+        )}`);
 
         if (hasEcf) {
             doc.text(`eNCF: ${ecfENCF || "N/A"}`);
@@ -393,7 +837,13 @@ async function generateInvoicePDF(orderId, tenantId) {
 
         doc.moveDown(0.5);
         doc.text(`Cliente: ${customerName}`);
-        if (customerRnc) doc.text(`RNC/Cédula: ${customerRnc}`);
+        if (
+            customerTaxValue
+        ) {
+            doc.text(
+                `${customerTaxLabel}: ${customerTaxValue}`
+            );
+        }
         if (customerPhone) doc.text(`Teléfono: ${customerPhone}`);
         if (customerAddress) doc.text(`Dirección: ${customerAddress}`);
 
@@ -414,25 +864,46 @@ async function generateInvoicePDF(orderId, tenantId) {
             .strokeColor("#e5e7eb")
             .stroke();
 
-// Rows
+// Rows: separate paid extra lines, never recompute billed totals.
         let y = tableTop + 25;
         doc.fontSize(10).fillColor("#111827");
-
+        const ensureRoom = (height = 18) => {
+            if (y + height > doc.page.height - 105) {
+                doc.addPage();
+                y = 55;
+            }
+        };
         items.forEach((it) => {
-            const qty = Number(it?.quantity || it?.qty || 0);
+            const detail = invoiceLineBreakdown(it);
+            const qtyLabel = it?.qtyType === "weight"
+                ? `${detail.qty} ${it?.weightUnit || localization?.weightUnit || ""}`.trim()
+                : String(detail.qty);
+            const mainName = String(it?.name || "Item");
+            doc.fontSize(10).fillColor("#111827");
+            const mainHeight = Math.max(18, doc.heightOfString(mainName, { width: 225 }) + 5);
+            ensureRoom(mainHeight);
+            doc.text(mainName, 50, y, { width: 225 });
+            doc.text(qtyLabel, 285, y, { width: 50, align: "right" });
+            doc.text(moneyPdf(detail.mainUnitPrice), 355, y, { width: 80, align: "right" });
+            doc.text(moneyPdf(detail.mainLineTotal), 455, y, { width: 90, align: "right" });
+            y += mainHeight;
 
-            const unitPrice =
-                Number(it?.unitPrice ?? it?.pricePerQuantity ?? it?.price ?? 0);
-
-            const lineTotal = qty * unitPrice;
-
-            doc.text(it?.name || "Item", 50, y, { width: 230 });
-            doc.text(String(qty), 285, y, { width: 50, align: "right" });
-            doc.text(moneyRD(unitPrice), 355, y, { width: 80, align: "right" });
-            doc.text(moneyRD(lineTotal), 455, y, { width: 90, align: "right" });
-
-            y += 18;
+            for (const extra of detail.extras) {
+                const label = `${extra.note ? "•" : "+"} ${extra.label}${extra.included ? " (incluido)" : ""}`;
+                doc.fontSize(8).fillColor("#4b5563");
+                const height = Math.max(15, doc.heightOfString(label, { width: 205 }) + 5);
+                ensureRoom(height);
+                doc.text(label, 64, y, { width: 205 });
+                if (!extra.note) {
+                    doc.text(String(extra.totalQty), 285, y, { width: 50, align: "right" });
+                    doc.text(extra.unitPrice === null ? "—" : moneyPdf(extra.unitPrice), 355, y, { width: 80, align: "right" });
+                    doc.text(extra.included || extra.lineTotal === null ? "—" : moneyPdf(extra.lineTotal), 455, y, { width: 90, align: "right" });
+                }
+                y += height;
+            }
         });
+        doc.y = Math.max(doc.y, y + 4);
+        doc.fontSize(10).fillColor("#111827");
 
         doc.moveDown(2);
         doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor("#e5e7eb").stroke();
@@ -440,20 +911,65 @@ async function generateInvoicePDF(orderId, tenantId) {
 
         // Totals
         doc.fontSize(10).fillColor("#111827");
-        if (discount > 0) doc.text(`Descuento: -${moneyRD(discount)}`);
-        doc.text(`Subtotal: ${moneyRD(subtotal)}`);
-        doc.text(`Propina: ${moneyRD(tip)}`);
-        doc.text(`ITBIS: ${moneyRD(totalTax)}`);
+        if (discount > 0) doc.text(`Descuento: -${moneyPdf(discount)}`);
+        doc.text(`Subtotal: ${moneyPdf(subtotal)}`);
+        doc.text(`Propina: ${moneyPdf(tip)}`);
+        if (
+            totalTax > 0
+        ) {
+            doc.text(
+                `${resolvedTaxLabel}: ${moneyPdf(
+                    totalTax
+                )}`
+            );
+        }
+
+        if (
+            serviceChargeBreakdown.length >
+            0
+        ) {
+            serviceChargeBreakdown.forEach(
+                (charge) => {
+                    const amount =
+                        Number(
+                            charge?.amount ??
+                            charge?.total ??
+                            0
+                        );
+
+                    if (amount <= 0) {
+                        return;
+                    }
+
+                    const name =
+                        charge?.name ||
+                        charge?.code ||
+                        "Cargo por servicio";
+
+                    doc.text(
+                        `${name}: ${moneyPdf(
+                            amount
+                        )}`
+                    );
+                }
+            );
+        } else if (
+            serviceChargeTotal > 0
+        ) {
+            doc.text(
+                `Cargo por servicio: ${moneyPdf(
+                    serviceChargeTotal
+                )}`
+            );
+        }
 
         if (deliveryFee > 0) {
-            doc.text(`Envío: ${moneyRD(deliveryFee)}`);
+            doc.text(`Envío: ${moneyPdf(deliveryFee)}`);
         }
 
-        if (isDelivery && commissionAmount > 0) {
-            doc.text(`Comisión: ${moneyRD(commissionAmount)}`);
-        }
 
-        doc.font("Helvetica-Bold").text(`Total a pagar: ${moneyRD(totalToPay)}`);
+
+        doc.font("Helvetica-Bold").text(`Total a pagar: ${moneyPdf(totalToPay)}`);
         doc.font("Helvetica").text(`Método de pago: ${order?.paymentMethod || "N/A"}`);
 
         if (hasEcf && ecfQrUrl) {
@@ -498,7 +1014,8 @@ async function generateInvoicePDF(orderId, tenantId) {
         });
 
         // Upload to Supabase
-        const storagePath = `invoices/tenant_${tenantId}/orders/${fileName}`;
+        const { invoiceStoragePaths } = require("./invoiceStoragePaths");
+        const storagePath = invoiceStoragePaths(tenantId, orderId)[0];
         const fileBuffer = fs.readFileSync(filePath);
 
         const { error: uploadError } = await supabase.storage
@@ -507,15 +1024,11 @@ async function generateInvoicePDF(orderId, tenantId) {
 
         if (uploadError) throw uploadError;
 
-        const { data: publicData } = supabase.storage.from("invoices").getPublicUrl(storagePath);
-        const publicUrl = publicData?.publicUrl || null;
-
-        console.log("[PDF] URL pública generada:", publicUrl);
-
-        // Cleanup temp
+        // Private bucket: do not create public URLs, and do not persist a
+        // short-lived signed URL in the order. The API will sign on each read.
         try { fs.unlinkSync(filePath); } catch (_) {}
 
-        return publicUrl;
+        return { path: storagePath };
     } catch (err) {
         console.error("[PDF] Error generando invoice PDF:", err);
         throw err;

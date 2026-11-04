@@ -30,10 +30,9 @@ router.use(verifyToken);
 router.use(requireScope({ level: "tenant" }));
 
 // =======================
-// LECTURA DE INVENTARIO
-// DISPONIBLE PARA TODOS LOS USUARIOS ACTIVOS DEL TENANT
-// SIN IMPORTAR ROL NI PLAN
+// LECTURA DE INVENTARIO: también requiere feature de plan en backend.
 // =======================
+router.use(requireFeatureOrSuper("inventory"));
 
 router.get(
     "/items",
@@ -66,11 +65,8 @@ router.get(
 );
 
 // =======================
-// DESDE AQUÍ SÍ APLICA EL PLAN DE INVENTARIO
-// Estándar / Premium / Pro según planTiers.js
+// El control de plan se aplica arriba tanto a GET como a mutaciones.
 // =======================
-
-router.use(requireFeatureOrSuper("inventory"));
 
 // =======================
 // ARTÍCULOS DE INVENTARIO

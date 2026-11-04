@@ -1,153 +1,101 @@
-// controllers/invoiceController.js  (PDF-LIB VERSION FINAL)
-const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
-const path = require("path");
-const fs = require("fs");
+"use strict";
+const mongoose = require("mongoose");
 const Order = require("../models/orderModel");
 const generateInvoicePDF = require("../utils/generateInvoicePDF");
+const { signStoredInvoice } = require("../utils/invoiceStorageAccess");
+const { supabase } = require("../config/supabaseClient");
 
+function scopedOrderQuery(req, orderId) {
+    const tenantId = req.tenantId;
+    const clientId = req.clientId || "default";
+    return {
+        _id: orderId,
+        tenantId,
+        ...(clientId === "default"
+            ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }] }
+            : { clientId }),
+    };
+}
 
+async function temporaryInvoiceUrl(req, orderId) {
+    const signed = await signStoredInvoice({
+        storage: supabase.storage,
+        tenantId: req.tenantId,
+        orderId,
+        ttlSeconds: 120,
+    });
+    return signed?.url || null;
+}
+
+function validInvoiceRequest(req, res, orderId) {
+    if (!req.tenantId) {
+        res.status(403).json({ success: false, message: "Tenant unavailable" });
+        return false;
+    }
+    if (!mongoose.isValidObjectId(orderId)) {
+        res.status(404).json({ success: false, message: "Order not found" });
+        return false;
+    }
+    return true;
+}
 
 exports.createInvoice = async (req, res) => {
     try {
-        const { orderId } = req.body;
+        const { orderId } = req.body || {};
+        if (!validInvoiceRequest(req, res, orderId)) return;
+        const query = scopedOrderQuery(req, orderId);
+        const order = await Order.findOne(query).select("_id invoicePath invoiceUrl").lean();
+        if (!order) return res.status(404).json({ success: false, message: "Order not found" });
 
-        // Usa SIEMPRE el tenantId/clientId resuelto por tu middleware multi-tenant
-        // (si aún no lo estás usando en la ruta, te lo digo más abajo)
-        const tenantId = req.tenantId || req.user?.tenantId;
-        const clientId = req.clientId;
-
-        if (!orderId) {
-            return res.status(400).json({ message: "orderId is required" });
-        }
-        if (!tenantId) {
-            return res.status(400).json({ message: "tenantId missing (middleware not applied?)" });
-        }
-
-        // ✅ Query seguro (igual que getInvoice)
-        const query = { _id: orderId, tenantId };
-        query.$or = clientId
-            ? [
-                { clientId },                    // órdenes nuevas
-                { clientId: { $exists: false } }, // órdenes viejas
-                { clientId: "default" },         // compat
-            ]
-            : [
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ];
-
-        // ✅ Verifica pertenencia ANTES de generar el PDF
-        const order = await Order.findOne(query).select("_id invoiceUrl").lean();
-        if (!order) {
-            return res.status(404).json({ message: "Order not found for this tenant/client" });
+        // Old PDFs remain valid: issue a short-lived link on demand.
+        // Never echo a legacy public URL even when it is stored in MongoDB.
+        if (order.invoicePath || order.invoiceUrl) {
+            const url = await temporaryInvoiceUrl(req, orderId);
+            if (!url) return res.status(404).json({ success: false, message: "Stored PDF unavailable" });
+            res.set("Cache-Control", "no-store");
+            return res.status(200).json({ success: true, message: "Invoice already generated", url, invoiceUrl: url });
         }
 
-        // Si ya existe invoice, devuelve la misma
-        if (order.invoiceUrl) {
-            return res.status(200).json({
-                message: "Invoice already generated",
-                invoiceUrl: order.invoiceUrl,
-            });
+        const output = await generateInvoicePDF(orderId, req.tenantId);
+        if (!output || typeof output.path !== "string") {
+            throw new Error("INVOICE_STORAGE_PATH_MISSING");
         }
-
-        // Genera PDF (ya validaste pertenencia)
-        const invoiceData = await generateInvoicePDF(orderId, tenantId);
-
-// Soporta ambos formatos: string (url) o { url, path }
-        const invoiceUrl =
-            typeof invoiceData === "string" ? invoiceData : (invoiceData?.url || null);
-        const invoicePath =
-            typeof invoiceData === "string" ? null : (invoiceData?.path || null);
-
-        if (!invoiceUrl) {
-            return res.status(500).json({
-                success: false,
-                message: "Invoice generated but URL is missing",
-            });
-        }
-
-        await Order.findOneAndUpdate(query, {
-            ...(invoicePath ? { invoicePath } : {}),
-            invoiceUrl,
-        });
-
-        return res.status(200).json({
-            success: true,
-            message: "Invoice generated successfully",
-            url: invoiceUrl,
-            invoiceUrl,
-        });
-
-
+        // Only a stable object path is stored, not a public or expiring URL.
+        await Order.findOneAndUpdate(query, { $set: { invoicePath: output.path, invoiceUrl: "" } });
+        const url = await temporaryInvoiceUrl(req, orderId);
+        if (!url) return res.status(502).json({ success: false, message: "PDF stored but signed download unavailable" });
+        res.set("Cache-Control", "no-store");
+        return res.status(200).json({ success: true, message: "Invoice generated successfully", url, invoiceUrl: url });
     } catch (error) {
-        console.error("Invoice Create Error:", error);
-        return res.status(500).json({
-            message: "Error generating invoice",
-            error: error.message,
-        });
+        console.error("Invoice Create Error:", error?.message || error);
+        return res.status(500).json({ success: false, message: "Error generating invoice" });
     }
 };
 
 exports.getInvoice = async (req, res) => {
     try {
         const { orderId } = req.params;
-        const tenantId = req.user?.tenantId;
-        const clientId = req.clientId;
-
-        if (!orderId) {
-            return res.status(400).json({ success: false, message: "orderId is required" });
+        if (!validInvoiceRequest(req, res, orderId)) return;
+        const order = await Order.findOne(scopedOrderQuery(req, orderId))
+            .select("_id invoicePath invoiceUrl").lean();
+        if (!order) return res.status(404).json({ success: false, message: "Order not found" });
+        res.set("Cache-Control", "no-store");
+        if (order.invoicePath || order.invoiceUrl) {
+            const url = await temporaryInvoiceUrl(req, orderId);
+            if (!url) return res.status(404).json({ success: false, message: "Stored PDF unavailable" });
+            return res.status(200).json({ success: true, url });
         }
-
-        // ✅ Compatibilidad: órdenes viejas sin clientId o con "default"
-        const query = { _id: orderId, tenantId };
-
-        query.$or = clientId
-            ? [
-                { clientId },                 // órdenes nuevas
-                { clientId: { $exists: false } }, // órdenes viejas
-                { clientId: "default" },       // compat
-            ]
-            : [
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ];
-
-        const order = await Order.findOne(query).lean();
-
-        if (!order) {
-            return res.status(404).json({ success: false, message: "Order not found" });
-        }
-
-        if (order.invoiceUrl) {
-            return res.status(200).json({ success: true, url: order.invoiceUrl });
-        }
-
-        const invoiceData = await generateInvoicePDF(orderId, tenantId);
-
-        const invoiceUrl =
-            typeof invoiceData === "string" ? invoiceData : (invoiceData?.url || null);
-        const invoicePath =
-            typeof invoiceData === "string" ? null : (invoiceData?.path || null);
-
-        if (!invoiceUrl) {
-            return res.status(500).json({
-                success: false,
-                message: "Invoice generated but URL is missing",
-            });
-        }
-
-        await Order.findOneAndUpdate(query, {
-            ...(invoicePath ? { invoicePath } : {}),
-            invoiceUrl,
+        // The normal visual invoice uses existing order data and does not
+        // upload a PDF automatically.
+        return res.status(200).json({
+            success: true,
+            orderId,
+            previewAvailable: true,
+            invoiceUrl: null,
+            message: "Stored order available for invoice preview; no PDF generated",
         });
-
-        return res.status(200).json({ success: true, url: invoiceUrl });
     } catch (error) {
-        console.error("Get Invoice Error:", error);
-        return res.status(500).json({
-            success: false,
-            message: "Error getting invoice",
-            error: error.message,
-        });
+        console.error("Get Invoice Error:", error?.message || error);
+        return res.status(500).json({ success: false, message: "Error getting invoice" });
     }
 };

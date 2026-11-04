@@ -1,3 +1,4 @@
+const { summarizeLegacyNcf } = require("../services/fiscal/legacyNcfAvailability");
 const createHttpError = require("http-errors");
 const mongoose = require("mongoose");
 const Order = require("../models/orderModel");
@@ -6,24 +7,65 @@ const Tenant = require("../models/tenantModel");
 const Dish = require("../models/dish"); // ajusta si el nombre es dishModel.js
 const InventoryCategory = require("../models/inventoryCategoryModel");
 const ElectronicTaxDocument = require("../models/electronicTaxDocumentModel");
+const { buildEcfDocumentScope, mapEcfForInvoice } = require("../services/ecf/orderInvoiceEcfView");
 // const InventoryItem = require("../models/inventoryItemModel"); // DEPRECATED: Ya no se usa InventoryItem, solo Dish
 // const InventoryMovement = require("../models/inventoryMovementModel"); // DEPRECATED
 const Customer = require("../models/customerModel");
 const { deductInventoryForOrder, restoreInventoryForOrder } = require("../services/inventory/deductInventoryForOrder");
+const { persistOrderWithInventory } = require("../services/inventory/persistOrderWithInventory");
 const Printer = require("../models/printerModel");
 const networkPrintService = require("../services/networkPrintService");
 const Membership = require("../models/membershipModel");
 const TenantEcfProfile = require("../models/tenantEcfProfileModel");
+const Client = require("../models/clientModel");
+const {getBranchEcfStatus, assertSecondarySandboxIssue} = require("../services/ecf/ecfBranchAccess");
 const { issueOrderAsEcfCore } = require("./ecfIssueController");
 const { createReceivableForOrder } = require("./accountReceivableController");
+const {
+    getTenantTimezone,
+    getUtcRangeForYMDRange,
+    getTodayYMDInTimeZone,
+} = require(
+    "../utils/timezone"
+);
+const {
+    validateEcfProfile,
+} = require(
+    "../services/ecf/helpers/validateEcfProfile"
+);
+const {
+    calculateOrderTaxes,
+} = require(
+    "../services/tax/taxEngine"
+);
+const {
+    calculateServiceCharges,
+} = require(
+    "../services/charges/serviceChargeEngine"
+);
 
-
-// Impuesto por defecto (0.25% para coincidir con tu UI)
-const TAX_RATE = Number(process.env.TAX_RATE ?? 0.18);
+const {
+    normalizePlan,
+    getPlanFeatures,
+} = require("../middlewares/requirePlan");
 
 
 function round2(n) {
     return Math.round((Number(n) || 0) * 100) / 100;
+}
+function tenantCanUseAccountsReceivable(tenant) {
+    const plan =
+        normalizePlan(
+            tenant?.plan ||
+            "emprendedor"
+        );
+
+    const features =
+        getPlanFeatures(plan);
+
+    return Boolean(
+        features?.accountsReceivable
+    );
 }
 const ORDER_SOURCES = ["DINE_IN", "TAKEOUT", "PEDIDOSYA", "UBEREATS", "DELIVERY"];
 function normalizeSource(v) {
@@ -88,6 +130,204 @@ function normalizeMongoDate(value) {
     }
 
     return null;
+}
+// ======================================================
+// IDENTIFICACIÓN FISCAL DEL CLIENTE
+// ======================================================
+
+function normalizeCustomerTaxIdentity(
+    raw,
+    legacyValue = "",
+    fallbackCountryCode = "DO"
+) {
+    // ==============================================
+    // FORMATO INTERNACIONAL NUEVO
+    // ==============================================
+
+    if (
+        raw &&
+        typeof raw === "object"
+    ) {
+        const value =
+            String(
+                raw?.value ||
+                ""
+            ).trim();
+
+        if (value) {
+            const type =
+                String(
+                    raw?.type ||
+                    "TAX_ID"
+                )
+                    .trim()
+                    .toUpperCase();
+
+            return {
+                countryCode:
+                    String(
+                        raw?.countryCode ||
+                        fallbackCountryCode ||
+                        "DO"
+                    )
+                        .trim()
+                        .toUpperCase()
+                        .slice(0, 2),
+
+                type:
+                    type.slice(
+                        0,
+                        40
+                    ),
+
+                label:
+                    String(
+                        raw?.label ||
+                        type ||
+                        "Tax ID"
+                    )
+                        .trim()
+                        .slice(
+                            0,
+                            80
+                        ),
+
+                value:
+                    value.slice(
+                        0,
+                        120
+                    ),
+            };
+        }
+    }
+
+
+    // ==============================================
+    // COMPATIBILIDAD LEGACY RD
+    // ==============================================
+
+    const legacy =
+        String(
+            legacyValue ||
+            ""
+        ).trim();
+
+    if (!legacy) {
+        return null;
+    }
+
+
+    const digits =
+        legacy.replace(
+            /\D/g,
+            ""
+        );
+
+
+    let type =
+        "RNC_CEDULA";
+
+
+    if (
+        digits.length ===
+        9
+    ) {
+        type =
+            "RNC";
+    }
+
+
+    if (
+        digits.length ===
+        11
+    ) {
+        type =
+            "CEDULA";
+    }
+
+
+    return {
+        countryCode:
+            "DO",
+
+        type,
+
+        label:
+            type === "CEDULA"
+                ? "Cédula"
+                : type === "RNC"
+                    ? "RNC"
+                    : "RNC / Cédula",
+
+        value:
+        legacy,
+    };
+}
+
+
+// ======================================================
+// LEGACY PARA DGII
+// ======================================================
+//
+// Solamente una identificación dominicana puede
+// alimentar rnc / rncCedula.
+//
+// EIN, VAT, ABN, NIT, RFC, etc. SIEMPRE producen "".
+// ======================================================
+
+function getDominicanLegacyCustomerTaxValue(
+    taxIdentity
+) {
+    if (!taxIdentity) {
+        return "";
+    }
+
+
+    const countryCode =
+        String(
+            taxIdentity
+                ?.countryCode ||
+            ""
+        )
+            .trim()
+            .toUpperCase();
+
+
+    if (
+        countryCode !==
+        "DO"
+    ) {
+        return "";
+    }
+
+
+    const type =
+        String(
+            taxIdentity
+                ?.type ||
+            ""
+        )
+            .trim()
+            .toUpperCase();
+
+
+    if (
+        ![
+            "RNC",
+            "CEDULA",
+            "CÉDULA",
+            "RNC_CEDULA",
+        ].includes(type)
+    ) {
+        return "";
+    }
+
+
+    return String(
+        taxIdentity
+            ?.value ||
+        ""
+    ).trim();
 }
 function normalizeOrderStatus(s) {
     const v = String(s || "").trim();
@@ -248,15 +488,27 @@ async function hydrateOrderItems({ items, tenantId, clientId, currentItems = [] 
         ? await Dish.find({
             _id: { $in: validDishIds },
             tenantId,
-            $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+            ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
         })
-            .select("_id productionArea")
+            .select(
+                "_id productionArea taxId taxIncludedOverride"
+            )
             .lean()
         : [];
 
-    const dishAreaMap = new Map(
-        dishes.map((d) => [String(d._id), normalizeProductionArea(d.productionArea)])
-    );
+    const dishMap =
+        new Map(
+            dishes.map(
+                (dish) => [
+                    String(
+                        dish._id
+                    ),
+                    dish,
+                ]
+            )
+        );
 
     const currentByLineId = new Map(
         (currentItems || [])
@@ -289,17 +541,62 @@ async function hydrateOrderItems({ items, tenantId, clientId, currentItems = [] 
 
         const quantity = Number(item.quantity || 0);
         const prevPrintedQty = Number(matched?.printedQty || 0);
-
+        const authoritativeDish =
+            dishMap.get(
+                String(
+                    item.dishId ||
+                    ""
+                )
+            );
         return {
             ...item,
-            lineId: matched?.lineId || item.lineId || makeLineId(),
-            productionArea: normalizeProductionArea(
-                item.productionArea ||
-                matched?.productionArea ||
-                dishAreaMap.get(String(item.dishId || "")) ||
-                "kitchen"
-            ),
-            printedQty: Math.max(0, Math.min(prevPrintedQty, quantity)),
+
+            lineId:
+                matched?.lineId ||
+                item.lineId ||
+                makeLineId(),
+
+            productionArea:
+                normalizeProductionArea(
+                    item.productionArea ||
+                    matched?.productionArea ||
+                    authoritativeDish
+                        ?.productionArea ||
+                    "kitchen"
+                ),
+
+            // IMPORTANTE:
+            // nunca confiamos en el taxId enviado
+            // por el navegador.
+            //
+            // Siempre viene del producto guardado.
+            taxId:
+                authoritativeDish
+                    ? (
+                        String(
+                            authoritativeDish
+                                ?.taxId ||
+                            ""
+                        ).trim() ||
+                        null
+                    )
+                    : null,
+
+            taxIncludedOverride:
+                typeof authoritativeDish
+                    ?.taxIncludedOverride ===
+                "boolean"
+                    ? authoritativeDish
+                        .taxIncludedOverride
+                    : null,
+            printedQty:
+                Math.max(
+                    0,
+                    Math.min(
+                        prevPrintedQty,
+                        quantity
+                    )
+                ),
         };
     });
 }
@@ -321,64 +618,439 @@ async function findActiveProductionPrinter({ tenantId, clientId, category }) {
 //     ... (función deshabilitada porque usa InventoryItem)
 // }
 
-const getTenantEcfStatus = async (req, res, next) => {
-    try {
-        const tenantId = req.tenantId || req.user?.tenantId;
-        const clientId = req.clientId || "default";
+const getTenantEcfStatus =
+    async (
+        req,
+        res,
+        next
+    ) => {
+        try {
+
+            const tenantId =
+                req.tenantId ||
+                req.user
+                    ?.tenantId;
+
+
+            if (!tenantId) {
+                return next(
+                    createHttpError(
+                        401,
+                        "TENANT_NOT_FOUND"
+                    )
+                );
+            }
+
+
+            const tenant =
+                await Tenant
+                    .findOne({
+                        tenantId,
+                    })
+                    .select(
+                        "localization.countryCode plan fiscal.enabled fiscal.ncfConfig features.fiscal.enabled"
+                    )
+                    .lean();
+
+
+            if (!tenant) {
+                return next(
+                    createHttpError(
+                        404,
+                        "TENANT_NOT_FOUND"
+                    )
+                );
+            }
+
+
+            if (
+                !tenantUsesDgii(
+                    tenant
+                )
+            ) {
+                return res
+                    .status(200)
+                    .json({
+                        success:
+                            true,
+
+                        data: {
+                            enabled:
+                                false,
+
+                            canIssue:
+                                false,
+
+                            countryCode:
+                                tenant
+                                    ?.localization
+                                    ?.countryCode ||
+                                null,
+
+                            environment:
+                                null,
+
+                            certificationStatus:
+                                null,
+
+                            issuerReady:
+                                false,
+
+                            certificateRequired:
+                                false,
+
+                            certificateReady:
+                                false,
+
+                            documentTypes:
+                                null,
+
+                            documentTypeStatus:
+                                {},
+
+                            errors: [
+                                "DGII_ONLY_AVAILABLE_FOR_DO",
+                            ],
+
+                            warnings:
+                                [],
+                        },
+                    });
+            }
+
+
+            const clientId =
+                req.clientId ||
+                "default";
 
         if (!tenantId) {
-            return next(createHttpError(401, "TENANT_NOT_FOUND"));
+            return next(
+                createHttpError(
+                    401,
+                    "TENANT_NOT_FOUND"
+                )
+            );
         }
 
-        const profile = await TenantEcfProfile.findOne({
-            tenantId,
-            $or: [
-                { clientId },
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ],
-        })
-            .select("enabled environment certificationStatus issuer certificate security documentTypes")
-            .lean();
+        const profile =
+            await TenantEcfProfile
+                .findOne({
+                    tenantId,
 
-        const enabled = profile?.enabled === true;
+                    $or: [
+                        {
+                            clientId,
+                        },
+                        {
+                            clientId: {
+                                $exists:
+                                    false,
+                            },
+                        },
+                        {
+                            clientId:
+                                "default",
+                        },
+                    ],
+                })
+                .select(
+                    "enabled environment certificationStatus issuer certificate security documentTypes productionApproval certificationVerification"
+                )
+                .lean();
 
-        const certificateReady =
-            profile?.security?.certificateUploaded === true ||
-            profile?.certificate?.isActive === true;
-
-        const issuerReady = Boolean(
-            profile?.issuer?.rnc &&
-            profile?.issuer?.legalName
-        );
-
-        const canIssue =
-            enabled &&
-            issuerReady &&
-            (
-                String(profile?.environment || "") === "internal_sandbox" ||
-                certificateReady
+        const validation =
+            validateEcfProfile(
+                profile
             );
 
-        return res.status(200).json({
-            success: true,
-            data: {
-                enabled,
-                canIssue,
-                environment: profile?.environment || null,
-                certificationStatus: profile?.certificationStatus || null,
-                issuerReady,
-                certificateReady,
-                documentTypes: profile?.documentTypes || null,
-            },
-        });
+        const enabled =
+            profile?.enabled ===
+            true;
+
+        const {getBranchEcfStatus} = require("../services/ecf/ecfBranchAccess");
+        const branchEcf = await getBranchEcfStatus({tenantId,clientId});
+        const eligibleBranch = branchEcf.prepared === true &&
+            (!branchEcf.secondary || profile?.environment === "internal_sandbox");
+        const canIssue = enabled && validation.ok === true && eligibleBranch;
+
+        return res
+            .status(200)
+            .json({
+                success: true,
+
+                data: {
+                    enabled: enabled && eligibleBranch,
+                    sharedProfileEnabled: enabled,
+                    // Datos NCF tradicionales comunes al contribuyente, no al almacén
+                    // de certificados. El POS puede consultarlos como Cajera sin ver
+                    // rangos, secuencias o datos privados del emisor.
+                    legacyNcf: profile?.enabled === true && profile?.environment === "dgii_production"
+                        ? { enabled: false, availableTypes: [], available: false }
+                        : summarizeLegacyNcf(
+                            tenant,
+                            getPlanFeatures(normalizePlan(tenant.plan)).fiscal === true
+                        ),
+                    branch: branchEcf,
+                    readOnly: branchEcf.secondary,
+                    canIssue,
+
+                    environment:
+                        profile
+                            ?.environment ||
+                        null,
+
+                    certificationStatus:
+                        profile
+                            ?.certificationStatus ||
+                        null,
+
+                    issuerReady:
+                        validation
+                            .issuerReady ===
+                        true,
+
+                    certificateRequired:
+                        validation
+                            .certificateRequired ===
+                        true,
+
+                    certificateReady:
+                        validation
+                            .certificateReady ===
+                        true,
+
+                    documentTypes:
+                        profile
+                            ?.documentTypes ||
+                        null,
+
+                    documentTypeStatus:
+                        validation
+                            .documentTypes ||
+                        {},
+
+                    errors:
+                        validation
+                            .errors ||
+                        [],
+
+                    warnings:
+                        validation
+                            .warnings ||
+                        [],
+                },
+            });
     } catch (error) {
-        console.error("[getTenantEcfStatus] error:", error);
-        return next(createHttpError(500, "GET_TENANT_ECF_STATUS_FAILED"));
+        console.error(
+            "[getTenantEcfStatus] error:",
+            error
+        );
+
+        return next(
+            createHttpError(
+                500,
+                "GET_TENANT_ECF_STATUS_FAILED"
+            )
+        );
     }
 };
+const previewOrderTaxes = async (
+    req,
+    res,
+    next
+) => {
+    try {
+        const tenantId =
+            req.tenantId ||
+            req.user?.tenantId;
 
+        const clientId =
+            req.clientId ||
+            req.scope?.clientId ||
+            "default";
 
+        if (!tenantId) {
+            return next(
+                createHttpError(
+                    401,
+                    "TENANT_NOT_FOUND"
+                )
+            );
+        }
+
+        const tenant =
+            await Tenant.findOne({
+                tenantId,
+            })
+                .select(
+                    "taxConfig features localization"
+                )
+                .lean();
+
+        if (!tenant) {
+            return next(
+                createHttpError(
+                    404,
+                    "TENANT_NOT_FOUND"
+                )
+            );
+        }
+
+        const incomingItems =
+            Array.isArray(
+                req.body?.items
+            )
+                ? req.body.items
+                : [];
+
+        if (
+            incomingItems.length ===
+            0
+        ) {
+            return res
+                .status(200)
+                .json({
+                    success: true,
+
+                    data: {
+                        engineVersion: 1,
+
+                        taxEnabled:
+                            false,
+
+                        items: [],
+
+                        subtotal: 0,
+
+                        discount: 0,
+
+                        subtotalAfterDiscount:
+                            0,
+
+                        netAmount: 0,
+
+                        tax: 0,
+
+                        taxTotal: 0,
+
+                        taxBreakdown: [],
+                        serviceChargeTotal: 0,
+
+                        serviceChargeBreakdown: [],
+
+                        deliveryFee: 0,
+
+                        deliveryTaxAmount:
+                            0,
+
+                        deliveryGrossAmount:
+                            0,
+
+                        itemsTotalWithTax:
+                            0,
+
+                        totalBeforeTip:
+                            0,
+                    },
+                });
+        }
+
+        // ==================================================
+        // IMPORTANTE
+        // ==================================================
+        // No confiamos en taxId ni taxIncludedOverride
+        // enviados por el navegador.
+        //
+        // hydrateOrderItems vuelve a consultar Dish.
+        // ==================================================
+
+        const hydratedItems =
+            await hydrateOrderItems({
+                items:
+                incomingItems,
+
+                tenantId,
+
+                clientId,
+
+                currentItems:
+                    [],
+            });
+
+        const result =
+            calculateOrderTaxes({
+                tenant,
+
+                items:
+                hydratedItems,
+
+                discountAmount:
+                    Number(
+                        req.body
+                            ?.discountAmount ||
+                        0
+                    ),
+
+                deliveryFee:
+                    Number(
+                        req.body
+                            ?.deliveryFee ||
+                        0
+                    ),
+
+                taxesEnabled:
+                    req.body
+                        ?.taxEnabled !==
+                    false,
+            });
+        const serviceChargeResult =
+            calculateServiceCharges({
+                tenant,
+
+                taxResult:
+                result,
+
+                orderSource:
+                    normalizeSource(
+                        req.body
+                            ?.orderSource
+                    ),
+            });
+
+        const totalBeforeTip =
+            round2(
+                result.totalBeforeTip +
+                serviceChargeResult
+                    .addedTotal
+            );
+        return res
+            .status(200)
+            .json({
+                success: true,
+
+                data: {
+                    ...result,
+
+                    serviceChargeTotal:
+                    serviceChargeResult
+                        .addedTotal,
+
+                    serviceChargeBreakdown:
+                    serviceChargeResult
+                        .breakdown,
+
+                    totalBeforeTip,
+                },
+            });
+    } catch (error) {
+        console.error(
+            "[previewOrderTaxes] error:",
+            error
+        );
+
+        return next(error);
+    }
+};
 const getOrderEcfStatus = async (req, res, next) => {
     try {
         const { id } = req.params;
@@ -397,11 +1069,9 @@ const getOrderEcfStatus = async (req, res, next) => {
         const orderScope = {
             _id: id,
             tenantId,
-            $or: [
-                { clientId },
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ],
+            ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
         };
 
         const order = await Order.findOne(orderScope)
@@ -416,11 +1086,9 @@ const getOrderEcfStatus = async (req, res, next) => {
             tenantId,
             orderId: id,
             sourceDocumentType: "ORDER",
-            $or: [
-                { clientId },
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ],
+            ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
         })
             .sort({ createdAt: -1 })
             .lean();
@@ -433,7 +1101,17 @@ const getOrderEcfStatus = async (req, res, next) => {
                     orderId: String(order._id),
                     invoiceNumber: order.invoiceNumber || order.facturaNo || null,
                     legacyNcfNumber: order?.fiscal?.ncfNumber || order?.ncfNumber || null,
-                    canIssue: true,
+                    // El historial es visible, pero la acción de emitir depende
+                    // del permiso y la preparación de la sede.
+                    canIssue: await (async () => {
+                        const {getCapabilities} = require("../middlewares/requireEcfPermission");
+                        if (!getCapabilities(req).issue) return false;
+                        try {
+                            const {assertSecondarySandboxIssue} = require("../services/ecf/ecfBranchAccess");
+                            await assertSecondarySandboxIssue({tenantId,clientId});
+                            return true;
+                        } catch (_error) { return false; }
+                    })(),
                     message: "NO_ECF_FOUND_FOR_ORDER",
                 },
             });
@@ -526,6 +1204,18 @@ function normalizeAndPriceItems(items) {
             unitPrice,
             price,
 
+            taxId:
+                it?.taxId ||
+                null,
+
+            taxIncludedOverride:
+                typeof it
+                    ?.taxIncludedOverride ===
+                "boolean"
+                    ? it
+                        .taxIncludedOverride
+                    : null,
+
             note: String(it?.note || it?.comment || it?.specialInstructions || "").trim(),
             addons: cloneArray(
                 it?.addons ||
@@ -556,19 +1246,55 @@ const addOrder = async (req, res, next) => {
         if (!tenantId) {
             return next(createHttpError(401, "TENANT_NOT_FOUND"));
         }
+        const clientId =
+            req.clientId;
 
-        const clientId = req.clientId;
 
-        const ecfProfileForTenant = await TenantEcfProfile.findOne({
-            tenantId,
-            $or: [
-                { clientId },
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ],
-        }).lean();
+// ======================================================
+// TENANT
+// ======================================================
 
-        const ecfEnabledForTenant = ecfProfileForTenant?.enabled === true;
+        const tenant =
+            await Tenant
+                .findOne({
+                    tenantId,
+                })
+                .lean();
+
+
+        if (!tenant) {
+            return next(
+                createHttpError(
+                    404,
+                    "TENANT_NOT_FOUND"
+                )
+            );
+        }
+
+
+// ======================================================
+// DGII SOLO RD
+// ======================================================
+
+        const dgiiTenant =
+            tenantUsesDgii(
+                tenant
+            );
+
+
+// ======================================================
+// PERFIL e-CF
+// ======================================================
+
+        const ecfProfileForTenant = await TenantEcfProfile.findOne({tenantId}).lean();
+        const branchEcfState = await getBranchEcfStatus({tenantId,clientId});
+        const ecfEnabledForTenant =
+            branchEcfState.prepared &&
+            (!branchEcfState.secondary || ecfProfileForTenant?.environment === "internal_sandbox") &&
+            dgiiTenant &&
+            getPlanFeatures(normalizePlan(tenant.plan))?.fiscal === true &&
+            tenant.fiscal?.enabled === true && tenant.features?.fiscal?.enabled !== false &&
+            ecfProfileForTenant?.enabled === true;
         const {
             customerId = null,
             customerDetails = {},
@@ -584,6 +1310,17 @@ const addOrder = async (req, res, next) => {
         } = req.body;
         const normalizedPaymentMethod = String(paymentMethod || "Efectivo").trim();
         const isCreditSale = normalizedPaymentMethod === "Credito";
+        if (
+            isCreditSale &&
+            !tenantCanUseAccountsReceivable(tenant)
+        ) {
+            return next(
+                createHttpError(
+                    403,
+                    "PLAN_FEATURE_ACCOUNTS_RECEIVABLE_NOT_ALLOWED"
+                )
+            );
+        }
         const normalizedStatus = normalizeOrderStatus(orderStatus);
         customerDetails.name = customerDetails.name || "";
 
@@ -600,26 +1337,38 @@ const addOrder = async (req, res, next) => {
             const sameTenantTable = await Table.findOne({
                 _id: tableRef,
                 tenantId,
-                $or: [
-                    { clientId: req.clientId },
-                    { clientId: { $exists: false } },
-                    { clientId: "default" },
-                ],
+                ...(req.clientId === "default"
+                    ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }] }
+                    : { clientId: req.clientId }),
             }).select("_id isVirtual virtualType");
 
             if (!sameTenantTable) {
-                return next(createHttpError(403, "TABLE_DOES_NOT_BELONG_TO_TENANT"));
+                return next(createHttpError(403, "TABLE_NOT_IN_SELECTED_BRANCH"));
             }
         }
 
-        const tenant = await Tenant.findOne({ tenantId }).lean();
-        if (!tenant) return next(createHttpError(404, "TENANT_NOT_FOUND"));
+        const features =
+            tenant?.features ||
+            {};
 
-        const features = tenant?.features || {};
-        const taxFeatureEnabled = features?.tax?.enabled !== false;
+        const taxFeatureEnabled =
+            typeof tenant
+                ?.taxConfig
+                ?.enabled ===
+            "boolean"
+                ? tenant
+                    .taxConfig
+                    .enabled
+                : features
+                ?.tax
+                ?.enabled !== false;
         const tipFeatureEnabled = features?.tip?.enabled !== false;
         const discountFeatureEnabled = features?.discount?.enabled !== false;
-        const fiscalFeatureEnabled = tenant?.fiscal?.enabled === true;
+        const fiscalFeatureEnabled =
+            dgiiTenant &&
+            tenant
+                ?.fiscal
+                ?.enabled === true;
 
         const {
             chargeMode,
@@ -656,8 +1405,83 @@ const addOrder = async (req, res, next) => {
             .replace(/^e/, "");
 
         const fiscalRequested =
-            incomingFiscal?.requested === true ||
-            incomingExplicitEcfType === "31";
+            dgiiTenant &&
+            (
+                incomingFiscal
+                    ?.requested === true ||
+
+                incomingExplicitEcfType ===
+                "31"
+            );
+
+        const selectedEcfType = requestedEcfType(incomingFiscal);
+        if (incomingFiscal?.ecfDocumentType && !selectedEcfType)
+            return next(createHttpError(400,"INVALID_ECF_DOCUMENT_TYPE"));
+        if (submitAction === "invoice" && selectedEcfType &&
+            ecfProfileForTenant?.documentTypes?.[`e${selectedEcfType}`]?.enabled !== true)
+            return next(createHttpError(409,`ECF_DOCUMENT_TYPE_NOT_ENABLED_E${selectedEcfType}`));
+        // e-CF ON en la sucursal: Facturar exige E31/E32 explícito.
+        // Nunca confirmar una factura ordinaria silenciosamente sin e-NCF/QR.
+        if (submitAction === "invoice" && ecfEnabledForTenant && !selectedEcfType)
+            return next(createHttpError(400,"ECF_DOCUMENT_TYPE_REQUIRED"));
+        if (selectedEcfType && !ecfEnabledForTenant)
+            return next(createHttpError(403,"BRANCH_ECF_NOT_ENABLED"));
+        // OFF en esta sucursal = NCF legacy (si el contribuyente mantiene rangos NCF
+        // habilitados). No bloquear todas las sucursales secundarias por defecto.
+        if (fiscalRequested && !selectedEcfType && ecfEnabledForTenant)
+            return next(createHttpError(400,"ECF_DOCUMENT_TYPE_REQUIRED"));
+        // No generar NCF legacy si el perfil compartido ya opera en producción e-CF.
+        if (fiscalRequested && !selectedEcfType &&
+            ecfProfileForTenant?.enabled === true &&
+            ecfProfileForTenant?.environment === "dgii_production")
+            return next(createHttpError(403,"LEGACY_NCF_NOT_ALLOWED_IN_ECF_PRODUCTION"));
+
+        const incomingNcfType =
+            String(
+                incomingFiscal
+                    ?.ncfType ||
+                ""
+            )
+                .trim()
+                .toUpperCase();
+
+
+        const hasIncomingDgiiRequest =
+            Boolean(
+                incomingFiscal &&
+                (
+                    incomingFiscal
+                        ?.requested ===
+                    true ||
+
+                    [
+                        "B01",
+                        "B02",
+                    ].includes(
+                        incomingNcfType
+                    ) ||
+
+                    [
+                        "31",
+                        "32",
+                    ].includes(
+                        incomingExplicitEcfType
+                    )
+                )
+            );
+
+
+        if (
+            !dgiiTenant &&
+            hasIncomingDgiiRequest
+        ) {
+            return next(
+                createHttpError(
+                    400,
+                    "DGII_ONLY_AVAILABLE_FOR_DO"
+                )
+            );
+        }
 
         const shouldIssueInternalInvoice = isInvoiceAction || shouldFinalize;
         let assignedInternalInvoice = null;
@@ -672,7 +1496,7 @@ const addOrder = async (req, res, next) => {
 
         let topLevelNcfNumber = null;
 
-        if (!ecfEnabledForTenant && shouldFinalize && fiscalRequested) {
+        if (!ecfEnabledForTenant && shouldIssueInternalInvoice && fiscalRequested) {
             if (!fiscalFeatureEnabled) {
                 return next(createHttpError(400, "FISCAL_NOT_ENABLED_FOR_TENANT"));
             }
@@ -690,8 +1514,7 @@ const addOrder = async (req, res, next) => {
             const emissionPoint =
                 String(tenant?.fiscal?.emissionPoint || "001").trim() || "001";
 
-            const branchName =
-                String(tenant?.fiscal?.branchName || "Principal").trim() || "Principal";
+            const branchName = await getBranchInvoiceName({tenantId,clientId,tenant});
 
             const expiresAtRaw =
                 tenant?.fiscal?.ncfConfig?.[type]?.expiresAt ??
@@ -716,7 +1539,7 @@ const addOrder = async (req, res, next) => {
 
             topLevelNcfNumber = ncfNumber;
         }
-        if (ecfEnabledForTenant && fiscalRequested) {
+        if (ecfEnabledForTenant && selectedEcfType) {
             const requestedEcfType = String(incomingFiscal?.ecfDocumentType || "")
                 .trim()
                 .toLowerCase()
@@ -817,32 +1640,163 @@ const addOrder = async (req, res, next) => {
         if (tip < 0) tip = 0;
 
         // Tax
-        const taxable = round2(Math.max(subtotal - discountAmt, 0));
-        const effectiveTaxRate = taxEnabled
-            ? Number(tenant?.features?.tax?.rate ?? TAX_RATE)
-            : 0;
-        const tax = round2(taxable * effectiveTaxRate);
+        // ======================================================
+// MOTOR DE IMPUESTOS GENÉRICO
+// ======================================================
 
-        const baseBeforeTip = round2(taxable + tax);
-        const totalBeforeTip = round2(baseBeforeTip + deliveryFee);
-        const totalWithTax = round2(totalBeforeTip + tip);
+        const taxResult =
+            calculateOrderTaxes({
+                tenant,
 
-        const { commissionAmount, netTotal } = computeCommission(
-            baseBeforeTip,
-            totalWithTax,
-            rate
-        );
+                items:
+                normItems,
+
+                discountAmount:
+                discountAmt,
+
+                deliveryFee,
+
+                taxesEnabled:
+                taxEnabled,
+            });
+
+        const serviceChargeResult =
+            calculateServiceCharges({
+                tenant,
+                taxResult,
+
+                orderSource:
+                source,
+            });
+
+// Los items que debemos guardar son estos,
+// no los enviados por el navegador.
+        const taxedItems =
+            taxResult.items;
+
+// Compatibilidad:
+// bills.tax sigue siendo el total de impuestos.
+        const tax =
+            taxResult.taxTotal;
+
+// Total sin propina.
+        const totalBeforeTip =
+            round2(
+                taxResult
+                    .totalBeforeTip +
+                serviceChargeResult
+                    .addedTotal
+            );
+
+        const totalWithTax =
+            round2(
+                totalBeforeTip +
+                tip
+            );
+
+// La comisión de PedidosYa/UberEats continúa
+// sin usar la propina.
+//
+// Tampoco cambiamos aquí la política existente
+// respecto al delivery.
+        const commissionBase =
+            taxResult.itemsTotalWithTax;
+
+        const {
+            commissionAmount,
+            netTotal,
+        } =
+            computeCommission(
+                commissionBase,
+                totalWithTax,
+                rate
+            );
 
         // Resolver customer
-        let resolvedCustomerId = null;
+        // ======================================================
+// RESOLVER CUSTOMER
+// ======================================================
+
+        let resolvedCustomerId =
+            null;
+
+
+// ======================================================
+// TAX IDENTITY ENVIADO POR LA ORDEN
+// ======================================================
+
+        const incomingLegacyTaxValue =
+            String(
+                customerDetails
+                    ?.rncCedula ??
+                customerDetails
+                    ?.rnc ??
+                ""
+            ).trim();
+
+
+        const incomingTaxIdentity =
+            normalizeCustomerTaxIdentity(
+                customerDetails
+                    ?.taxIdentity,
+
+                incomingLegacyTaxValue,
+
+                tenant
+                    ?.localization
+                    ?.countryCode ||
+                "DO"
+            );
+
+
+        const incomingDominicanLegacy =
+            getDominicanLegacyCustomerTaxValue(
+                incomingTaxIdentity
+            );
+
 
         let resolvedCustomerDetails = {
-            name: String(customerDetails?.name ?? ""),
-            phone: String(customerDetails?.phone ?? ""),
-            address: String(customerDetails?.address ?? ""),
-            guests: Number(customerDetails?.guests ?? 0),
-            rnc: String(customerDetails?.rnc ?? customerDetails?.rncCedula ?? ""),
-            rncCedula: String(customerDetails?.rncCedula ?? customerDetails?.rnc ?? ""),
+            name:
+                String(
+                    customerDetails
+                        ?.name ??
+                    ""
+                ),
+
+            phone:
+                String(
+                    customerDetails
+                        ?.phone ??
+                    ""
+                ),
+
+            address:
+                String(
+                    customerDetails
+                        ?.address ??
+                    ""
+                ),
+
+            guests:
+                Number(
+                    customerDetails
+                        ?.guests ??
+                    0
+                ),
+
+            taxIdentity:
+            incomingTaxIdentity,
+
+            /*
+             * Compatibilidad DGII.
+             *
+             * Nunca copiamos directamente un EIN/VAT/etc.
+             */
+            rnc:
+            incomingDominicanLegacy,
+
+            rncCedula:
+            incomingDominicanLegacy,
         };
 
         if (customerId) {
@@ -862,25 +1816,66 @@ const addOrder = async (req, res, next) => {
             }
 
             resolvedCustomerId = found._id;
+            const foundTaxIdentity =
+                normalizeCustomerTaxIdentity(
+                    found
+                        ?.taxIdentity,
+
+                    "",
+
+                    tenant
+                        ?.localization
+                        ?.countryCode ||
+                    "DO"
+                );
+
+
+            /*
+             * Si el Customer guardado ya tiene taxIdentity,
+             * esa es nuestra fuente principal.
+             *
+             * Si es un cliente viejo sin taxIdentity,
+             * usamos lo que vino de la orden.
+             */
+            const finalTaxIdentity =
+                foundTaxIdentity ||
+                incomingTaxIdentity;
+
+
+            const finalLegacyTaxValue =
+                getDominicanLegacyCustomerTaxValue(
+                    finalTaxIdentity
+                );
+
+
             resolvedCustomerDetails = {
-                name: found.name || "",
-                phone: found.phone || "",
-                address: found.address || "",
-                guests: Number(customerDetails?.guests ?? 0),
-                rnc: String(
-                    customerDetails?.rnc ??
-                    customerDetails?.rncCedula ??
-                    found?.rnc ??
-                    found?.rncCedula ??
-                    ""
-                ),
-                rncCedula: String(
-                    customerDetails?.rncCedula ??
-                    customerDetails?.rnc ??
-                    found?.rncCedula ??
-                    found?.rnc ??
-                    ""
-                ),
+                name:
+                    found.name ||
+                    "",
+
+                phone:
+                    found.phone ||
+                    "",
+
+                address:
+                    found.address ||
+                    "",
+
+                guests:
+                    Number(
+                        customerDetails
+                            ?.guests ??
+                        0
+                    ),
+
+                taxIdentity:
+                finalTaxIdentity,
+
+                rnc:
+                finalLegacyTaxValue,
+
+                rncCedula:
+                finalLegacyTaxValue,
             };
         }
         const registerId = String(req.body?.registerId || "MAIN")
@@ -894,32 +1889,100 @@ const addOrder = async (req, res, next) => {
 // Esto evita que una E32 mayor o igual a 250,000 sin RNC/Cédula
 // se guarde como Consumidor Final.
         try {
+            if (String(submitAction || "").toLowerCase() === "invoice" && selectedEcfType) {
+                await assertSecondarySandboxIssue({tenantId,clientId});
+                const profileValidation = validateEcfProfile(ecfProfileForTenant);
+                if (!profileValidation.ok) {
+                    const err = createHttpError(409,"ECF_PROFILE_INVALID");
+                    err.errors = profileValidation.errors;
+                    throw err;
+                }
+            }
             assertEcfCanBeIssuedBeforePersist({
-                ecfProfile: ecfProfileForTenant,
+                tenant,
+
+                ecfProfile:
+                ecfProfileForTenant,
+
                 submitAction,
+
                 orderCandidate: {
                     tenantId,
+
                     clientId,
-                    customerDetails: resolvedCustomerDetails,
+
+                    customerDetails:
+                    resolvedCustomerDetails,
+
                     bills: {
+                        // Compatibilidad
                         subtotal,
-                        total: subtotal,
-                        discount: discountAmt,
+
+                        total:
+                        subtotal,
+
+                        discount:
+                        discountAmt,
+
                         taxEnabled,
+
+                        // Total de todos los impuestos.
                         tax,
+
+                        // ==========================================
+                        // NUEVO MOTOR DE IMPUESTOS
+                        // ==========================================
+
+                        taxEngineVersion:
+                        taxResult
+                            .engineVersion,
+
+                        subtotalAfterDiscount:
+                        taxResult
+                            .subtotalAfterDiscount,
+
+                        netAmount:
+                        taxResult
+                            .netAmount,
+
+                        deliveryTaxAmount:
+                        taxResult
+                            .deliveryTaxAmount,
+
+                        taxBreakdown:
+                        taxResult
+                            .taxBreakdown,
+
+                        // ==========================================
+
                         tipEnabled,
+
                         tip,
-                        tipAmount: tip,
+
+                        tipAmount:
+                        tip,
+
                         deliveryFee,
+
                         totalWithTax,
                     },
-                    fiscal: fiscalPayload,
+
+                    fiscal:
+                    fiscalPayload,
                 },
             });
-        } catch (error) {
-            return next(getEcfHttpError(error));
-        }
 
+        } catch (error) {
+            return next(
+                getEcfHttpError(
+                    error
+                )
+            );
+        }
+// Snapshot de sede desde el alcance autenticado; no confundirla con el RNC común.
+        if (shouldIssueInternalInvoice) {
+            fiscalPayload.branchName = await getBranchInvoiceName({tenantId,clientId,tenant});
+        }
 // ✅ Solo asignar número interno si la validación e-CF pasó.
         if (shouldIssueInternalInvoice && !assignedInternalInvoice) {
             assignedInternalInvoice = await allocateInternalSeq({ tenantId });
@@ -951,18 +2014,61 @@ const addOrder = async (req, res, next) => {
             facturaNo: assignedInternalInvoice?.internalNumber || null,
 
             bills: {
+                // Compatibilidad
                 subtotal,
-                total: subtotal,
-                discount: discountAmt,
+
+                total:
+                subtotal,
+
+                discount:
+                discountAmt,
+
                 taxEnabled,
+
+                serviceChargeTotal:
+                serviceChargeResult
+                    .addedTotal,
+
+                serviceChargeBreakdown:
+                serviceChargeResult
+                    .breakdown,
                 tax,
+
+                // ==========================================
+                // MOTOR FISCAL NUEVO
+                // ==========================================
+
+                taxEngineVersion:
+                taxResult.engineVersion,
+
+                subtotalAfterDiscount:
+                taxResult
+                    .subtotalAfterDiscount,
+
+                netAmount:
+                taxResult.netAmount,
+
+                deliveryTaxAmount:
+                taxResult
+                    .deliveryTaxAmount,
+
+                taxBreakdown:
+                taxResult
+                    .taxBreakdown,
+
+                // ==========================================
+
                 tipEnabled,
+
                 tip,
-                tipAmount: tip,
+
+                tipAmount:
+                tip,
+
                 deliveryFee,
+
                 totalWithTax,
             },
-
             fiscal: fiscalPayload,
             ...(topLevelNcfNumber ? { ncfNumber: topLevelNcfNumber } : {}),
 
@@ -972,7 +2078,8 @@ const addOrder = async (req, res, next) => {
             commissionAmount,
             netTotal,
 
-            items: normItems,
+            items:
+            taxedItems,
             paymentMethod: normalizedPaymentMethod,
             registerId,
 
@@ -1011,11 +2118,9 @@ const addOrder = async (req, res, next) => {
                 {
                     _id: tableRef,
                     tenantId,
-                    $or: [
-                        { clientId: req.clientId },
-                        { clientId: { $exists: false } },
-                        { clientId: "default" },
-                    ],
+                    ...(req.clientId === "default"
+                        ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }] }
+                        : { clientId: req.clientId }),
                 },
                 {
                     $set: shouldFreeTable
@@ -1054,6 +2159,7 @@ const addOrder = async (req, res, next) => {
             clientId,
             order: responseOrder,
             submitAction,
+            requestedFiscal: incomingFiscal,
             orderStatus: finalOrderStatus,
         });
 
@@ -1067,13 +2173,10 @@ const addOrder = async (req, res, next) => {
             const isInvoiceActionForEcf =
                 String(submitAction || "").trim().toLowerCase() === "invoice";
 
-            if (ecfEnabledForTenant && isInvoiceActionForEcf) {
-                return next(
-                    createHttpError(
-                        502,
-                        autoEcfResult.message || "AUTO_ECF_ISSUE_FAILED"
-                    )
-                );
+            if (ecfEnabledForTenant && isInvoiceActionForEcf && requestedEcfType(responseOrder?.fiscal)) {
+                return res.status(409).json({success:false,code:"ECF_ISSUE_REQUIRES_RECOVERY",
+                    orderId:String(order._id),message:autoEcfResult.message || "AUTO_ECF_ISSUE_FAILED",
+                    details:autoEcfResult.errors || []});
             }
 
             responseOrder = responseOrder.toObject ? responseOrder.toObject() : responseOrder;
@@ -1131,7 +2234,23 @@ const getOrderById = async (req, res, next) => {
 
         if (!order) return next(createHttpError(404, "Order not found!"));
 
-        res.status(200).json({ success: true, data: order });
+        // La emisión e-CF se conserva en ElectronicTaxDocument, no en Order.
+        // Adjuntar SOLO el comprobante aceptado de esta orden, tenant y sucursal;
+        // no modificar Order ni crear secuencias al consultar/imprimir.
+        const tenantId = req.tenantId || req.user?.tenantId;
+        const clientId = req.clientId || "default";
+        const document = await ElectronicTaxDocument.findOne(
+            buildEcfDocumentScope({ orderId: order._id, tenantId, clientId })
+        )
+            .select("ecf.documentType ecf.eNCF ecf.status ecf.trackId ecf.securityCode ecf.qrUrl ecf.fechaHoraFirma")
+            .sort({ createdAt: -1 })
+            .lean();
+
+        const orderForInvoice = order.toObject();
+        const ecf = mapEcfForInvoice(document);
+        if (ecf) orderForInvoice.ecf = ecf;
+
+        res.status(200).json({ success: true, data: orderForInvoice });
     } catch (error) {
         next(error);
     }
@@ -1177,15 +2296,16 @@ const getOrders = async (req, res, next) => {
             500
         );
 
-        const clientScope = {
-            $or: [
-                { clientId },
+        // No incluir ventas de la sucursal principal al consultar otra sede.
+        // Los registros sin clientId solo son compatibles con la sede legacy default.
+        const clientScope = clientId === "default"
+            ? { $or: [
                 { clientId: "default" },
                 { clientId: { $exists: false } },
                 { clientId: null },
                 { clientId: "" },
-            ],
-        };
+            ] }
+            : { clientId };
 
         const query = {
             tenantId,
@@ -1297,6 +2417,27 @@ const deleteOrder = async (req, res, next) => {
                 message: "Order already removed or not found",
             });
         }
+        const hasFinancialHistory =
+            Boolean(
+                order.invoiceNumber ||
+                order.facturaNo ||
+                order.invoicedAt ||
+                order.accountReceivableId ||
+                order.ncfNumber ||
+                order?.fiscal?.ncfNumber ||
+                order?.fiscal?.internalNumber ||
+                order.paymentStatus === "Pagado" ||
+                order.paymentMethod === "Credito"
+            );
+
+        if (hasFinancialHistory) {
+            return next(
+                createHttpError(
+                    409,
+                    "FINANCIAL_ORDER_CANNOT_BE_DELETED_USE_CANCEL_OR_VOID"
+                )
+            );
+        }
         await assertCanCancelOrder(req, req.user.tenantId);
 
         // Si la orden tiene mesa asignada, liberar la mesa
@@ -1362,6 +2503,22 @@ async function allocateNCF({ tenantId, ncfType }) {
     const tenant = await Tenant.findOneAndUpdate(
         {
             tenantId,
+            $or: [
+                {
+                    "localization.countryCode":
+                        "DO",
+                },
+
+                /*
+                 * Compatibilidad tenants antiguos
+                 */
+                {
+                    "localization.countryCode": {
+                        $exists:
+                            false,
+                    },
+                },
+            ],
             "fiscal.enabled": true,
             [activePath]: true,
             $expr: { $lte: [`$${currentPath}`, `$${maxPath}`] },
@@ -1535,6 +2692,35 @@ function onlyDigits(value = "") {
     return String(value || "").replace(/\D/g, "");
 }
 
+// ======================================================
+// DGII SOLO REPÚBLICA DOMINICANA
+// ======================================================
+
+function tenantUsesDgii(
+    tenant = {}
+) {
+    const countryCode =
+        String(
+            tenant
+                ?.localization
+                ?.countryCode ||
+            "DO"
+        )
+            .trim()
+            .toUpperCase();
+
+
+    /*
+     * Default DO conserva compatibilidad
+     * con tenants antiguos que todavía
+     * no tienen localization.
+     */
+    return (
+        countryCode ===
+        "DO"
+    );
+}
+
 function determineEcfDocumentTypeForOrder(order) {
     const rnc = onlyDigits(order?.customerDetails?.rnc);
     const rncCedula = onlyDigits(order?.customerDetails?.rncCedula);
@@ -1584,25 +2770,48 @@ function determineEcfDocumentTypeForOrder(order) {
 
     return "32";
 }
+async function getBranchInvoiceName({tenantId,clientId,tenant}) {
+    if (String(clientId || "default") === "default")
+        return String(tenant?.fiscal?.branchName || "Principal").trim() || "Principal";
+    const branch = await Client.findOne({tenantId,clientId}).select("name").lean();
+    if (!branch) throw createHttpError(403,"BRANCH_NOT_FOUND");
+    return String(branch.name || "Sucursal").trim();
+}
+function requestedEcfType(fiscal) {
+    const type = String(fiscal?.ecfDocumentType || "").trim().toLowerCase().replace(/^e/, "");
+    return ["31","32"].includes(type) ? type : null;
+}
 function shouldAutoIssueEcfNow({
                                    ecfProfile,
                                    submitAction,
+                                   fiscal,
                                }) {
-    if (ecfProfile?.enabled !== true) return false;
-
-    const isInvoiceAction =
-        String(submitAction || "").trim().toLowerCase() === "invoice";
-
-    return isInvoiceAction;
+    return ecfProfile?.enabled === true &&
+        String(submitAction || "").trim().toLowerCase() === "invoice" &&
+        Boolean(requestedEcfType(fiscal));
 }
 function assertEcfCanBeIssuedBeforePersist({
+                                               tenant,
                                                ecfProfile,
                                                submitAction,
                                                orderCandidate,
                                            }) {
+
+    if (
+        !tenantUsesDgii(
+            tenant
+        )
+    ) {
+        return;
+    }
+    // Fase 12.3: una configuración fiscal desactivada nunca dispara emisión automática.
+    if (tenant?.fiscal?.enabled !== true ||
+        tenant?.features?.fiscal?.enabled === false ||
+        getPlanFeatures(normalizePlan(tenant?.plan)).fiscal !== true) return;
     const shouldIssue = shouldAutoIssueEcfNow({
         ecfProfile,
         submitAction,
+        fiscal: orderCandidate?.fiscal,
     });
 
     if (!shouldIssue) return;
@@ -1622,28 +2831,26 @@ async function autoIssueEcfForOrderIfNeeded({
                                                 clientId,
                                                 order,
                                                 submitAction,
+                                                requestedFiscal,
                                                 orderStatus,
                                             }) {
     try {
         if (!order?._id) return null;
+        if (!tenantUsesDgii(tenant) || tenant?.fiscal?.enabled !== true ||
+            tenant?.features?.fiscal?.enabled === false ||
+            getPlanFeatures(normalizePlan(tenant?.plan)).fiscal !== true) return null;
 
-        const ecfProfile = await TenantEcfProfile.findOne({
-            tenantId,
-            $or: [
-                { clientId },
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ],
-        });
+        const ecfProfile = await TenantEcfProfile.findOne({tenantId});
 
 
         const shouldIssue = shouldAutoIssueEcfNow({
             ecfProfile,
             submitAction,
+            fiscal: requestedFiscal,
         });
-
         if (!shouldIssue) return null;
-
+        // This is checked again inside issueOrderAsEcfCore, not just at route level.
+        await assertSecondarySandboxIssue({tenantId,clientId});
         const documentType = determineEcfDocumentTypeForOrder(order);
 
         const result = await issueOrderAsEcfCore({
@@ -1676,12 +2883,13 @@ async function syncInventoryForOrderTiming({
                                                orderStatus,
                                                isInvoiceAction,
                                                userId,
+                                               session = null,
                                            }) {
     const normalizedStatus = normalizeOrderStatus(orderStatus);
 
     if (normalizedStatus === "Cancelado") {
         const restored = await restoreInventoryForOrder(orderId, {
-            userId: userId || null,
+            userId: userId || null, session,
         });
 
         return {
@@ -1698,7 +2906,7 @@ async function syncInventoryForOrderTiming({
         })
     ) {
         const deducted = await deductInventoryForOrder(orderId, {
-            userId: userId || null,
+            userId: userId || null, session,
         });
 
         return {
@@ -1740,26 +2948,70 @@ const updateOrder = async (req, res, next) => {
         // ✅ Traer settings del tenant al inicio
         const tenant = await Tenant.findOne({ tenantId }).lean();
         if (!tenant) return next(createHttpError(404, "TENANT_NOT_FOUND"));
+        // ======================================================
+// DGII SOLO REPÚBLICA DOMINICANA
+// ======================================================
 
-        const features = tenant?.features || {};
-        const taxFeatureEnabled = features?.tax?.enabled !== false; // default true
+        const dgiiTenant =
+            tenantUsesDgii(
+                tenant
+            );
+
+        const features =
+            tenant?.features ||
+            {};
+
+        const taxFeatureEnabled =
+            typeof tenant
+                ?.taxConfig
+                ?.enabled ===
+            "boolean"
+                ? tenant
+                    .taxConfig
+                    .enabled
+                : features
+                    ?.tax
+                    ?.enabled !==
+                false;
         const discountFeatureEnabled = features?.discount?.enabled !== false; // default true
         const tipFeatureEnabled = features?.tip?.enabled !== false; // default true
 
         // ✅ fiscalFeatureEnabled viene del tenant.fiscal.enabled
-        const fiscalFeatureEnabled = tenant?.fiscal?.enabled === true;
+        const fiscalFeatureEnabled =
+            dgiiTenant &&
+            tenant
+                ?.fiscal
+                ?.enabled === true;
 
         // Helper: compatibilidad con docs viejos (sin clientId)
         const orderScope = {
             _id: id,
             tenantId,
-            $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+            ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
         };
 
 // ✅ Primero buscamos la orden actual.
 // IMPORTANTE: current debe existir antes de leer current.items, current.paymentMethod, etc.
         const current = await Order.findOne(orderScope);
         if (!current) return next(createHttpError(404, "Order not found!"));
+
+        // Validar la mesa ANTES de modificar la orden o reservar NCF/e-NCF.
+        if (Object.prototype.hasOwnProperty.call(req.body || {}, "table") &&
+            req.body.table !== null && req.body.table !== "") {
+            const requestedTableId = String(req.body.table?._id || req.body.table);
+            if (!mongoose.Types.ObjectId.isValid(requestedTableId))
+                return next(createHttpError(400, "INVALID_TABLE_ID"));
+            const sameBranchTable = await Table.findOne({
+                _id: requestedTableId, tenantId,
+                ...(clientId === "default"
+                    ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }] }
+                    : { clientId }),
+            }).select("_id");
+            if (!sameBranchTable)
+                return next(createHttpError(403, "TABLE_NOT_IN_SELECTED_BRANCH"));
+        }
 
         const incomingItemsForOperation = Array.isArray(req.body?.items)
             ? req.body.items
@@ -1784,16 +3036,25 @@ const updateOrder = async (req, res, next) => {
         ).trim();
 
         const isCreditSale = normalizedIncomingPaymentMethod === "Credito";
-        const ecfProfileForTenant = await TenantEcfProfile.findOne({
-            tenantId,
-            $or: [
-                { clientId },
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ],
-        }).lean();
-
-        const ecfEnabledForTenant = ecfProfileForTenant?.enabled === true;
+        if (
+            isCreditSale &&
+            !tenantCanUseAccountsReceivable(tenant)
+        ) {
+            return next(
+                createHttpError(
+                    403,
+                    "PLAN_FEATURE_ACCOUNTS_RECEIVABLE_NOT_ALLOWED"
+                )
+            );
+        }
+        const ecfProfileForTenant = await TenantEcfProfile.findOne({tenantId}).lean();
+        const branchEcfState = await getBranchEcfStatus({tenantId,clientId});
+        const ecfEnabledForTenant = branchEcfState.prepared &&
+            (!branchEcfState.secondary || ecfProfileForTenant?.environment === "internal_sandbox") &&
+            dgiiTenant && tenant.fiscal?.enabled === true &&
+            tenant.features?.fiscal?.enabled !== false &&
+            getPlanFeatures(normalizePlan(tenant.plan)).fiscal === true &&
+            ecfProfileForTenant?.enabled === true;
         const submitAction = String(req.body?.submitAction || "").trim().toLowerCase();
 
         const requestedStatusRaw = normalizeOrderStatus(
@@ -1821,11 +3082,84 @@ const updateOrder = async (req, res, next) => {
             .toLowerCase()
             .replace(/^e/, "");
 
-        const fiscalRequested =
-            req.body?.fiscal?.requested === true ||
-            current?.fiscal?.requested === true ||
-            incomingExplicitEcfType === "31" ||
-            currentExplicitEcfType === "31";
+        const incomingNcfType =
+            String(
+                req.body
+                    ?.fiscal
+                    ?.ncfType ||
+                ""
+            )
+                .trim()
+                .toUpperCase();
+
+
+        const hasIncomingDgiiRequest =
+            Boolean(
+                req.body?.fiscal &&
+                (
+                    req.body
+                        .fiscal
+                        .requested ===
+                    true ||
+
+                    [
+                        "B01",
+                        "B02",
+                    ].includes(
+                        incomingNcfType
+                    ) ||
+
+                    [
+                        "31",
+                        "32",
+                    ].includes(
+                        incomingExplicitEcfType
+                    )
+                )
+            );
+
+
+        if (
+            !dgiiTenant &&
+            hasIncomingDgiiRequest
+        ) {
+            return next(
+                createHttpError(
+                    400,
+                    "DGII_ONLY_AVAILABLE_FOR_DO"
+                )
+            );
+        }
+
+
+// Una orden vieja puede conservar datos fiscales,
+// pero solamente RD puede generar/reprocesar DGII.
+        const fiscalRequested = dgiiTenant && (
+            req.body?.fiscal != null
+                // Explicit choice for THIS checkout wins over previous draft.
+                ? (req.body.fiscal.requested === true || incomingExplicitEcfType === "31")
+                : (current?.fiscal?.requested === true || currentExplicitEcfType === "31")
+        );
+
+        const selectedEcfType = requestedEcfType(req.body?.fiscal);
+        if (req.body?.fiscal?.ecfDocumentType && !selectedEcfType)
+            return next(createHttpError(400,"INVALID_ECF_DOCUMENT_TYPE"));
+        if (submitAction === "invoice" && selectedEcfType &&
+            ecfProfileForTenant?.documentTypes?.[`e${selectedEcfType}`]?.enabled !== true)
+            return next(createHttpError(409,`ECF_DOCUMENT_TYPE_NOT_ENABLED_E${selectedEcfType}`));
+        if (submitAction === "invoice" && ecfEnabledForTenant && !selectedEcfType)
+            return next(createHttpError(400,"ECF_DOCUMENT_TYPE_REQUIRED"));
+        if (selectedEcfType && !ecfEnabledForTenant)
+            return next(createHttpError(403,"BRANCH_ECF_NOT_ENABLED"));
+        // OFF en esta sucursal = NCF legacy (si el contribuyente mantiene rangos NCF
+        // habilitados). No bloquear todas las sucursales secundarias por defecto.
+        if (fiscalRequested && !selectedEcfType && ecfEnabledForTenant)
+            return next(createHttpError(400,"ECF_DOCUMENT_TYPE_REQUIRED"));
+        // No generar NCF legacy si el perfil compartido ya opera en producción e-CF.
+        if (fiscalRequested && !selectedEcfType &&
+            ecfProfileForTenant?.enabled === true &&
+            ecfProfileForTenant?.environment === "dgii_production")
+            return next(createHttpError(403,"LEGACY_NCF_NOT_ALLOWED_IN_ECF_PRODUCTION"));
 
         const shouldIssueInternalInvoice = isInvoiceAction || shouldFinalize;
         const prevStatus = current.orderStatus;
@@ -1900,6 +3234,68 @@ const updateOrder = async (req, res, next) => {
                 ...(fiscalSafeFromClient || {}),
             },
         };
+        if (submitAction === "invoice" && !selectedEcfType &&
+            !current?.fiscal?.ncfNumber && !current?.ncfNumber) {
+            // El cajero apagó el interruptor e-CF para esta factura. No reutilizar
+            // la intención e31/e32 de un borrador previo.
+            safeUpdate.fiscal.ecfDocumentType = null;
+            safeUpdate.fiscal.requested = req.body?.fiscal?.requested === true;
+            safeUpdate.fiscal.ncfType = safeUpdate.fiscal.requested
+                ? (req.body?.fiscal?.ncfType || "B02") : null;
+        }
+        // ======================================================
+// NORMALIZAR IDENTIDAD FISCAL DEL SNAPSHOT
+// ======================================================
+
+        const safeLegacyTaxValue =
+            String(
+                safeUpdate
+                    ?.customerDetails
+                    ?.rncCedula ??
+                safeUpdate
+                    ?.customerDetails
+                    ?.rnc ??
+                ""
+            ).trim();
+
+
+        const safeTaxIdentity =
+            normalizeCustomerTaxIdentity(
+                safeUpdate
+                    ?.customerDetails
+                    ?.taxIdentity,
+
+                safeLegacyTaxValue,
+
+                tenant
+                    ?.localization
+                    ?.countryCode ||
+                "DO"
+            );
+
+
+        const safeDominicanLegacy =
+            getDominicanLegacyCustomerTaxValue(
+                safeTaxIdentity
+            );
+
+
+        safeUpdate.customerDetails = {
+            ...(
+                safeUpdate
+                    .customerDetails ||
+                {}
+            ),
+
+            taxIdentity:
+            safeTaxIdentity,
+
+            rnc:
+            safeDominicanLegacy,
+
+            rncCedula:
+            safeDominicanLegacy,
+        };
         if (assignedOperation) {
             safeUpdate.operationSeq = assignedOperation.operationSeq;
             safeUpdate.operationNumber = assignedOperation.operationNumber;
@@ -1925,11 +3321,76 @@ const updateOrder = async (req, res, next) => {
 
             nextCustomerId = foundCustomer._id;
 
+            const storedCustomerTaxIdentity =
+                normalizeCustomerTaxIdentity(
+                    foundCustomer
+                        ?.taxIdentity,
+
+                    "",
+
+                    tenant
+                        ?.localization
+                        ?.countryCode ||
+                    "DO"
+                );
+
+
+            /*
+             * Cliente persistente tiene prioridad.
+             *
+             * Si todavía es un Customer legacy,
+             * conservamos el snapshot que ya teníamos.
+             */
+            const finalCustomerTaxIdentity =
+                storedCustomerTaxIdentity ||
+                safeUpdate
+                    ?.customerDetails
+                    ?.taxIdentity ||
+                null;
+
+
+            const finalCustomerLegacyTaxValue =
+                getDominicanLegacyCustomerTaxValue(
+                    finalCustomerTaxIdentity
+                );
+
+
             safeUpdate.customerDetails = {
-                ...(safeUpdate.customerDetails || {}),
-                name: foundCustomer.name || safeUpdate.customerDetails?.name || "",
-                phone: foundCustomer.phone || safeUpdate.customerDetails?.phone || "",
-                address: foundCustomer.address || safeUpdate.customerDetails?.address || "",
+                ...(
+                    safeUpdate
+                        .customerDetails ||
+                    {}
+                ),
+
+                name:
+                    foundCustomer.name ||
+                    safeUpdate
+                        .customerDetails
+                        ?.name ||
+                    "",
+
+                phone:
+                    foundCustomer.phone ||
+                    safeUpdate
+                        .customerDetails
+                        ?.phone ||
+                    "",
+
+                address:
+                    foundCustomer.address ||
+                    safeUpdate
+                        .customerDetails
+                        ?.address ||
+                    "",
+
+                taxIdentity:
+                finalCustomerTaxIdentity,
+
+                rnc:
+                finalCustomerLegacyTaxValue,
+
+                rncCedula:
+                finalCustomerLegacyTaxValue,
             };
         }
 
@@ -1955,7 +3416,7 @@ const updateOrder = async (req, res, next) => {
         });
         const alreadyHasNCF = current?.fiscal?.ncfNumber || current?.ncfNumber;
 
-        if (!ecfEnabledForTenant && shouldFinalize && fiscalFeatureEnabled && fiscalRequested && !alreadyHasNCF) {
+        if (!ecfEnabledForTenant && shouldIssueInternalInvoice && fiscalFeatureEnabled && fiscalRequested && !alreadyHasNCF) {
             const requestedType = incomingFiscal?.ncfType || current?.fiscal?.ncfType || "B02";
 
             const { type, ncfNumber } = await allocateNCF({
@@ -1968,8 +3429,7 @@ const updateOrder = async (req, res, next) => {
             const emissionPoint =
                 String(tenant?.fiscal?.emissionPoint || "001").trim() || "001";
 
-            const branchName =
-                String(tenant?.fiscal?.branchName || "Principal").trim() || "Principal";
+            const branchName = await getBranchInvoiceName({tenantId,clientId,tenant});
 
             const expiresAtRaw =
                 tenant?.fiscal?.ncfConfig?.[type]?.expiresAt ??
@@ -1999,7 +3459,7 @@ const updateOrder = async (req, res, next) => {
 
             safeUpdate.invoiceNumber = internalNumber;
             safeUpdate.facturaNo = internalNumber;
-        }else if (!ecfEnabledForTenant && shouldFinalize && fiscalFeatureEnabled && fiscalRequested && alreadyHasNCF) {
+        }else if (!ecfEnabledForTenant && shouldIssueInternalInvoice && fiscalFeatureEnabled && fiscalRequested && alreadyHasNCF) {
             // Backfill por si la orden vieja tiene NCF pero le faltan campos
             const existingNcfNumber = String(
                 current?.fiscal?.ncfNumber ||
@@ -2047,8 +3507,7 @@ const updateOrder = async (req, res, next) => {
                     null,
                 branchName:
                     safeUpdate.fiscal.branchName ||
-                    String(tenant?.fiscal?.branchName || "Principal").trim() ||
-                    "Principal",
+                    await getBranchInvoiceName({tenantId,clientId,tenant}),
                 emissionPoint:
                     safeUpdate.fiscal.emissionPoint ||
                     String(tenant?.fiscal?.emissionPoint || "001").trim() ||
@@ -2063,7 +3522,7 @@ const updateOrder = async (req, res, next) => {
             getExistingInternalInvoiceNumber(current) ||
             getExistingInternalInvoiceNumber(safeUpdate);
 
-        if (ecfEnabledForTenant && fiscalRequested) {
+        if (ecfEnabledForTenant && selectedEcfType) {
             const preservedEcfDocumentType = String(
                 incomingFiscal?.ecfDocumentType ||
                 safeUpdate?.fiscal?.ecfDocumentType ||
@@ -2161,53 +3620,233 @@ const updateOrder = async (req, res, next) => {
         subtotal = round2(subtotal);
         discount = round2(discount);
 
-        taxEnabled = taxFeatureEnabled ? taxEnabled : false;
+        taxEnabled =
+            taxFeatureEnabled
+                ? taxEnabled
+                : false;
 
-        const taxable = round2(Math.max(subtotal - discount, 0));
-        const effectiveTaxRate = taxEnabled
-            ? Number(tenant?.features?.tax?.rate ?? TAX_RATE)
-            : 0;
-        const tax = round2(taxable * effectiveTaxRate);
 
-// Tip enabled
+// ======================================================
+// PROPINA
+// ======================================================
+
         let tipEnabled;
-        if (incomingBills.tipEnabled !== undefined) {
-            tipEnabled = Boolean(incomingBills.tipEnabled);
-        } else if (safeUpdate.bills.tipEnabled !== undefined) {
-            tipEnabled = Boolean(safeUpdate.bills.tipEnabled);
-        } else if (incomingBills.tipAmount !== undefined) {
-            tipEnabled = Number(incomingBills.tipAmount) > 0;
-        } else if (incomingBills.tip !== undefined) {
-            tipEnabled = Number(incomingBills.tip) > 0;
-        } else if (safeUpdate.bills.tipAmount !== undefined) {
-            tipEnabled = Number(safeUpdate.bills.tipAmount) > 0;
-        } else if (safeUpdate.bills.tip !== undefined) {
-            tipEnabled = Number(safeUpdate.bills.tip) > 0;
+
+        if (
+            incomingBills.tipEnabled !==
+            undefined
+        ) {
+            tipEnabled =
+                Boolean(
+                    incomingBills.tipEnabled
+                );
+        } else if (
+            safeUpdate.bills.tipEnabled !==
+            undefined
+        ) {
+            tipEnabled =
+                Boolean(
+                    safeUpdate
+                        .bills
+                        .tipEnabled
+                );
+        } else if (
+            incomingBills.tipAmount !==
+            undefined
+        ) {
+            tipEnabled =
+                Number(
+                    incomingBills.tipAmount
+                ) > 0;
+        } else if (
+            incomingBills.tip !==
+            undefined
+        ) {
+            tipEnabled =
+                Number(
+                    incomingBills.tip
+                ) > 0;
+        } else if (
+            safeUpdate.bills.tipAmount !==
+            undefined
+        ) {
+            tipEnabled =
+                Number(
+                    safeUpdate
+                        .bills
+                        .tipAmount
+                ) > 0;
+        } else if (
+            safeUpdate.bills.tip !==
+            undefined
+        ) {
+            tipEnabled =
+                Number(
+                    safeUpdate
+                        .bills
+                        .tip
+                ) > 0;
         } else {
-            tipEnabled = tipFeatureEnabled;
+            tipEnabled =
+                tipFeatureEnabled;
         }
 
-        tipEnabled = tipFeatureEnabled ? tipEnabled : false;
+        tipEnabled =
+            tipFeatureEnabled
+                ? tipEnabled
+                : false;
 
-// Tip
+
+// ======================================================
+// MONTO DE PROPINA
+// ======================================================
+
         let tip = 0;
+
         if (tipEnabled) {
-            if (incomingBills.tipAmount !== undefined) {
-                tip = Number(incomingBills.tipAmount);
-            } else if (incomingBills.tip !== undefined) {
-                tip = Number(incomingBills.tip);
-            } else if (safeUpdate.bills.tipAmount !== undefined) {
-                tip = Number(safeUpdate.bills.tipAmount);
-            } else if (safeUpdate.bills.tip !== undefined) {
-                tip = Number(safeUpdate.bills.tip);
+            if (
+                incomingBills.tipAmount !==
+                undefined
+            ) {
+                tip =
+                    Number(
+                        incomingBills.tipAmount
+                    );
+            } else if (
+                incomingBills.tip !==
+                undefined
+            ) {
+                tip =
+                    Number(
+                        incomingBills.tip
+                    );
+            } else if (
+                safeUpdate.bills.tipAmount !==
+                undefined
+            ) {
+                tip =
+                    Number(
+                        safeUpdate
+                            .bills
+                            .tipAmount
+                    );
+            } else if (
+                safeUpdate.bills.tip !==
+                undefined
+            ) {
+                tip =
+                    Number(
+                        safeUpdate
+                            .bills
+                            .tip
+                    );
             }
         }
-        tip = round2(tip);
-        if (tip < 0) tip = 0;
 
-        const baseBeforeTip = round2(taxable + tax);
-        const totalBeforeTip = round2(baseBeforeTip + deliveryFee);
-        const totalWithTax = round2(totalBeforeTip + tip);
+        tip = round2(tip);
+
+        if (tip < 0) {
+            tip = 0;
+        }
+
+
+// ======================================================
+// MOTOR DE IMPUESTOS GENÉRICO
+// ======================================================
+//
+// Aquí reemplazamos completamente:
+// - taxable
+// - effectiveTaxRate
+// - TAX_RATE
+//
+// El servidor calcula ahora cada producto utilizando
+// taxId + taxIncludedOverride.
+// ======================================================
+
+        const itemsForTaxCalculation =
+            Array.isArray(
+                safeUpdate.items
+            )
+                ? safeUpdate.items.map(
+                    (item) =>
+                        item?.toObject
+                            ? item.toObject()
+                            : item
+                )
+                : [];
+
+        const taxResult =
+            calculateOrderTaxes({
+                tenant,
+
+                items:
+                itemsForTaxCalculation,
+
+                discountAmount:
+                discount,
+
+                deliveryFee,
+
+                taxesEnabled:
+                taxEnabled,
+            });
+        const serviceChargeResult =
+            calculateServiceCharges({
+                tenant,
+                taxResult,
+
+                orderSource:
+                    normalizeSource(
+                        req.body
+                            ?.orderSource ??
+                        current
+                            ?.orderSource ??
+                        "DINE_IN"
+                    ),
+            });
+
+
+// Los items guardados deben ser los que devolvió
+// el motor, porque contienen taxSnapshot.
+        safeUpdate.items =
+            taxResult.items;
+
+
+// Reutilizamos exactamente los valores
+// calculados por el motor.
+        subtotal =
+            taxResult.subtotal;
+
+        discount =
+            taxResult.discount;
+
+
+// Total de todos los impuestos.
+        const tax =
+            taxResult.taxTotal;
+
+
+        const totalBeforeTip =
+            round2(
+                taxResult
+                    .totalBeforeTip +
+                serviceChargeResult
+                    .addedTotal
+            );
+
+        const totalWithTax =
+            round2(
+                totalBeforeTip +
+                tip
+            );
+
+
+// Base utilizada actualmente para
+// comisión PedidoYa / UberEats.
+//
+// No incluye propina.
+        const baseBeforeTip =
+            taxResult.itemsTotalWithTax;
 
 // =========================
 // CANAL / COMISION
@@ -2246,31 +3885,98 @@ const updateOrder = async (req, res, next) => {
 
         safeUpdate.bills = {
             ...safeUpdate.bills,
+
+            // Compatibilidad
             subtotal,
-            total: subtotal,
+            serviceChargeTotal:
+            serviceChargeResult
+                .addedTotal,
+
+            serviceChargeBreakdown:
+            serviceChargeResult
+                .breakdown,
+
+            total:
+            subtotal,
+
             discount,
+
             taxEnabled,
+
             tax,
+
+            // ==========================================
+            // MOTOR FISCAL NUEVO
+            // ==========================================
+
+            taxEngineVersion:
+            taxResult.engineVersion,
+
+            subtotalAfterDiscount:
+            taxResult
+                .subtotalAfterDiscount,
+
+            netAmount:
+            taxResult.netAmount,
+
+            deliveryTaxAmount:
+            taxResult
+                .deliveryTaxAmount,
+
+            taxBreakdown:
+            taxResult
+                .taxBreakdown,
+
+            // ==========================================
+
             tipEnabled,
-            tipAmount: tip,
+
+            tipAmount:
             tip,
+
+            tip,
+
             deliveryFee,
+
             totalWithTax,
         };
-
         // ✅ AUTO-DELETE SOLO SI items: [] fue enviado explícitamente
         const incomingItems = req.body.items;
         const isClearingItems = Array.isArray(incomingItems) && incomingItems.length === 0;
-        const deletableStatuses = ["En Progreso", "Cancelado"];
+        const deletableStatuses = [
+            "En Progreso",
+            "Cancelado",
+        ];
 
-        if (isClearingItems && deletableStatuses.includes(current.orderStatus)) {
+        const hasFinancialHistory =
+            Boolean(
+                current.invoiceNumber ||
+                current.facturaNo ||
+                current.invoicedAt ||
+                current.accountReceivableId ||
+                current.ncfNumber ||
+                current?.fiscal?.ncfNumber ||
+                current?.fiscal?.internalNumber ||
+                current.paymentStatus === "Pagado" ||
+                current.paymentMethod === "Credito"
+            );
+
+        if (
+            isClearingItems &&
+            deletableStatuses.includes(
+                current.orderStatus
+            ) &&
+            !hasFinancialHistory
+        ) {
             if (current.table) {
                 const tableId = current.table?._id ? current.table._id : current.table;
                 await Table.findOneAndUpdate(
                     {
                         _id: tableId,
                         tenantId,
-                        $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                        ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
                     },
                     { status: "Disponible", currentOrder: null }
                 );
@@ -2329,11 +4035,21 @@ const updateOrder = async (req, res, next) => {
 // ✅ Validar e-CF ANTES de actualizar/cerrar la orden.
 // Si falla, no se marca como pagada, no se completa y no se muestra factura.
         try {
+            if (submitAction === "invoice" && selectedEcfType) {
+                await assertSecondarySandboxIssue({tenantId,clientId});
+                const profileValidation = validateEcfProfile(ecfProfileForTenant);
+                if (!profileValidation.ok) {
+                    const err = createHttpError(409,"ECF_PROFILE_INVALID");
+                    err.errors = profileValidation.errors;
+                    throw err;
+                }
+            }
             const currentPlain = current?.toObject ? current.toObject() : current;
 
             assertEcfCanBeIssuedBeforePersist({
                 ecfProfile: ecfProfileForTenant,
                 submitAction,
+                tenant,
                 orderCandidate: {
                     ...currentPlain,
                     ...safeUpdate,
@@ -2361,11 +4077,42 @@ const updateOrder = async (req, res, next) => {
             safeUpdate.facturaNo = internalNumber;
         }
 
-// ✅ Update
-        let order = await Order.findOneAndUpdate(orderScope, safeUpdate, { new: true })
-
+// Conservar sucursal de la orden (no la etiqueta global Principal).
+        if (shouldIssueInternalInvoice) {
+            safeUpdate.fiscal = {...(safeUpdate.fiscal || {}),
+                branchName: await getBranchInvoiceName({tenantId,clientId,tenant})};
+        }
+// CONTROL 4: estado/pago e inventario se confirman en una misma transacción.
+        // Sin soporte transaccional o con falta de stock, todo revierte y se envía error.
+        // No se recalculan pagos, partidas ni impuestos en cambios de estado pagados.
+        const paidStatusOnly = current.paymentStatus === "Pagado" && !isInvoiceAction &&
+            Object.keys(req.body || {}).every(key => [
+                "orderStatus", "statusHistory", "lastStatusChangeAt", "registerId"
+            ].includes(key));
+        if (paidStatusOnly &&
+            Object.prototype.hasOwnProperty.call(req.body || {}, "registerId") &&
+            incomingRegisterId !== String(current.registerId || "MAIN").trim().toUpperCase()) {
+            return next(createHttpError(409, "PAID_ORDER_REGISTER_CHANGE_REQUIRES_AUDIT"));
+        }
+        if (paidStatusOnly) {
+            const statePatch = { orderStatus: incomingStatus };
+            if (incomingStatus === "Cancelado") statePatch.paymentStatus = "Anulado";
+            for (const field of Object.keys(safeUpdate)) delete safeUpdate[field];
+            Object.assign(safeUpdate, statePatch);
+        }
+        const mustSyncInventory = incomingStatus === "Cancelado" ||
+            shouldDeductInventoryNow({ tenant, orderStatus: incomingStatus, isInvoiceAction });
+        await persistOrderWithInventory({
+            mongoose, Order, orderScope, safeUpdate, mustSyncInventory,
+            syncInventory: ({ session, orderId }) => syncInventoryForOrderTiming({
+                orderId, tenant, orderStatus: incomingStatus, isInvoiceAction,
+                userId: req.user?._id || null, session,
+            }),
+        });
+        let order = await Order.findOne(orderScope)
             .populate("table", "tableNo status")
             .populate("user", "name email role");
+        if (!order) throw createHttpError(500, "ORDER_NOT_FOUND_AFTER_COMMIT");
 
 
         // Si antes no tenía items y ahora sí tiene, ocupar la mesa
@@ -2379,7 +4126,9 @@ const updateOrder = async (req, res, next) => {
                 {
                     _id: tableId,
                     tenantId,
-                    $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                    ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
                 },
                 { status: "Ocupada", currentOrder: order._id }
             );
@@ -2388,7 +4137,8 @@ const updateOrder = async (req, res, next) => {
         // ✅ Si se completó => generar PDF (no rompe la respuesta)
         // ✅ Si se completó => descontar inventario (idempotente) + generar PDF
         // ✅ Congelar snapshot de items para reportes (category, unitCost, taxAmount)
-        try {
+        // Orden pagada + cambio de estado no debe alterar importes ni snapshots fiscales.
+        if (!paidStatusOnly) try {
             const Dish = require("../models/dish"); // ya lo tienes
             const InventoryCategory = require("../models/inventoryCategoryModel"); // 👈 este es tu model
 
@@ -2408,7 +4158,9 @@ const updateOrder = async (req, res, next) => {
                 ? await InventoryCategory.find({
                     _id: { $in: invCatIds },
                     tenantId,
-                    $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                    ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
                 })
                     .select("_id name")
                     .lean()
@@ -2440,8 +4192,7 @@ const updateOrder = async (req, res, next) => {
             );
 
             // 4) Impuestos: prorratear con base real = sum(items.price)
-            const taxTotal = Number(order?.bills?.tax || 0);
-            const baseTotal = items.reduce((acc, it) => acc + Number(it.price || 0), 0);
+
 
             for (const it of items) {
                 const d = it.dishId ? dishMap.get(String(it.dishId)) : null;
@@ -2494,13 +4245,27 @@ const updateOrder = async (req, res, next) => {
 
                 it.unitCost = Number(unitCost.toFixed(6)); // precisión por si hay pesos/recetas
 
-                // ✅ ITBIS prorrateado (mejor base: suma items.price)
-                const line = Number(it.price || 0);
-                if (baseTotal > 0 && taxTotal > 0 && line > 0) {
-                    it.taxAmount = Number((taxTotal * (line / baseTotal)).toFixed(2));
-                } else {
-                    it.taxAmount = 0;
-                }
+
+// ==========================================
+// IMPUESTO
+// ==========================================
+//
+// Ya fue calculado por taxEngine.js.
+// NO recalcular ni prorratear aquí.
+//
+// Solo normalizamos por seguridad.
+// ==========================================
+
+                it.taxAmount =
+                    round2(
+                        Number(
+                            it?.taxAmount ??
+                            it
+                                ?.taxSnapshot
+                                ?.amount ??
+                            0
+                        )
+                    );
 
                 // ✅ Presentación fallback
                 if (!it.presentation) it.presentation = "Regular";
@@ -2512,27 +4277,8 @@ const updateOrder = async (req, res, next) => {
         }
 
 
-// ✅ Inventario real según modo del tenant:
-// - AT_INVOICE: descuenta al facturar
-// - AT_COMPLETE: descuenta al completar
-// - Cancelado: restaura si ya había descontado
-        try {
-            const invResult = await syncInventoryForOrderTiming({
-                orderId: order._id,
-                tenant,
-                orderStatus: incomingStatus,
-                isInvoiceAction,
-                userId: req.user?._id || null,
-            });
-
-            if (["deduct", "restore"].includes(invResult?.action)) {
-                order = await Order.findOne(orderScope)
-                    .populate("table", "tableNo status")
-                    .populate("user", "name email role") || order;
-            }
-        } catch (e) {
-            console.error("INVENTORY SYNC ERROR =>", e);
-        }
+// Inventario ejecutado atómicamente ANTES de los efectos secundarios.
+// NO repetir aquí: evita doble descuento y no oculta un fallo con un catch.
 // ✅ Solo liberar mesa si la orden fue cancelada.
 // Completado NO debe desocupar la mesa automáticamente.
         if (
@@ -2545,7 +4291,9 @@ const updateOrder = async (req, res, next) => {
                 {
                     _id: tableId,
                     tenantId,
-                    $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                    ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
                 },
                 { status: "Disponible", currentOrder: null }
             );
@@ -2570,7 +4318,9 @@ const updateOrder = async (req, res, next) => {
                     {
                         _id: prevTableId,
                         tenantId,
-                        $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                        ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
                     },
                     { status: "Disponible", currentOrder: null }
                 );
@@ -2583,7 +4333,9 @@ const updateOrder = async (req, res, next) => {
                     {
                         _id: nextTableId,
                         tenantId,
-                        $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+                        ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
                     },
                     { status: nextStatus, currentOrder: id }
                 );
@@ -2597,6 +4349,7 @@ const updateOrder = async (req, res, next) => {
             clientId,
             order,
             submitAction,
+            requestedFiscal: req.body?.fiscal,
             orderStatus: incomingStatus,
         });
 
@@ -2610,13 +4363,10 @@ const updateOrder = async (req, res, next) => {
             const isInvoiceActionForEcf =
                 String(submitAction || "").trim().toLowerCase() === "invoice";
 
-            if (ecfEnabledForTenant && isInvoiceActionForEcf) {
-                return next(
-                    createHttpError(
-                        502,
-                        autoEcfResult.message || "AUTO_ECF_ISSUE_FAILED"
-                    )
-                );
+            if (ecfEnabledForTenant && isInvoiceActionForEcf && requestedEcfType(order?.fiscal)) {
+                return res.status(409).json({success:false,code:"ECF_ISSUE_REQUIRES_RECOVERY",
+                    orderId:String(order._id),message:autoEcfResult.message || "AUTO_ECF_ISSUE_FAILED",
+                    details:autoEcfResult.errors || []});
             }
 
             order = order.toObject ? order.toObject() : order;
@@ -2630,7 +4380,8 @@ const updateOrder = async (req, res, next) => {
 
         const io = req.app?.get?.("io");
         if (io) {
-            const room = `tenant:${tenantId}`;
+            const eventClientId = String(order?.clientId || req.clientId || "default");
+            const room = `tenant:${tenantId}:branch:${eventClientId}`;
 
             const tableId =
                 order?.table?._id
@@ -2683,6 +4434,10 @@ const updateOrder = async (req, res, next) => {
         });
     } catch (error) {
         console.error("[updateOrder] error:", error);
+        const status = Number(error?.statusCode || error?.status);
+        if (Number.isInteger(status) && status >= 400 && status < 500) {
+            return next(error);
+        }
         return next(createHttpError(500, "UPDATE_ORDER_FAILED"));
     }
 };
@@ -2711,17 +4466,31 @@ const updatePaymentMethod = async (req, res) => {
         const current = await Order.findOne({
             _id: id,
             tenantId: req.tenantId || req.user?.tenantId,
-            $or: [
-                { clientId: req.clientId },
-                { clientId: { $exists: false } },
-                { clientId: "default" },
-            ],
+            ...(req.clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId: req.clientId }),
         });
 
         if (!current) {
             return res.status(404).json({
                 success: false,
                 message: "Orden no encontrada",
+            });
+        }
+        const currentMethod =
+            String(
+                current.paymentMethod || ""
+            ).trim();
+
+        if (
+            paymentMethod === "Credito" ||
+            currentMethod === "Credito" ||
+            current.accountReceivableId
+        ) {
+            return res.status(409).json({
+                success: false,
+                message:
+                    "CREDIT_PAYMENT_METHOD_MUST_USE_ORDER_FINALIZATION_FLOW",
             });
         }
 
@@ -2760,26 +4529,7 @@ const updatePaymentMethod = async (req, res) => {
 };
 // ✅ Reporte tipo “Químicos” pero para restaurante (por categoría/presentación/producto/método)
 // ✅ Reporte tipo “Químicos” pero para restaurante (por categoría/presentación/producto/método)
-function parseReportBoundary(value, endOfDay = false) {
-    const raw = String(value || "").trim();
-    if (!raw) return null;
 
-    const tzOffset = process.env.REPORT_TZ_OFFSET || "-04:00";
-
-    const ymdMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/);
-    if (ymdMatch) {
-        const ymd = ymdMatch[1];
-        return new Date(`${ymd}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}${tzOffset}`);
-    }
-
-    const d = new Date(raw);
-    if (Number.isNaN(d.getTime())) return null;
-
-    if (endOfDay) d.setHours(23, 59, 59, 999);
-    else d.setHours(0, 0, 0, 0);
-
-    return d;
-}
 const getSalesByProductReport = async (req, res) => {
     try {
         const tenantId = req.tenantId || req.user?.tenantId;
@@ -2794,33 +4544,61 @@ const getSalesByProductReport = async (req, res) => {
 
         const { from, to, paymentMethod, category, presentation, orderSource } = req.query;
 
-        const now = new Date();
-        const todayYMD = now.toLocaleDateString("en-CA", {
-            timeZone: "America/Santo_Domingo",
-        });
+        const tenant =
+            await Tenant
+                .findOne({
+                    tenantId,
+                })
+                .select(
+                    "localization.timezone"
+                )
+                .lean();
 
-        const start = from
-            ? parseReportBoundary(from, false)
-            : parseReportBoundary(todayYMD, false);
+        const timezone =
+            getTenantTimezone(
+                tenant
+            );
 
-        const end = to
-            ? parseReportBoundary(to, true)
-            : parseReportBoundary(todayYMD, true);
+        const todayYMD =
+            getTodayYMDInTimeZone(
+                timezone
+            );
 
-        if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
-            return res.status(400).json({
-                success: false,
-                message: "INVALID_DATE_RANGE",
-            });
+        const range =
+            getUtcRangeForYMDRange(
+                from ||
+                to ||
+                todayYMD,
+
+                to ||
+                from ||
+                todayYMD,
+
+                timezone
+            );
+
+        if (!range) {
+            return res
+                .status(400)
+                .json({
+                    success: false,
+                    message:
+                        "INVALID_DATE_RANGE",
+                });
         }
+
+        const {
+            start,
+            end,
+        } = range;
+
+
 
         const rawClientId = String(clientId || "default").trim() || "default";
 
-        const clientScope = [
-            { clientId: rawClientId },
-            { clientId: { $exists: false } },
-            { clientId: "default" },
-        ];
+        const clientScope = rawClientId === "default"
+            ? [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }]
+            : [{ clientId: rawClientId }];
 
         const baseOrderFilter = {
             tenantId,
@@ -3092,71 +4870,146 @@ const getSalesByProductReport = async (req, res) => {
                         ],
                     },
 
-                    _tax: {
-                        $cond: [
-                            { $gt: [{ $ifNull: ["$items.taxAmount", 0] }, 0] },
-                            { $ifNull: ["$items.taxAmount", 0] },
-                            {
-                                $multiply: [
-                                    { $ifNull: ["$bills.tax", 0] },
-                                    {
-                                        $cond: [
-                                            { $gt: ["$_orderItemsSubtotal", 0] },
-                                            { $divide: [{ $ifNull: ["$items.price", 0] }, "$_orderItemsSubtotal"] },
-                                            0,
-                                        ],
-                                    },
-                                ],
-                            },
-                        ],
-                    },
-
-                    _tip: {
-                        $multiply: [
-                            { $ifNull: ["$bills.tip", 0] },
-                            {
-                                $cond: [
-                                    { $gt: ["$_orderItemsSubtotal", 0] },
-                                    { $divide: [{ $ifNull: ["$items.price", 0] }, "$_orderItemsSubtotal"] },
-                                    0,
-                                ],
-                            },
-                        ],
-                    },
                 },
 
             },
             {
                 $addFields: {
+
+                    // ==========================================
+                    // IMPUESTO DEL ITEM
+                    // ==========================================
+                    //
+                    // Orden nueva:
+                    // usamos taxAmount aunque sea 0.
+                    //
+                    // Orden legacy:
+                    // mantenemos el prorrateo antiguo.
+                    // ==========================================
+
                     _tax: {
                         $cond: [
-                            { $gt: [{ $ifNull: ["$items.taxAmount", 0] }, 0] },
-                            { $ifNull: ["$items.taxAmount", 0] },
+                            {
+                                $gte: [
+                                    {
+                                        $ifNull: [
+                                            "$bills.taxEngineVersion",
+                                            0
+                                        ]
+                                    },
+
+                                    1
+                                ]
+                            },
+
+                            {
+                                $ifNull: [
+                                    "$items.taxAmount",
+
+                                    {
+                                        $ifNull: [
+                                            "$items.taxSnapshot.amount",
+                                            0
+                                        ]
+                                    }
+                                ]
+                            },
+
                             {
                                 $multiply: [
-                                    { $ifNull: ["$bills.tax", 0] },
-                                    "$_lineRatio",
-                                ],
-                            },
-                        ],
+                                    {
+                                        $ifNull: [
+                                            "$bills.tax",
+                                            0
+                                        ]
+                                    },
+
+                                    "$_lineRatio"
+                                ]
+                            }
+                        ]
                     },
 
                     _tip: {
                         $multiply: [
-                            { $ifNull: ["$bills.tip", 0] },
-                            "$_lineRatio",
-                        ],
+                            {
+                                $ifNull: [
+                                    "$bills.tip",
+                                    0
+                                ]
+                            },
+
+                            "$_lineRatio"
+                        ]
                     },
 
                     _deliveryFeeShare: {
                         $multiply: [
-                            { $ifNull: ["$bills.deliveryFee", 0] },
-                            "$_lineRatio",
-                        ],
+                            {
+                                $ifNull: [
+                                    "$bills.deliveryFee",
+                                    0
+                                ]
+                            },
+
+                            "$_lineRatio"
+                        ]
                     },
                 },
             },
 
+            {
+                $addFields: {
+
+                    // ==========================================
+                    // TOTAL REAL DE LA LÍNEA CON IMPUESTO
+                    // ==========================================
+                    //
+                    // Motor nuevo:
+                    // lineTotalWithTax ya sabe si el impuesto
+                    // estaba incluido o se agregó encima.
+                    //
+                    // Orden legacy:
+                    // mantenemos price + tax.
+                    // ==========================================
+
+                    _lineGrossRevenue: {
+                        $cond: [
+                            {
+                                $gte: [
+                                    {
+                                        $ifNull: [
+                                            "$bills.taxEngineVersion",
+                                            0
+                                        ]
+                                    },
+                                    1
+                                ]
+                            },
+
+                            {
+                                $ifNull: [
+                                    "$items.lineTotalWithTax",
+
+                                    {
+                                        $add: [
+                                            "$_revenue",
+                                            "$_tax"
+                                        ]
+                                    }
+                                ]
+                            },
+
+                            {
+                                $add: [
+                                    "$_revenue",
+                                    "$_tax"
+                                ]
+                            }
+                        ]
+                    },
+                },
+            },
             ...(categoryFilterValue ? [{ $match: { _cat: categoryFilterValue } }] : []),
 
             {
@@ -3164,8 +5017,7 @@ const getSalesByProductReport = async (req, res) => {
                     _costTotal: { $multiply: ["$_qty", "$_unitCost"] },
                     _grossRevenue: {
                         $add: [
-                            "$_revenue",
-                            "$_tax",
+                            "$_lineGrossRevenue",
                             "$_tip",
                             "$_deliveryFeeShare",
                         ],
@@ -3325,7 +5177,9 @@ const sendOrderToProduction = async (req, res, next) => {
         const order = await Order.findOne({
             _id: id,
             tenantId,
-            $or: [{ clientId }, { clientId: { $exists: false } }, { clientId: "default" }],
+            ...(clientId === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
+                : { clientId }),
         })
             .populate("table", "tableNo name area")
             .populate("user", "name");
@@ -3503,6 +5357,7 @@ module.exports = {
     getOrderById,
     getOrderEcfStatus,
     getTenantEcfStatus,
+    previewOrderTaxes,
     getOrders,
     updateOrder,
     deleteOrder,

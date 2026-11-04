@@ -26,7 +26,38 @@ function getCurrentRole(req) {
 function isAdminLike(req) {
     return ["SuperAdmin", "Owner", "Admin"].includes(getCurrentRole(req));
 }
+async function getTenantWeightUnit(
+    tenantId
+) {
+    const tenant =
+        await Tenant
+            .findOne({
+                tenantId,
+            })
+            .select(
+                "localization.weightUnit localization.measurementSystem"
+            )
+            .lean();
 
+    const explicit =
+        tenant?.localization
+            ?.weightUnit;
+
+    if (
+        explicit === "lb" ||
+        explicit === "kg"
+    ) {
+        return explicit;
+    }
+
+    return (
+        tenant?.localization
+            ?.measurementSystem ===
+        "metric"
+            ? "kg"
+            : "lb"
+    );
+}
 async function getTenantPlanContext(tenantId) {
     if (!tenantId) {
         throw createHttpError(401, "TENANT_NOT_FOUND");
@@ -51,7 +82,81 @@ async function getTenantPlanContext(tenantId) {
     };
 }
 
+async function normalizeDishTaxId({
+                                      tenantId,
+                                      taxId,
+                                  }) {
+    // undefined significa:
+    // el frontend no intentó modificarlo.
+    if (
+        taxId === undefined
+    ) {
+        return undefined;
+    }
 
+    const value =
+        String(
+            taxId || ""
+        ).trim();
+
+    // Vacío = usar impuesto predeterminado.
+    if (!value) {
+        return null;
+    }
+
+    const tenant =
+        await Tenant.findOne({
+            tenantId,
+        })
+            .select(
+                "taxConfig"
+            )
+            .lean();
+
+    if (!tenant) {
+        throw createHttpError(
+            404,
+            "TENANT_NOT_FOUND"
+        );
+    }
+    const taxes =
+        Array.isArray(
+            tenant
+                ?.taxConfig
+                ?.taxes
+        )
+            ? tenant.taxConfig.taxes
+            : [];
+
+    const found =
+        taxes.find(
+            (tax) =>
+                String(
+                    tax?.id ||
+                    ""
+                ).trim() ===
+                value
+        );
+
+    if (!found) {
+        throw createHttpError(
+            400,
+            "TAX_NOT_FOUND"
+        );
+    }
+
+    if (
+        found.active ===
+        false
+    ) {
+        throw createHttpError(
+            400,
+            "TAX_INACTIVE"
+        );
+    }
+
+    return value;
+}
 const normalizeProductionArea = (value) => {
     const v = String(value || "kitchen").trim().toLowerCase();
     return VALID_PRODUCTION_AREAS.includes(v) ? v : "kitchen";
@@ -70,6 +175,69 @@ const parseBooleanField = (value, fallback = false) => {
     }
 
     return String(value).trim().toLowerCase() === "true";
+};
+const normalizeTaxIncludedOverride = (
+    value
+) => {
+    // No vino en la petición:
+    // no tocar el valor existente.
+    if (value === undefined) {
+        return undefined;
+    }
+
+    // Vacío = heredar configuración
+    // del impuesto.
+    if (
+        value === null ||
+        value === "" ||
+        String(value)
+            .trim()
+            .toLowerCase() ===
+        "inherit"
+    ) {
+        return null;
+    }
+
+    if (
+        typeof value ===
+        "boolean"
+    ) {
+        return value;
+    }
+
+    const normalized =
+        String(value)
+            .trim()
+            .toLowerCase();
+
+    if (
+        [
+            "true",
+            "1",
+            "yes",
+            "si",
+            "sí",
+            "included",
+        ].includes(normalized)
+    ) {
+        return true;
+    }
+
+    if (
+        [
+            "false",
+            "0",
+            "no",
+            "excluded",
+        ].includes(normalized)
+    ) {
+        return false;
+    }
+
+    throw createHttpError(
+        400,
+        "TAX_INCLUDED_OVERRIDE_INVALID"
+    );
 };
 
 const parseArrayField = (value, fieldName) => {
@@ -299,8 +467,9 @@ exports.addDish = async (req, res, next) => {
         const {
             name,
             price,
-
             category,
+            taxId,
+            taxIncludedOverride,
             inventoryCategoryId,
             productionArea,
             customizationEnabled,
@@ -322,6 +491,16 @@ exports.addDish = async (req, res, next) => {
         } = req.body;
 
         const normalizedProductionArea = normalizeProductionArea(productionArea);
+        const normalizedTaxId =
+            await normalizeDishTaxId({
+                tenantId,
+                taxId,
+            });
+
+        const normalizedTaxIncludedOverride =
+            normalizeTaxIncludedOverride(
+                taxIncludedOverride
+            );
 
         // inventoryCategoryId (si viene)
 // Flags base (evita usar variables antes de declararlas)
@@ -484,6 +663,20 @@ exports.addDish = async (req, res, next) => {
                 extras,
             });
         const newDish = await Dish.create({
+            taxId:
+                isInv
+                    ? null
+                    : (
+                        normalizedTaxId ??
+                        null
+                    ),
+            taxIncludedOverride:
+                isInv
+                    ? null
+                    : (
+                        normalizedTaxIncludedOverride ??
+                        null
+                    ),
             name: String(name).trim(),
             price: finalPrice,
             category: String(finalCategory).trim(),
@@ -551,65 +744,161 @@ exports.getDishes = async (req, res, next) => {
             search = "",
             category = "",
         } = req.query;
-        const tenantId = req.user?.tenantId;
-        const planContext = await getTenantPlanContext(tenantId);
 
-        if (String(includeInventory) === "true" && !planContext.features.inventory) {
-            return res.status(403).json({
-                success: false,
-                code: "PLAN_FEATURE_NOT_ALLOWED",
-                message: "Tu plan actual no incluye inventario.",
-            });
+        const tenantId =
+            req.user?.tenantId;
+
+        if (!tenantId) {
+            return next(
+                createHttpError(
+                    401,
+                    "TENANT_NOT_FOUND"
+                )
+            );
         }
 
-        const pageNum = Math.max(Number(page) || 1, 1);
-        const limitNum = Math.max(Number(limit) || 12, 1);
-        const skip = (pageNum - 1) * limitNum;
+        const planContext =
+            await getTenantPlanContext(
+                tenantId
+            );
 
+        if (
+            String(includeInventory) ===
+            "true" &&
+            !planContext
+                .features
+                .inventory
+        ) {
+            return res
+                .status(403)
+                .json({
+                    success: false,
+                    code:
+                        "PLAN_FEATURE_NOT_ALLOWED",
+                    message:
+                        "Tu plan actual no incluye inventario.",
+                });
+        }
+
+        const pageNum =
+            Math.max(
+                Number(page) || 1,
+                1
+            );
+
+        const limitNum =
+            Math.max(
+                Number(limit) || 12,
+                1
+            );
+
+        const skip =
+            (pageNum - 1) *
+            limitNum;
+
+        const clientId = req.clientId || "default";
+        const branchScope = clientId === "default"
+            ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }] }
+            : { clientId };
         const filter = {
             tenantId,
+            ...branchScope,
             isArchived: { $ne: true },
         };
 
-        if (String(includeInventory) !== "true") {
-            filter.category = { $ne: "Inventario" };
+        if (
+            String(includeInventory) !==
+            "true"
+        ) {
+            filter.category = {
+                $ne: "Inventario",
+            };
         }
 
-        const searchTrimmed = String(search || "").trim();
+        const searchTrimmed =
+            String(
+                search || ""
+            ).trim();
+
         if (searchTrimmed) {
             filter.$or = [
-                { name: { $regex: searchTrimmed, $options: "i" } },
-                { category: { $regex: searchTrimmed, $options: "i" } },
+                {
+                    name: {
+                        $regex:
+                        searchTrimmed,
+                        $options: "i",
+                    },
+                },
+                {
+                    category: {
+                        $regex:
+                        searchTrimmed,
+                        $options: "i",
+                    },
+                },
             ];
         }
 
-        const categoryTrimmed = String(category || "").trim();
+        const categoryTrimmed =
+            String(
+                category || ""
+            ).trim();
+
         if (categoryTrimmed) {
-            filter.category = categoryTrimmed;
+            filter.category =
+                categoryTrimmed;
         }
 
-        const [items, total] = await Promise.all([
-            Dish.find(filter)
-                .sort({ updatedAt: -1 })
-                .skip(skip)
-                .limit(limitNum),
-            Dish.countDocuments(filter),
-        ]);
+        const [
+            items,
+            total,
+        ] =
+            await Promise.all([
+                Dish.find(filter)
+                    .sort({
+                        updatedAt: -1,
+                    })
+                    .skip(skip)
+                    .limit(
+                        limitNum
+                    ),
 
-        const totalPages = Math.max(Math.ceil(total / limitNum), 1);
+                Dish.countDocuments(
+                    filter
+                ),
+            ]);
 
-        res.status(200).json({
-            success: true,
-            data: {
-                items,
-                page: pageNum,
-                limit: limitNum,
-                total,
-                totalPages,
-            },
-        });
+        const totalPages =
+            Math.max(
+                Math.ceil(
+                    total /
+                    limitNum
+                ),
+                1
+            );
+
+        return res
+            .status(200)
+            .json({
+                success: true,
+
+                data: {
+                    items,
+                    page:
+                    pageNum,
+                    limit:
+                    limitNum,
+                    total,
+                    totalPages,
+                },
+            });
     } catch (error) {
-        next(error);
+        console.error(
+            "[getDishes] error:",
+            error
+        );
+
+        return next(error);
     }
 };
 
@@ -624,6 +913,10 @@ exports.updateDish = async (req, res, next) => {
             name,
             price,
             category,
+
+            taxId,
+            taxIncludedOverride,
+
             productionArea,
             sellMode,
             weightUnit,
@@ -671,9 +964,24 @@ exports.updateDish = async (req, res, next) => {
         const dish = await Dish.findOne({
             _id: id,
             tenantId,
+            ...((req.clientId || "default") === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }] }
+                : { clientId: req.clientId }),
         });
 
         if (!dish) return next(createHttpError(404, "Dish not found!"));
+
+        const normalizedTaxId =
+            await normalizeDishTaxId({
+                tenantId,
+                taxId,
+            });
+
+        const normalizedTaxIncludedOverride =
+            normalizeTaxIncludedOverride(
+                taxIncludedOverride
+            );
+
 
         const requestedInventoryType =
             inventoryType !== undefined
@@ -872,6 +1180,26 @@ exports.updateDish = async (req, res, next) => {
                 });
             }
         }
+        if (
+            normalizedTaxId !==
+            undefined
+        ) {
+            dish.taxId =
+                dish.isInventoryItem
+                    ? null
+                    : normalizedTaxId;
+        }
+        if (
+            normalizedTaxIncludedOverride !==
+            undefined
+        ) {
+            dish.taxIncludedOverride =
+                dish.isInventoryItem
+                    ? null
+                    : normalizedTaxIncludedOverride;
+        }
+        // Compatibilidad: al editar un plato legacy se normaliza a la sede principal.
+        if (!dish.clientId && (req.clientId || "default") === "default") dish.clientId = "default";
         const updated = await dish.save();
 
         res.status(200).json({
@@ -886,8 +1214,11 @@ exports.updateDish = async (req, res, next) => {
 
 exports.getDishRecipe = async (req, res) => {
     try {
-        const tenantId = req.tenantId || req.headers["x-tenant-id"];
-        const dish = await Dish.findOne({ _id: req.params.id, tenantId });
+        const tenantId = req.tenantId;
+        const dish = await Dish.findOne({ _id: req.params.id, tenantId,
+            ...((req.clientId || "default") === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }] }
+                : { clientId: req.clientId }) });
 
         if (!dish) {
             return res.status(404).json({ success: false, message: "Dish no encontrado" });
@@ -908,7 +1239,7 @@ exports.getDishRecipe = async (req, res) => {
 
 exports.updateDishRecipe = async (req, res) => {
     try {
-        const tenantId = req.tenantId || req.headers["x-tenant-id"];
+        const tenantId = req.tenantId;
 
         const { sellMode, weightUnit, pricePerLb, recipe } = req.body;
 
@@ -937,7 +1268,10 @@ exports.updateDishRecipe = async (req, res) => {
             }
         }
 
-        const dish = await Dish.findOne({ _id: req.params.id, tenantId });
+        const dish = await Dish.findOne({ _id: req.params.id, tenantId,
+            ...((req.clientId || "default") === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }] }
+                : { clientId: req.clientId }) });
         if (!dish) {
             return res.status(404).json({ success: false, message: "Dish no encontrado" });
         }
@@ -970,6 +1304,7 @@ exports.updateDishRecipe = async (req, res) => {
             }));
         }
 
+        if (!dish.clientId && (req.clientId || "default") === "default") dish.clientId = "default";
         await dish.save();
 
         return res.json({ success: true, dish });
@@ -991,6 +1326,9 @@ exports.deleteDish = async (req, res, next) => {
         const dish = await Dish.findOne({
             _id: id,
             tenantId: req.user.tenantId,
+            ...((req.clientId || "default") === "default"
+                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }] }
+                : { clientId: req.clientId }),
         });
 
         if (!dish) return next(createHttpError(404, "Dish not found!"));
@@ -1052,10 +1390,15 @@ exports.createIngredient = async (req, res) => {
             return res.status(400).json({ success: false, message: "sellMode inválido" });
         }
 
-        const wu = weightUnit !== undefined ? String(weightUnit) : "lb";
-        if (!["lb", "kg"].includes(wu)) {
-            return res.status(400).json({ success: false, message: "weightUnit inválido" });
-        }
+        const defaultWeightUnit =
+            await getTenantWeightUnit(
+                tenantId
+            );
+
+        const wu =
+            weightUnit !== undefined
+                ? String(weightUnit)
+                : defaultWeightUnit;
 
         const invCatId = parseInvCatId(inventoryCategoryId);
         if (invCatId === "__INVALID__") {
@@ -1104,7 +1447,9 @@ exports.createIngredient = async (req, res) => {
             if (invCatId !== undefined) dish.inventoryCategoryId = invCatId;
             if (description !== undefined) dish.description = String(description);
 
-            const updated = await dish.save();
+            // Compatibilidad: al editar un plato legacy se normaliza a la sede principal.
+        if (!dish.clientId && (req.clientId || "default") === "default") dish.clientId = "default";
+        const updated = await dish.save();
 
             return res.status(200).json({
                 success: true,

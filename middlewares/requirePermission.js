@@ -10,8 +10,7 @@ function getTenantId(req) {
     return (
         req.scope?.tenantId ||
         req.tenantId ||
-        req.user?.tenantId ||
-        req.headers["x-tenant-id"]
+        req.user?.tenantId
     );
 }
 
@@ -54,6 +53,12 @@ async function hasPermission(req, permissionKey) {
     if (req.user?.role === "SuperAdmin") return true;
 
     const membership = await getMembershipFromReq(req);
+    // Nunca elevar el rol Admin del JWT si la membresía fue desactivada.
+    if (!membership || membership.status !== "active") return false;
+    if (String(membership.tenantId) !== String(getTenantId(req)) ||
+        String(membership.user?._id || membership.user) !== String(req.user?._id)) {
+        return false;
+    }
     const role = getRole(req, membership);
 
     if (isAdminLikeRole(role)) return true;

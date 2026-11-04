@@ -94,24 +94,25 @@ function signXmlWithPem({ xml, privateKeyPem, certificatePem }) {
     const sig = new SignedXml({
         privateKey: privateKeyPem,
         publicCert: certificatePem,
-        canonicalizationAlgorithm: "http://www.w3.org/2001/10/xml-exc-c14n#",
-        signatureAlgorithm: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+
+        canonicalizationAlgorithm:
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+
+        signatureAlgorithm:
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
     });
 
     sig.addReference({
         xpath: "/*",
-
-        // Importante:
-        // Evita que xml-crypto agregue un atributo Id al nodo raíz.
-        // DGII está rechazando ese atributo porque no existe en el XSD de la semilla.
         uri: "",
         isEmptyUri: true,
 
         transforms: [
             "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
-            "http://www.w3.org/2001/10/xml-exc-c14n#",
         ],
-        digestAlgorithm: "http://www.w3.org/2001/04/xmlenc#sha256",
+
+        digestAlgorithm:
+            "http://www.w3.org/2001/04/xmlenc#sha256",
     });
 
     sig.computeSignature(xml, {
@@ -123,12 +124,41 @@ function signXmlWithPem({ xml, privateKeyPem, certificatePem }) {
 
     const signedXml = sig.getSignedXml();
 
-    // Protección temporal para detectar si la librería todavía agrega Id.
-    if (/\sId="[^"]+"/.test(signedXml)) {
-        throw new Error("SIGNED_XML_CONTAINS_UNDECLARED_ID_ATTRIBUTE");
+    // Solamente revisamos el nodo raíz.
+    // No queremos que xml-crypto agregue un Id no contemplado por el XSD.
+    const rootTagMatch = signedXml.match(
+        /<([A-Za-z_][\w:.-]*)(?:\s[^>]*)?>/
+    );
+
+    if (rootTagMatch && /\sId="[^"]+"/.test(rootTagMatch[0])) {
+        throw new Error(
+            "SIGNED_XML_ROOT_CONTAINS_UNDECLARED_ID_ATTRIBUTE"
+        );
     }
 
     return signedXml;
+}
+
+function extractSignatureValue(signedXml = "") {
+    const match = String(signedXml).match(
+        /<(?:[\w.-]+:)?SignatureValue(?:\s[^>]*)?>([\s\S]*?)<\/(?:[\w.-]+:)?SignatureValue>/i
+    );
+
+    if (!match) {
+        return "";
+    }
+
+    return match[1].replace(/\s+/g, "");
+}
+
+function getSecurityCodeFromSignedXml(signedXml = "") {
+    const signatureValue = extractSignatureValue(signedXml);
+
+    if (!signatureValue) {
+        throw new Error("SIGNATURE_VALUE_NOT_FOUND");
+    }
+
+    return signatureValue.slice(0, 6);
 }
 
 async function realSignXml({ xml, profile }) {
@@ -144,7 +174,9 @@ async function realSignXml({ xml, profile }) {
         throw new Error("ECF_CERTIFICATE_PASSWORD_NOT_CONFIGURED");
     }
 
-    const password = decryptField(profile.certificate.passwordEncrypted);
+    const password = decryptField(
+        profile.certificate.passwordEncrypted
+    );
 
     if (!password) {
         throw new Error("ECF_CERTIFICATE_PASSWORD_DECRYPT_FAILED");
@@ -155,8 +187,14 @@ async function realSignXml({ xml, profile }) {
         .download(profile.certificate.path);
 
     if (error) {
-        console.error("[realSignXml] Supabase download error:", error);
-        throw new Error(`CERTIFICATE_DOWNLOAD_FAILED: ${error.message}`);
+        console.error(
+            "[realSignXml] Supabase download error:",
+            error
+        );
+
+        throw new Error(
+            `CERTIFICATE_DOWNLOAD_FAILED: ${error.message}`
+        );
     }
 
     const p12Buffer = await bufferFromSupabaseDownload(data);
@@ -170,20 +208,28 @@ async function realSignXml({ xml, profile }) {
         password,
     });
 
+    // AQUÍ FALTABA REALMENTE FIRMAR EL XML
     const signedXml = signXmlWithPem({
         xml,
         privateKeyPem,
         certificatePem,
     });
 
+    // Código que utiliza DGII para QR / RFCE.
+    const securityCode =
+        getSecurityCodeFromSignedXml(signedXml);
+
+    // Esto lo conservamos para integridad interna de DeLeonSoft.
+    // NO utilizar este hash para CodigoSeguridad DGII.
     const hash = crypto
         .createHash("sha256")
-        .update(signedXml)
+        .update(signedXml, "utf8")
         .digest("hex");
 
     return {
         signedXml,
         hash,
+        securityCode,
         certificateInfo,
     };
 }
@@ -211,4 +257,5 @@ function validateP12CertificateBuffer({ p12Buffer, password }) {
 module.exports = {
     realSignXml,
     validateP12CertificateBuffer,
+    getSecurityCodeFromSignedXml,
 };

@@ -85,6 +85,52 @@ function getSoldAmount(orderItem) {
     return Math.max(num(orderItem?.quantity, 0), 0);
 }
 
+/**
+ * Los extras referenciados consumen inventario propio de la sucursal.
+ * Un extra sin extraDishId es solo un modificador comercial (no stock).
+ * Las referencias deben existir en customization.extras del plato original.
+ */
+async function getExtraStockLines({ soldDish, line, soldAmount, tenantId, clientId, session = null }) {
+    const selected = Array.isArray(line?.addons) ? line.addons : [];
+    const allowed = Array.isArray(soldDish?.customization?.extras) ? soldDish.customization.extras : [];
+    const output = [];
+    for (const extra of selected) {
+        const ref = extra?.extraDishId?._id || extra?.extraDishId || null;
+        if (!ref) continue;
+        if (!mongoose.Types.ObjectId.isValid(String(ref))) throw createHttpError(400, "INVALID_EXTRA_DISH_ID");
+        const definition = allowed.find((e) =>
+            e?.active !== false && e.extraDishId && String(e.extraDishId) === String(ref) &&
+            (!extra.extraId || String(e._id) === String(extra.extraId))
+        );
+        if (!definition) throw createHttpError(409, "EXTRA_NOT_DEFINED_FOR_DISH");
+        const perDish = Number(extra?.quantity ?? extra?.extraQuantity ?? 1);
+        if (!Number.isInteger(perDish) || perDish < 1 || perDish > Number(definition.maxQuantity || 5)) {
+            throw createHttpError(400, "INVALID_EXTRA_QUANTITY");
+        }
+        const amount = Number((perDish * soldAmount).toFixed(6));
+        const query = Dish.findOne({ _id: ref, tenantId, clientId, isArchived: { $ne: true } })
+            .select("_id recipe inventoryType allowNegativeStock isInventoryItem inventoryCategoryId name").lean();
+        const extraDish = await (session ? query.session(session) : query);
+        if (!extraDish) throw createHttpError(409, "EXTRA_DISH_NOT_FOUND_IN_BRANCH");
+        if (shouldUseRecipe(extraDish)) {
+            if (!Array.isArray(extraDish.recipe) || extraDish.recipe.length === 0) {
+                throw createHttpError(409, "EXTRA_RECIPE_EMPTY");
+            }
+            for (const ing of extraDish.recipe || []) {
+                const ingId = ing?.ingredientDishId || ing?.dishId || ing?.inventoryItemId;
+                const qty = num(ing?.qty, 0);
+                if (!ingId || !mongoose.Types.ObjectId.isValid(String(ingId)) || qty <= 0) {
+                    throw createHttpError(409, "INVALID_EXTRA_RECIPE_INGREDIENT");
+                }
+                output.push({ itemId: ingId, qty: Number((amount * qty).toFixed(6)) });
+            }
+        } else if (isStockManagedItem(extraDish)) {
+            output.push({ itemId: extraDish._id, qty: amount });
+        }
+    }
+    return output.filter(({ qty }) => qty > 0);
+}
+
 async function applyDeduction({
                                   tenantId,
                                   clientId,
@@ -116,7 +162,7 @@ async function applyDeduction({
     });
 
     if (!dish) {
-        return { skipped: true, costAmount: 0, movement: null };
+        throw createHttpError(409, "STOCK_ITEM_NOT_FOUND_IN_BRANCH");
     }
 
     const beforeStock = num(dish.stockCurrent, 0);
@@ -178,16 +224,17 @@ async function deductInventoryForOrder(orderId, opts = {}) {
 // El control final se hace por item con allowNegativeStock.
     const allowNegativeStock = opts.allowNegativeStock !== false;
     const userId = opts.userId || null;
+    const externalSession = opts.session || null;
     if (!orderId || !mongoose.Types.ObjectId.isValid(String(orderId))) {
         throw createHttpError(400, "INVALID_ORDER_ID");
     }
 
-    const session = await mongoose.startSession();
+    const session = externalSession || await mongoose.startSession();
 
     try {
         let result = null;
 
-        await session.withTransaction(async () => {
+        const performInventoryWork = async () => {
             const order = await Order.findOne({ _id: orderId }).session(session);
             if (!order) throw createHttpError(404, "ORDER_NOT_FOUND");
 
@@ -209,11 +256,14 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                 if (!soldDishId || !mongoose.Types.ObjectId.isValid(String(soldDishId))) continue;
 
                 const soldDish = await Dish.findOne({ _id: soldDishId, tenantId, clientId })
-                    .select("_id recipe inventoryType allowNegativeStock isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")                    .lean()
+                    .select("_id recipe customization inventoryType allowNegativeStock isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")                    .lean()
 
                     .session(session);
 
-                if (!soldDish) continue;
+                if (!soldDish) {
+                    if (externalSession) throw createHttpError(409, "SOLD_DISH_NOT_FOUND_IN_BRANCH");
+                    continue;
+                }
 
                 const soldAmount = getSoldAmount(line);
                 if (soldAmount <= 0) continue;
@@ -223,12 +273,15 @@ async function deductInventoryForOrder(orderId, opts = {}) {
 // Si es producto direct => descuenta el mismo producto.
 // Si es none => no descuenta nada.
                 if (shouldUseRecipe(soldDish)) {
+                    if (!Array.isArray(soldDish.recipe) || soldDish.recipe.length === 0) {
+                        throw createHttpError(409, "RECIPE_EMPTY");
+                    }
                     for (const ing of soldDish.recipe || []) {
                         const ingId = ing?.ingredientDishId || ing?.dishId || ing?.inventoryItemId;
-                        if (!ingId || !mongoose.Types.ObjectId.isValid(String(ingId))) continue;
-
                         const ingQty = num(ing?.qty, 0);
-                        if (ingQty <= 0) continue;
+                        if (!ingId || !mongoose.Types.ObjectId.isValid(String(ingId)) || ingQty <= 0) {
+                            throw createHttpError(409, "INVALID_RECIPE_INGREDIENT");
+                        }
 
                         const qtyToDeduct = Number((ingQty * soldAmount).toFixed(6));
                         if (qtyToDeduct <= 0) continue;
@@ -272,6 +325,16 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                         inventoryCategoryId: soldDish?.inventoryCategoryId ? String(soldDish.inventoryCategoryId) : null,
                     });
                 }
+
+                // Extras vinculados: el plato principal puede ser inventoryType=none.
+                for (const extraLine of await getExtraStockLines({
+                    soldDish, line, soldAmount, tenantId, clientId, session,
+                })) {
+                    const out = await applyDeduction({ tenantId, clientId, userId,
+                        itemId: extraLine.itemId, qty: extraLine.qty, allowNegativeStock, orderId, session });
+                    cogsTotal += out.costAmount;
+                    movements.push(out.movement);
+                }
             }
 
             const createdCount = movements.filter(Boolean).length;
@@ -296,11 +359,15 @@ async function deductInventoryForOrder(orderId, opts = {}) {
                 cogsTotal: order.cogsTotal,
             };
             dbg("result", result);
-        });
-
+        };
+        if (externalSession) await performInventoryWork();
+        else await session.withTransaction(performInventoryWork);
 
         return result;
     } catch (e) {
+        // No utilizar un fallback sin transacciones cuando la orden y el stock
+        // deben confirmarse juntos; propagar el error al controlador.
+        if (externalSession) throw e;
         // Fallback si no hay replica set
         const msg = String(e?.message || "");
         const noTxn =
@@ -325,7 +392,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
             if (!soldDishId || !mongoose.Types.ObjectId.isValid(String(soldDishId))) continue;
 
             const soldDish = await Dish.findOne({ _id: soldDishId, tenantId, clientId })
-                .select("_id recipe inventoryType allowNegativeStock isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")                .lean();
+                .select("_id recipe customization inventoryType allowNegativeStock isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")                .lean();
 
             if (!soldDish) continue;
 
@@ -400,6 +467,11 @@ async function deductInventoryForOrder(orderId, opts = {}) {
             } else if (shouldTrackDirectStock(soldDish)) {
                 await deductOne(soldDish._id, Number(soldAmount.toFixed(6)));
             }
+            for (const extraLine of await getExtraStockLines({
+                soldDish, line, soldAmount, tenantId, clientId,
+            })) {
+                await deductOne(extraLine.itemId, extraLine.qty);
+            }
         }
 
         order.cogsTotal = Number((cogsTotal || 0).toFixed(2));
@@ -421,7 +493,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
             cogsTotal: order.cogsTotal,
         };
     } finally {
-        session.endSession();
+        if (!externalSession) await session.endSession();
     }
 }
 
@@ -432,16 +504,17 @@ async function deductInventoryForOrder(orderId, opts = {}) {
  */
 async function restoreInventoryForOrder(orderId, opts = {}) {
     const userId = opts.userId || null;
+    const externalSession = opts.session || null;
 
     if (!orderId || !mongoose.Types.ObjectId.isValid(String(orderId))) {
         throw createHttpError(400, "INVALID_ORDER_ID");
     }
 
-    const session = await mongoose.startSession();
+    const session = externalSession || await mongoose.startSession();
     try {
         let result = null;
 
-        await session.withTransaction(async () => {
+        const performInventoryWork = async () => {
             const order = await Order.findOne({ _id: orderId }).session(session);
             if (!order) throw createHttpError(404, "ORDER_NOT_FOUND");
 
@@ -499,42 +572,22 @@ async function restoreInventoryForOrder(orderId, opts = {}) {
                 movementsCreated += 1;
             };
 
-            for (const line of items) {
-                const soldDishId = line?.dishId || line?.dish || null;
-                dbg("line", {
-                    soldDishId: soldDishId ? String(soldDishId) : null,
-                    quantity: line?.quantity,
-                    weight: line?.weight,
-                    lbs: line?.lbs,
-                });
-                if (!soldDishId || !mongoose.Types.ObjectId.isValid(String(soldDishId))) continue;
-
-                const soldDish = await Dish.findOne({ _id: soldDishId, tenantId, clientId })
-                    .select("_id recipe inventoryType allowNegativeStock isInventoryItem inventoryCategoryId stockCurrent stockMin name avgCost lastCost")                    .lean()
-                    .session(session);
-
-
-                if (!soldDish) continue;
-
-                const soldAmount = getSoldAmount(line);
-                if (soldAmount <= 0) continue;
-
-                if (shouldUseRecipe(soldDish)) {
-                    for (const ing of soldDish.recipe) {
-                        const ingId = ing?.ingredientDishId || ing?.dishId || ing?.inventoryItemId;
-                        if (!ingId || !mongoose.Types.ObjectId.isValid(String(ingId))) continue;
-
-                        const ingQty = num(ing?.qty, 0);
-                        if (ingQty <= 0) continue;
-
-                        const qtyToAdd = Number((ingQty * soldAmount).toFixed(6));
-                        if (qtyToAdd <= 0) continue;
-
-                        await addBackOne(ingId, qtyToAdd);
-                    }
-                } else if (shouldTrackDirectStock(soldDish)) {
-                    await addBackOne(soldDish._id, Number(soldAmount.toFixed(6)));
-                }
+            // Restaurar EXACTAMENTE lo descontado al cobrar, no recalcular recetas actuales.
+            // Esto incluye extras inventariados y evita cambios de configuración posteriores.
+            const soldMovements = await InventoryMovement.find({
+                tenantId, clientId, sourceType: { $in: ["order", "order_correction"] }, sourceId: String(orderId),
+                $or: [{ type: "sale" }, { sourceType: "order_correction", type: "adjust" }]
+            }).select("itemId qty qtySigned type sourceType").lean().session(session);
+            const quantities = new Map();
+            for (const movement of soldMovements) {
+                const itemId = String(movement.itemId);
+                const signed = movement.qtySigned == null
+                    ? (movement.type === "sale" ? -num(movement.qty, 0) : num(movement.qty, 0))
+                    : num(movement.qtySigned, 0);
+                quantities.set(itemId, (quantities.get(itemId) || 0) - signed);
+            }
+            for (const [itemId, qtyToAdd] of quantities) {
+                if (qtyToAdd > 0) await addBackOne(itemId, qtyToAdd);
             }
 
             order.inventoryDeducted = false;
@@ -543,14 +596,16 @@ async function restoreInventoryForOrder(orderId, opts = {}) {
 
             result = { skipped: false, orderId: String(orderId), movementsCreated };
 
-        });
+        };
+        if (externalSession) await performInventoryWork();
+        else await session.withTransaction(performInventoryWork);
         return result;
     } catch (e) {
         // si no hay replica set, mejor que te falle explícito para que lo veas
         throw e;
     } finally {
-        session.endSession();
+        if (!externalSession) await session.endSession();
     }
 }
 
-module.exports = { deductInventoryForOrder, restoreInventoryForOrder };
+module.exports = { deductInventoryForOrder, restoreInventoryForOrder, getExtraStockLines, shouldUseRecipe, shouldTrackDirectStock };

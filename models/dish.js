@@ -65,6 +65,41 @@ const dishSchema = new mongoose.Schema(
         // Para platos (menú). Para inventario lo dejaremos en 0 / "Inventario"
         price: { type: Number, required: true, min: 0 },
         category: { type: String, required: true, trim: true },
+        // ======================================================
+// IMPUESTO DEL PRODUCTO
+// ======================================================
+//
+// null = utilizar impuesto predeterminado del tenant.
+//
+// Si tiene un ID:
+// utilizar específicamente ese impuesto.
+//
+// Para productos exentos NO usamos un boolean especial.
+// Se asigna un impuesto configurado con 0%.
+// ======================================================
+
+        taxId: {
+            type: String,
+            trim: true,
+            default: null,
+            index: true,
+        },
+        // ======================================================
+// TRATAMIENTO DEL IMPUESTO EN EL PRECIO
+// ======================================================
+//
+// null  = heredar del impuesto configurado
+// true  = impuesto incluido en el precio
+// false = impuesto se agrega encima del precio
+//
+// Esto permite que dos productos con el mismo impuesto
+// tengan diferente tratamiento de precio.
+// ======================================================
+
+        taxIncludedOverride: {
+            type: Boolean,
+            default: null,
+        },
         imageUrl: { type: String, default: "" },
 
         productionArea: {
@@ -132,6 +167,8 @@ const dishSchema = new mongoose.Schema(
         weightUnit: { type: String, enum: ["lb", "kg"], default: "lb" },
         pricePerLb: { type: Number, default: null },
 
+        // ID del plato en el catálogo maestro; el plato local mantiene su propio _id.
+        menuSourceDishId: { type: mongoose.Schema.Types.ObjectId, ref: "dish", default: null, index: true },
         tenantId: { type: String, required: true, index: true },
         clientId: { type: String, required: true, index: true },
 
@@ -173,5 +210,9 @@ dishSchema.index(
     { tenantId: 1, clientId: 1, category: 1, name: 1, isInventoryItem: 1 },
     { unique: true }
 );
+
+// Una sola copia local por plato del catálogo principal y sucursal.
+dishSchema.index({ tenantId: 1, clientId: 1, menuSourceDishId: 1 },
+    { unique: true, partialFilterExpression: { menuSourceDishId: { $type: "objectId" } } });
 
 module.exports = mongoose.model("dish", dishSchema);
