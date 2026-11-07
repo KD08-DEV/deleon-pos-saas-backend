@@ -755,7 +755,7 @@ exports.updateEmployee = async (req, res) => {
 
         // Verificar que el empleado existe y pertenece al mismo tenant
         const employee = await User.findOne({ _id: id, tenantId: req.user.tenantId });
-        
+
         if (!employee) {
             return res.status(404).json({ success: false, message: "Empleado no encontrado" });
         }
@@ -989,6 +989,17 @@ exports.updateEmployee = async (req, res) => {
                 message: "La asignación del empleado cambió. Actualiza la lista y vuelve a intentar." });
         }
 
+        try {
+            req.app?.get?.("io")
+                ?.in?.(`tenant:${req.scope.tenantId}:user:${employee._id}`)
+                ?.disconnectSockets?.(true);
+        } catch (socketError) {
+            console.error(
+                "SOCKET_EMPLOYEE_DISCONNECT_FAILED",
+                socketError?.message
+            );
+        }
+
         res.status(200).json({
             success: true,
             message: "Empleado actualizado exitosamente",
@@ -1002,22 +1013,22 @@ exports.updateEmployee = async (req, res) => {
         });
     } catch (error) {
         console.error("❌ Error al actualizar empleado:", error);
-        
+
         // Manejar errores de validación de Mongoose
         if (error.name === "ValidationError") {
             const messages = Object.values(error.errors).map(e => e.message).join(", ");
             return res.status(400).json({ success: false, message: messages });
         }
-        
+
         // Manejar errores de duplicación
         if (error.code === 11000) {
             return res.status(400).json({ success: false, message: "El email ya está en uso" });
         }
 
-        res.status(500).json({ 
-            success: false, 
+        res.status(500).json({
+            success: false,
             message: "Error al actualizar empleado",
-            error: error.message 
+            error: error.message
         });
     }
 };
@@ -2678,27 +2689,7 @@ exports.updateFiscalConfig = async (req, res) => {
                 `tenant:${tenantId}`
             ).emit(
                 "tenant:configUpdated",
-                {
-                    tenantId,
-
-                    localization:
-                    updated.localization,
-
-                    taxIdentity:
-                    updated.taxIdentity,
-
-                    taxConfig:
-                    updated.taxConfig,
-
-                    features:
-                    updated.features,
-
-                    fiscal:
-                    updated.fiscal,
-
-                    business:
-                    updated.business,
-                }
+                { tenantId }
             );
         }
 
@@ -3066,12 +3057,7 @@ exports.uploadTenantLogo = async (req, res) => {
 
         const io = req.app.get("io");
         if (io) {
-            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", {
-                tenantId,
-                features: updated.features,
-                fiscal: updated.fiscal,
-                business: updated.business,
-            });
+            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", { tenantId });
         }
 
         return res.json({
@@ -3138,12 +3124,7 @@ exports.deleteTenantLogo = async (req, res) => {
 
         const io = req.app.get("io");
         if (io) {
-            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", {
-                tenantId,
-                features: updated.features,
-                fiscal: updated.fiscal,
-                business: updated.business,
-            });
+            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", { tenantId });
         }
 
         return res.json({

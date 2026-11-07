@@ -1,3 +1,5 @@
+const { wasPrepared, authorizeInventoryReturn } = require("../services/inventory/returnAuthorization");
+const { customizedRecipe } = require("../services/inventory/customizedRecipe");
 "use strict";
 const mongoose=require("mongoose");
 const Order=require("../models/orderModel");
@@ -13,7 +15,12 @@ const {summarize,bad,money,round}=require("../services/orders/orderCorrectionCal
 const {getExtraStockLines,shouldUseRecipe,shouldTrackDirectStock}=require("../services/inventory/deductInventoryForOrder");
 
 const NON_CREDIT_METHODS = new Set(["Efectivo","Tarjeta","Transferencia","Pedido Ya","Uber Eats","Otros"]);
-function fiscalLocked(o){return Boolean(o?.fiscal?.requested||o?.fiscal?.ncfType||o?.fiscal?.ncfNumber||o?.fiscal?.ecfDocumentType||o?.ncfNumber||o?.eNCF||o?.ecf?.eNCF||o?.ecf?.exists||o?.accountReceivableId);}
+function fiscalLocked(o){
+  const number=String(o?.fiscal?.ncfNumber||o?.ncfNumber||"");
+  const traditional=["B01","B02"].includes(o?.fiscal?.ncfType)||/^B0[12]\d+$/.test(number);
+  return Boolean(o?.fiscal?.ecfDocumentType||o?.eNCF||o?.ecf?.eNCF||o?.ecf?.exists||o?.accountReceivableId||
+    (number&&!/^B0[12]\d+$/.test(number))||(o?.fiscal?.requested&&!traditional));
+}
 const owns= (req,id)=>({_id:id,tenantId:req.tenantId,...(req.clientId==="default"?{$or:[{clientId:"default"},{clientId:{$exists:false}},{clientId:null},{clientId:""}]}:{clientId:req.clientId})});
 const dishScope=req=>({tenantId:req.tenantId,...(req.clientId==="default"?{$or:[{clientId:"default"},{clientId:{$exists:false}},{clientId:null}]}:{clientId:req.clientId}),isArchived:{$ne:true}});
 async function getOrderAndTenant(req,session){
@@ -48,7 +55,7 @@ function normalizeAddon(add, dish, originalLine){
 }
 async function buildCandidate(req,order,tenant,session){
   const p=req.body||{};
-  const legalKeys=["items","bills","paymentMethod","orderNote","reason","expectedUpdatedAt","settlement"];
+  const legalKeys=["items","bills","paymentMethod","orderNote","reason","expectedUpdatedAt","settlement","inventoryReturnConfirmed"];
   if(Object.keys(p).some(k=>!legalKeys.includes(k)))throw bad("UNSUPPORTED_CORRECTION_FIELD");
   const method=p.paymentMethod??order.paymentMethod;
   if(!NON_CREDIT_METHODS.has(method))throw bad("PAYMENT_METHOD_NOT_SUPPORTED");
@@ -78,15 +85,15 @@ async function buildCandidate(req,order,tenant,session){
     const availableTaxes=tenant?.taxConfig?.taxes||[];
     if(requestedTaxId && availableTaxes.length && !availableTaxes.some(t=>String(t.id)===String(requestedTaxId)&&t.active!==false))throw bad("ITEM_TAX_NOT_ACTIVE",400);
     const taxIncluded=typeof line.taxIncludedOverride==="boolean"?line.taxIncludedOverride:(typeof dish.taxIncludedOverride==="boolean"?dish.taxIncludedOverride:null);
-    normalized.push({lineId,dishId:dish._id,name:dish.name,category:dish.category||"",presentation:String(line.presentation||"Regular").slice(0,100),productionArea:dish.productionArea||"kitchen",qtyType:line.qtyType==="weight"?"weight":"unit",weightUnit:line.weightUnit==="kg"?"kg":"lb",quantity:qty,unitPrice,price:round(unitPrice*qty),addons,modifiers:Array.isArray(line.modifiers)?line.modifiers.slice(0,25):[],note:String(line.note||"").slice(0,500),taxId:requestedTaxId||null,taxIncludedOverride:taxIncluded,printedQty:old&&JSON.stringify(old.addons||[])===JSON.stringify(addons)&&old.quantity===qty?old.printedQty||0:0});
+    normalized.push({lineId,dishId:dish._id,name:dish.name,category:dish.category||"",presentation:String(line.presentation||"Regular").slice(0,100),productionArea:dish.productionArea||"kitchen",qtyType:line.qtyType==="weight"?"weight":"unit",weightUnit:line.weightUnit==="kg"?"kg":"lb",quantity:qty,unitPrice,price:round(unitPrice*qty),addons,modifiers:Array.isArray(line.modifiers)?line.modifiers.slice(0,25):[],note:String(line.note||"").slice(0,500),taxId:requestedTaxId||null,taxIncludedOverride:taxIncluded,printedQty:old&&JSON.stringify(old.addons||[])===JSON.stringify(addons)&&old.quantity===qty&&JSON.stringify(old.modifiers||[])===JSON.stringify(line.modifiers||[])&&String(old.note||"")===String(line.note||"").slice(0,500)&&String(old.presentation||"Regular")===String(line.presentation||"Regular").slice(0,100)?old.printedQty||0:0});
   }
   const existing=order.bills?.toObject?order.bills.toObject():order.bills||{};
   const incoming=p.bills||{};
   if(!incoming||typeof incoming!=="object"||Array.isArray(incoming))throw bad("INVALID_BILLS");
-  const keys=["discount","taxEnabled","tipEnabled","tipAmount","deliveryFee"];
+  const keys=["discount","taxEnabled","legalTipEnabled","tipEnabled","tipAmount","deliveryFee"];
   if(Object.keys(incoming).some(k=>!keys.includes(k)))throw bad("UNSUPPORTED_BILL_FIELD");
-  if(["taxEnabled","tipEnabled"].some(k=>incoming[k]!==undefined&&typeof incoming[k]!=="boolean"))throw bad("INVALID_BILL_FLAGS");
-  const bills={discount:incoming.discount??existing.discount??0,taxEnabled:incoming.taxEnabled??existing.taxEnabled??true,tipEnabled:incoming.tipEnabled??existing.tipEnabled??true,tipAmount:incoming.tipAmount??existing.tipAmount??existing.tip??0,deliveryFee:incoming.deliveryFee??existing.deliveryFee??0};
+  if(["taxEnabled","legalTipEnabled","tipEnabled"].some(k=>incoming[k]!==undefined&&typeof incoming[k]!=="boolean"))throw bad("INVALID_BILL_FLAGS");
+  const bills={legalTipEnabled:incoming.legalTipEnabled??existing.legalTipEnabled??true,discount:incoming.discount??existing.discount??0,taxEnabled:incoming.taxEnabled??existing.taxEnabled??true,tipEnabled:incoming.tipEnabled??existing.tipEnabled??true,tipAmount:incoming.tipAmount??existing.tipAmount??existing.tip??0,deliveryFee:incoming.deliveryFee??existing.deliveryFee??0};
   const calculated=summarize({tenant,items:normalized,bills,source:order.orderSource,commissionRate:order.commissionRate});
   const previousTotal=round(Number(existing.totalWithTax??existing.total??0));
   const newTotal=calculated.bills.totalWithTax;
@@ -98,17 +105,17 @@ async function buildCandidate(req,order,tenant,session){
   })).sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
   const itemView=rows=>rows.map(i=>({
     lineId:String(i.lineId||""),dishId:String(i.dishId||""),quantity:Number(i.quantity||0),unitPrice:round(Number(i.unitPrice||0)),
-    addons:normalizedExtras(i),note:String(i.note||""),presentation:String(i.presentation||"Regular"),
+    addons:normalizedExtras(i),modifiers:Array.isArray(i.modifiers)?i.modifiers:[],note:String(i.note||""),presentation:String(i.presentation||"Regular"),
     taxId:String(i.taxId||""),taxIncludedOverride:i.taxIncludedOverride??null,
   }));
-  const stockView=rows=>rows.map(i=>({dishId:String(i.dishId||""),quantity:Number(i.quantity||0),
+  const stockView=rows=>rows.map(i=>({modifiers:(i.modifiers||[]).filter(m=>m.type==="remove"),dishId:String(i.dishId||""),quantity:Number(i.quantity||0),
     addons:normalizedExtras(i).filter(e=>e.extraDishId).map(e=>({extraDishId:e.extraDishId,quantity:e.quantity}))}));
   const previousLines=itemView(oldItemList);
   const newLines=itemView(normalized);
   const itemsChanged=JSON.stringify(previousLines)!==JSON.stringify(newLines);
   const inventoryChanged=JSON.stringify(stockView(oldItemList))!==JSON.stringify(stockView(normalized));
-  const previousBills={discount:round(existing.discount||0),taxEnabled:!!existing.taxEnabled,tipEnabled:!!existing.tipEnabled,tipAmount:round(existing.tipAmount||existing.tip||0),deliveryFee:round(existing.deliveryFee||0)};
-  const nextBills={discount:round(bills.discount),taxEnabled:bills.taxEnabled,tipEnabled:bills.tipEnabled,tipAmount:round(bills.tipEnabled?bills.tipAmount:0),deliveryFee:round(bills.deliveryFee)};
+  const previousBills={legalTipEnabled:existing.legalTipEnabled!==false,discount:round(existing.discount||0),taxEnabled:!!existing.taxEnabled,tipEnabled:!!existing.tipEnabled,tipAmount:round(existing.tipAmount||existing.tip||0),deliveryFee:round(existing.deliveryFee||0)};
+  const nextBills={legalTipEnabled:bills.legalTipEnabled!==false,discount:round(bills.discount),taxEnabled:bills.taxEnabled,tipEnabled:bills.tipEnabled,tipAmount:round(bills.tipEnabled?bills.tipAmount:0),deliveryFee:round(bills.deliveryFee)};
   const changed=[itemsChanged?"items":null,JSON.stringify(previousBills)!==JSON.stringify(nextBills)?"bills":null,method!==order.paymentMethod?"paymentMethod":null,note.trim()!==String(order.orderNote||"")?"orderNote":null].filter(Boolean);
   if(!changed.length)throw bad("NO_CHANGES",409);
   return {normalized,calculated,method,note:note.trim(),delta,previousTotal,newTotal,itemsChanged,inventoryChanged,changed,previousLines,newLines,previousBills,nextBills};
@@ -129,31 +136,44 @@ function sessionIsOpen(cashSession) {
 }
 function sumMap(rows){const out=new Map();for(const m of rows){const id=String(m.itemId);out.set(id,round6((out.get(id)||0)+(m.qtySigned==null?(m.type==="sale"?-Number(m.qty||0):Number(m.qty||0)):Number(m.qtySigned))));}return out;}
 function round6(v){return Math.round((v+Number.EPSILON)*1e6)/1e6;}
-async function reconcileInventory(req,order,lines,session){
-  if(!order.inventoryDeducted)return 0;
-  const prevMov=await InventoryMovement.find({tenantId:req.tenantId,clientId:req.clientId,sourceId:String(order._id),sourceType:{$in:["order","order_correction"]}}).session(session).lean();
-  const prior=sumMap(prevMov.filter(m=>(m.sourceType==="order"&&m.type==="sale")||m.sourceType==="order_correction"));
+async function stockDemandForLines(req,lines,session){
   const desired=new Map();
   const ds=await Dish.find({...dishScope(req),_id:{$in:lines.map(x=>x.dishId)}}).lean().session(session);
   const dishMap=new Map(ds.map(d=>[String(d._id),d]));
   const add=(id,qty)=>desired.set(String(id),round6((desired.get(String(id))||0)+qty));
   for(const line of lines){const dish=dishMap.get(String(line.dishId));if(!dish)throw bad("DISH_NOT_FOUND_IN_BRANCH",409);const qty=Number(line.quantity);
-    if(shouldUseRecipe(dish)){for(const ing of dish.recipe||[]){if(ing.ingredientDishId&&Number(ing.qty)>0)add(ing.ingredientDishId,qty*Number(ing.qty));}}
+    if(shouldUseRecipe(dish)){for(const ing of customizedRecipe(dish,line)){if(ing.ingredientDishId&&Number(ing.qty)>0)add(ing.ingredientDishId,qty*Number(ing.qty));}}
     else if(shouldTrackDirectStock(dish))add(dish._id,qty);
     for(const ex of await getExtraStockLines({soldDish:dish,line,soldAmount:qty,tenantId:req.tenantId,clientId:req.clientId,session})){add(ex.itemId,ex.qty);}
   }
+  return desired;
+}
+async function assertCorrectionInventoryState(req,order,c,session){
+  if(order.paymentStatus!=="Pagado"||!c.inventoryChanged||order.inventoryDeducted)return;
+  const before=await stockDemandForLines(req,order.items||[],session);
+  const after=await stockDemandForLines(req,c.normalized,session);
+  for(const id of new Set([...before.keys(),...after.keys()])){
+    if(Math.abs((before.get(id)||0)-(after.get(id)||0))>0.0000001)throw bad("INVENTORY_STATE_UNVERIFIED",409);
+  }
+}
+async function reconcileInventory(req,order,lines,session){
+  if(!order.inventoryDeducted)return {movements:0,costDelta:0};
+  const prevMov=await InventoryMovement.find({tenantId:req.tenantId,clientId:req.clientId,sourceId:String(order._id),sourceType:{$in:["order","order_correction"]}}).session(session).lean();
+  const prior=sumMap(prevMov.filter(m=>(m.sourceType==="order"&&m.type==="sale")||m.sourceType==="order_correction"));
+  const desired=await stockDemandForLines(req,lines,session);
   let movements=0, costDelta=0;
   for(const id of new Set([...desired.keys(),...prior.keys()])){
     const actualConsumed=round6(-(prior.get(id)||0));const nextConsumed=round6(desired.get(id)||0);
     const change=round6(nextConsumed-actualConsumed);if(Math.abs(change)<0.0000001)continue;
-    const inv=await Dish.findOne({...dishScope(req),_id:id,$or:[{inventoryType:{$in:["direct","ingredient"]}},{inventoryType:{$exists:false},isInventoryItem:true},{inventoryType:{$exists:false},inventoryCategoryId:{$exists:true,$ne:null}}]}).session(session);
+    if(change<0)await authorizeInventoryReturn(order,{userId:req.user._id,confirmed:req.body.inventoryReturnConfirmed},session);
+    const inv=await Dish.findOne({$and:[dishScope(req),{_id:id,$or:[{inventoryType:{$in:["direct","ingredient"]}},{inventoryType:{$exists:false},isInventoryItem:true},{inventoryType:{$exists:false},inventoryCategoryId:{$exists:true,$ne:null}}]}]}).session(session);
     if(!inv)throw bad("INVENTORY_ITEM_NOT_FOUND",409);
     const before=Number(inv.stockCurrent||0);const after=round6(before-change);
     if(inv.allowNegativeStock===false&&after<0)throw bad("INSUFFICIENT_STOCK",409);
     inv.stockCurrent=after;await inv.save({session});
     const unitCost=Number(inv.avgCost||inv.lastCost||0);
     costDelta=round(costDelta+change*unitCost);
-    await InventoryMovement.create([{tenantId:req.tenantId,clientId:req.clientId,itemId:inv._id,type:"adjust",qty:Math.abs(change),qtySigned:-change,unitCost,costAmount:round(Math.abs(change)*unitCost),beforeStock:before,afterStock:after,note:`Correction order ${order._id}`,createdBy:req.user._id,sourceType:"order_correction",sourceId:String(order._id)}],{session});
+    await InventoryMovement.create([{tenantId:req.tenantId,clientId:req.clientId,itemId:inv._id,type:"adjust",qty:Math.abs(change),qtySigned:-change,unitCost,costAmount:round(Math.abs(change)*unitCost),beforeStock:before,afterStock:after,note:`Correction order ${order._id}${change<0&&wasPrepared(order)?"; devolución física confirmada por administrador":""}`,createdBy:req.user._id,sourceType:"order_correction",sourceId:String(order._id)}],{session});
     movements++;
   }
   return {movements,costDelta};
@@ -161,22 +181,24 @@ async function reconcileInventory(req,order,lines,session){
 async function previewNormalOrderCorrection(req,res,next){try{
   const {order,tenant}=await getOrderAndTenant(req,null);const c=await buildCandidate(req,order,tenant,null);
   const paid=order.paymentStatus==="Pagado";
+  await assertCorrectionInventoryState(req,order,c,null);
   const cashSession=paid?await lookupOriginalCashSession(order,req,null):null;
   const postClose=paid&&!sessionIsOpen(cashSession);
-  return res.json({success:true,data:{previousTotal:c.previousTotal,newTotal:c.newTotal,delta:c.delta,items:c.calculated.items,bills:c.calculated.bills,changed:c.changed,paid,canApply:true,postCloseAdjustment:postClose,requiresSettlement:paid&&(Math.abs(c.delta)>=0.01||c.changed.includes("paymentMethod")),reason:null}});
+  return res.json({success:true,data:{previousTotal:c.previousTotal,newTotal:c.newTotal,delta:c.delta,items:c.calculated.items,bills:c.calculated.bills,changed:c.changed,paid,canApply:true,postCloseAdjustment:postClose,requiresInventoryReturnApproval:Boolean(order.inventoryDeducted&&wasPrepared(order)&&c.inventoryChanged),requiresSettlement:paid&&(Math.abs(c.delta)>=0.01||c.changed.includes("paymentMethod")),reason:null}});
 }catch(e){return res.status(e.statusCode||500).json({success:false,code:e.code||e.message});}}
 async function correctNormalOrder(req,res,next){
   const reason=String(req.body?.reason||"").trim();if(reason.length<8||reason.length>500)return res.status(400).json({success:false,code:"CORRECTION_REASON_REQUIRED"});
   if(!req.body?.expectedUpdatedAt)return res.status(400).json({success:false,code:"EXPECTED_VERSION_REQUIRED"});
-  const session=await mongoose.startSession();
+  let session;
   try{
+    session=await mongoose.startSession();
     let saved;let lastCorrectionCode="";
     await session.withTransaction(async()=>{
       const {order,tenant}=await getOrderAndTenant(req,session);
       if(new Date(req.body.expectedUpdatedAt).getTime()!==new Date(order.updatedAt).getTime())throw bad("ORDER_CHANGED_RELOAD",409);
       const c=await buildCandidate(req,order,tenant,session);
       const paid=order.paymentStatus==="Pagado";
-      if(paid&&c.inventoryChanged&&!order.inventoryDeducted)throw bad("INVENTORY_STATE_UNVERIFIED",409);
+      await assertCorrectionInventoryState(req,order,c,session);
       const cashSession=await lookupOriginalCashSession(order,req,session);
       let settlement=null;
       if(paid&&(Math.abs(c.delta)>=0.01||c.changed.includes("paymentMethod"))){
@@ -195,7 +217,7 @@ async function correctNormalOrder(req,res,next){
       const inventoryChange=c.inventoryChanged?await reconcileInventory(req,order,c.normalized,session):{costDelta:0};
       const audit={correctionCode,at:new Date(),by:req.user._id,reason,changed:c.changed,previousPaymentMethod:order.paymentMethod,nextPaymentMethod:c.method,previousNote:order.orderNote||"",nextNote:c.note,previousTotal:c.previousTotal,nextTotal:c.newTotal,previousItems:c.itemsChanged?previous.items:[],nextItems:c.itemsChanged?c.calculated.items:[],previousBills:previous.bills,nextBills:c.calculated.bills,settlement};
       const now=new Date();
-      const changed=await Order.findOneAndUpdate({...owns(req,order._id),updatedAt:order.updatedAt},{$set:{items:c.calculated.items,bills:c.calculated.bills,paymentMethod:c.method,orderNote:c.note,commissionAmount:c.calculated.commissionAmount,netTotal:c.calculated.netTotal,cogsTotal:round(Number(order.cogsTotal||0)+inventoryChange.costDelta),invoiceUrl:"",invoicePath:""},$push:{correctionHistory:audit}},{new:true,runValidators:true,session}).select("-correctionHistory");
+      const changed=await Order.findOneAndUpdate({...owns(req,order._id),updatedAt:order.updatedAt},{$set:{...(wasPrepared(order)?{inventoryPreparedAt:order.inventoryPreparedAt||new Date()}:{}),items:c.calculated.items,bills:c.calculated.bills,paymentMethod:c.method,orderNote:c.note,commissionAmount:c.calculated.commissionAmount,netTotal:c.calculated.netTotal,cogsTotal:round(Number(order.cogsTotal||0)+inventoryChange.costDelta),invoiceUrl:"",invoicePath:""},$push:{correctionHistory:audit}},{new:true,runValidators:true,session}).select("-correctionHistory");
       if(!changed)throw bad("ORDER_CHANGED_RELOAD",409);
       if(sessionIsOpen(cashSession)&&settlement){
         cashSession.movements.push({type:"PAYMENT_CORRECTION",amount:c.delta,by:req.user._id,at:now,note:`Order ${order._id}: ${settlement.direction} ${settlement.amount} (${settlement.reference})`});
@@ -216,7 +238,9 @@ async function correctNormalOrder(req,res,next){
       }
       saved=changed;
     });
-    req.app?.get?.("io")?.to(`tenant:${req.tenantId}`)?.emit("tenant:orderUpdated",{tenantId:req.tenantId,clientId:req.clientId,orderId:String(saved._id)});
+    // Notification failures do not negate an already committed correction.
+    try { req.app?.get?.("io")?.to(`tenant:${req.tenantId}:branch:${req.clientId}`)?.emit("tenant:orderUpdated",{tenantId:req.tenantId,clientId:req.clientId,orderId:String(saved._id)}); }
+    catch (error) { console.error("CORRECTION_SOCKET_NOTIFICATION_FAILED", error.message); }
     res.set("Cache-Control","no-store");return res.json({success:true,data:saved,invoiceNeedsRegeneration:true,correctionCode:lastCorrectionCode});
   }catch(e){
     const msg=String(e?.message||"");
@@ -224,7 +248,7 @@ async function correctNormalOrder(req,res,next){
       return res.status(503).json({success:false,code:"MONGODB_TRANSACTIONS_REQUIRED"});
     return res.status(e.statusCode||500).json({success:false,code:e.code||e.message});
   }
-  finally{await session.endSession();}
+  finally{if(session)await session.endSession();}
 }
 
 async function getCorrectionCatalog(req,res){
@@ -237,7 +261,7 @@ async function getCorrectionCatalog(req,res){
   if(ids.length&&q)filters.push({_id:{$in:ids}});
   if(q)filters.push({name:{$regex:q.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),$options:"i"}});
   const query={$and:[scoped,{category:{$ne:"Inventario"},inventoryType:{$ne:"ingredient"}},...(filters.length?[{$or:filters}]:[])]};
-  const items=await Dish.find(query).select("_id name category price inventoryType sellMode weightUnit customization.extras productionArea").sort({name:1}).limit(200).lean();
+  const items=await Dish.find(query).select("_id name category price inventoryType sellMode weightUnit customization.extras customization.removableIngredients productionArea").sort({name:1}).limit(200).lean();
   const tenant=await Tenant.findOne({tenantId:req.tenantId}).select("taxConfig").lean();
   res.set("Cache-Control","no-store");return res.json({success:true,data:items,taxes:(tenant?.taxConfig?.taxes||[]).filter(x=>x.active!==false).map(x=>({id:x.id,name:x.name,ratePercent:x.ratePercent}))});
  }catch(e){return res.status(500).json({success:false,code:"CATALOG_LOAD_FAILED"});}

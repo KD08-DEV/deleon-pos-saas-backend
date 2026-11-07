@@ -53,6 +53,9 @@ io.use(async (socket, next) => {
         if (!user || !user.activeSessionId || user.activeSessionId !== decoded.sid) {
             return next(new Error("SESSION_EXPIRED"));
         }
+        if (decoded.tenantId && String(decoded.tenantId) !== String(user.tenantId)) {
+            return next(new Error("SESSION_TENANT_MISMATCH"));
+        }
         const [tenant, membership] = await Promise.all([
             Tenant.findOne({ tenantId: user.tenantId, status: "active" }).select("tenantId").lean(),
             Membership.findOne({ tenantId: user.tenantId, user: user._id, status: "active" }).lean(),
@@ -73,6 +76,10 @@ io.use(async (socket, next) => {
         socket.data.tenantId = user.tenantId;
         socket.data.clientId = clientId;
         socket.data.userId = String(user._id);
+        socket.data.sid = decoded.sid;
+        socket.data.expiresAt = Number(decoded.exp || 0);
+        socket.data.memberRole = String(membership.role);
+        socket.data.memberBranches = JSON.stringify(allowedIds.slice().sort());
         return next();
     } catch (error) { return next(new Error("INVALID_TOKEN")); }
 });
@@ -80,6 +87,94 @@ io.on("connection", (socket) => {
     const { tenantId, clientId } = socket.data;
     socket.join(`tenant:${tenantId}`); // Existing controller server-side events remain supported.
     socket.join(`tenant:${tenantId}:branch:${clientId}`);
+    socket.join(`tenant:${tenantId}:user:${socket.data.userId}`);
+
+    // Revalidacion de sesiones persistentes.
+    // Una revocacion externa se detecta en el siguiente ciclo.
+    const SOCKET_REVALIDATE_MS = 15000;
+    let revalidating = false;
+
+    const revalidateSocket = async () => {
+        if (!socket.connected || revalidating) return;
+        revalidating = true;
+
+        try {
+            if (socket.data.expiresAt &&
+                Date.now() >= socket.data.expiresAt * 1000) {
+                socket.disconnect(true);
+                return;
+            }
+
+            const [currentUser, currentTenant, currentMember] =
+                await Promise.all([
+                    User.findById(socket.data.userId)
+                        .select("tenantId activeSessionId").lean(),
+                    Tenant.findOne({
+                        tenantId,
+                        status: "active"
+                    }).select("tenantId").lean(),
+                    Membership.findOne({
+                        tenantId,
+                        user: socket.data.userId,
+                        status: "active"
+                    }).select("role clientIds").lean()
+                ]);
+
+            if (!currentUser || !currentTenant || !currentMember ||
+                String(currentUser.tenantId) !== String(tenantId) ||
+                currentUser.activeSessionId !== socket.data.sid ||
+                String(currentMember.role) !== socket.data.memberRole) {
+                socket.disconnect(true);
+                return;
+            }
+
+            const currentBranches = (currentMember.clientIds || [])
+                .map(String).sort();
+
+            if (JSON.stringify(currentBranches) !==
+                socket.data.memberBranches) {
+                socket.disconnect(true);
+                return;
+            }
+
+            const isAdmin = ["Owner", "Admin"]
+                .includes(currentMember.role);
+
+            if (!isAdmin &&
+                !(clientId === "default" && currentBranches.length === 0) &&
+                !currentBranches.includes(clientId)) {
+                socket.disconnect(true);
+                return;
+            }
+
+            if (clientId !== "default") {
+                const Client = require("./models/clientModel");
+
+                if (!await Client.exists({
+                    tenantId, clientId, isActive: true
+                })) {
+                    socket.disconnect(true);
+                }
+            }
+        } catch (error) {
+            // Si falla la validacion, no conservar una
+            // conexion cuyo acceso no puede verificarse.
+            socket.disconnect(true);
+        } finally {
+            revalidating = false;
+        }
+    };
+
+    const revalidateTimer = setInterval(
+        () => { void revalidateSocket(); },
+        SOCKET_REVALIDATE_MS
+    );
+
+    revalidateTimer.unref?.();
+
+    socket.once("disconnect", () => {
+        clearInterval(revalidateTimer);
+    });
     // No client-supplied event payload is broadcast across other users/branches.
 });
 
