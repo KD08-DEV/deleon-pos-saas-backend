@@ -512,6 +512,19 @@ const logout = async (req, res, next) => {
             { _id: req.user._id },
             { $set: { activeSessionId: null, activeDeviceId: null } }
         );
+        try {
+            if (req.user.role !== "SuperAdmin") {
+                req.app?.get?.("io")
+                    ?.in?.(`tenant:${req.user.tenantId}:user:${req.user._id}`)
+                    ?.disconnectSockets?.(true);
+            }
+        } catch (socketError) {
+            console.error(
+                "SOCKET_LOGOUT_DISCONNECT_FAILED",
+                socketError?.message
+            );
+        }
+
         res.clearCookie("accessToken");
         res
             .status(200)

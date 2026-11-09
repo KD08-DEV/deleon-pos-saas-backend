@@ -15,6 +15,8 @@ router.get('/:id/accounts', requireScope({level:'client'}), requireRole('Owner',
 router.post('/:id/new-consumption', requireScope({level:'client'}), requireRole('Owner','Admin','Cajera','Camarero'), newConsumption);
 router.post('/:id/split', requireScope({level:'client'}), requireRole('Owner','Admin','Cajera','Camarero'), splitAccount);
 
+router.post('/:id/move', requireScope({level:'client'}), requireRole('Owner','Admin','Cajera','Camarero'), require('../controllers/moveTableController'));
+
 // Mesas del client actual
 router.post("/",    requireScope({ level: "client" }), requireRole("Owner","Admin"), addTable);
 router.get("/",     requireScope({ level: "client" }), requireRole("Owner","Admin","Cajera","Camarero"), getTables);

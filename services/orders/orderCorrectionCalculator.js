@@ -22,10 +22,10 @@ function summarize({tenant, items, bills, source="DINE_IN", commissionRate=0}) {
   const tip=tipEnabled?money(bills.tipAmount??0,"TIP"):0;
   const taxEnabled=(tenant?.taxConfig?.enabled!==false && features.tax?.enabled!==false) && bills.taxEnabled===true;
   const taxResult=calculateOrderTaxes({tenant,items:priced,discountAmount:discount,deliveryFee,taxesEnabled:taxEnabled});
-  const charges=calculateServiceCharges({tenant,taxResult,orderSource:source});
+  const charges=calculateServiceCharges({tenant,taxResult,orderSource:source,legalTipEnabled:bills.legalTipEnabled!==false});
   const total=round(taxResult.totalBeforeTip+charges.addedTotal+tip);
   const rate=Number(commissionRate)||0;
   const commissionAmount=round(taxResult.itemsTotalWithTax*rate);
-  return {items: taxResult.items,bills:{subtotal:taxResult.subtotal,total:taxResult.subtotal,discount,deliveryFee,tipEnabled,tip,tipAmount:tip,taxEnabled,tax:taxResult.taxTotal,taxEngineVersion:taxResult.engineVersion,subtotalAfterDiscount:taxResult.subtotalAfterDiscount,netAmount:taxResult.netAmount,deliveryTaxAmount:taxResult.deliveryTaxAmount,taxBreakdown:taxResult.taxBreakdown,serviceChargeTotal:charges.addedTotal,serviceChargeBreakdown:charges.breakdown,totalWithTax:total},commissionAmount,netTotal:round(total-commissionAmount)};
+  return {items: taxResult.items,bills:{subtotal:taxResult.subtotal,total:taxResult.subtotal,discount,deliveryFee,legalTipEnabled:bills.legalTipEnabled!==false,tipEnabled,tip,tipAmount:tip,taxEnabled,tax:taxResult.taxTotal,taxEngineVersion:taxResult.engineVersion,subtotalAfterDiscount:taxResult.subtotalAfterDiscount,netAmount:taxResult.netAmount,deliveryTaxAmount:taxResult.deliveryTaxAmount,taxBreakdown:taxResult.taxBreakdown,serviceChargeTotal:charges.addedTotal,serviceChargeBreakdown:charges.breakdown,totalWithTax:total},commissionAmount,netTotal:round(total-commissionAmount)};
 }
 module.exports={summarize,bad,money,round};

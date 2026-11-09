@@ -57,6 +57,19 @@ router.patch("/tenants/:tenantId/status", verifyToken, isSuperAdmin, async (req,
         return res.status(404).json({ message: "Tenant not found" });
     }
 
+    if (status === "suspended") {
+        try {
+            req.app?.get?.("io")
+                ?.in?.(`tenant:${tenantId}`)
+                ?.disconnectSockets?.(true);
+        } catch (socketError) {
+            console.error(
+                "SOCKET_TENANT_DISCONNECT_FAILED",
+                socketError?.message
+            );
+        }
+    }
+
     res.json({ success: true, data: tenant });
 });
 // =========================

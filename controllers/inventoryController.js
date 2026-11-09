@@ -1352,12 +1352,12 @@ exports.unarchiveItem = async (req, res, next) => {
     }
 };
 exports.processYield = async (req, res, next) => {
-    const session = await mongoose.startSession();
+    let session;
 
     try {
         const tenantId = req.scope?.tenantId;
         const clientId = req.scope?.clientId || "default";
-        const userId = req.scope?.userId || null;
+        const userId = req.user?._id || req.scope?.userId || null;
         // 1) primero lee el body
         const {
             itemId,
@@ -1367,6 +1367,7 @@ exports.processYield = async (req, res, next) => {
             steps = [],
             note = "",
             allowNegativeStock = false,
+            idempotencyKey,
         } = req.body || {};
 
 // 2) calcula stepsTxt y noteFinal con valores ya disponibles
@@ -1385,17 +1386,18 @@ exports.processYield = async (req, res, next) => {
             return res.status(400).json({ message: "itemId inválido" });
         }
 
-        const bought = num(purchasedQty);
-        const final = num(finalQty);
-        const tCost = num(totalCost);
+        const cleanKey = cleanIdempotencyKey(idempotencyKey);
+        const bought = num(purchasedQty, NaN);
+        const final = num(finalQty, NaN);
+        const tCost = num(totalCost, NaN);
 
-        if (bought <= 0 || final <= 0) {
+        if (!Number.isFinite(bought) || !Number.isFinite(final) || bought <= 0 || final <= 0) {
             return res.status(400).json({ message: "purchasedQty y finalQty deben ser > 0" });
         }
         if (final > bought) {
             return res.status(400).json({ message: "finalQty no puede ser mayor que purchasedQty" });
         }
-        if (tCost < 0) {
+        if (!Number.isFinite(tCost) || tCost < 0) {
             return res.status(400).json({ message: "totalCost inválido" });
         }
 
@@ -1405,16 +1407,14 @@ exports.processYield = async (req, res, next) => {
 
         let out = null;
 
+        session = await mongoose.startSession();
         await session.withTransaction(async () => {
             const dish = await Dish.findOne({
                 _id: itemId,
                 tenantId,
                 clientId,
                 isArchived: { $ne: true },
-                $or: [
-                    { isInventoryItem: true },
-                    { inventoryCategoryId: { $ne: null } },
-                ],
+                $or: stockManagedOrLegacyFilter(),
             }).session(session);
 
             if (!dish) {
@@ -1423,6 +1423,18 @@ exports.processYield = async (req, res, next) => {
                 throw err;
             }
 
+            if (cleanKey) {
+                const previous = await InventoryMovement.findOne({tenantId, clientId, idempotencyKey: cleanKey}).session(session);
+                if (previous) {
+                    if (previous.sourceType !== "yield" || String(previous.itemId) !== String(itemId) ||
+                        previous.qty !== wasteQty || previous.unitCost !== (purchaseUnitCost || null) || previous.note !== noteFinal) {
+                        throw createHttpError(409, "IDEMPOTENCY_KEY_CONFLICT");
+                    }
+                    out = {itemId: String(dish._id), beforeStock: previous.beforeStock,
+                        afterStock: previous.afterStock, wasteQty: previous.qty, duplicated: true};
+                    return;
+                }
+            }
             const beforeStock = num(dish.stockCurrent, 0);
             const afterStock = Number((beforeStock - wasteQty).toFixed(6));
 
@@ -1433,7 +1445,7 @@ exports.processYield = async (req, res, next) => {
             }
 
             // 1) Reducir stock por la merma del proceso (waste)
-            if (wasteQty > 0) {
+            if (wasteQty > 0 || cleanKey) {
                 await InventoryMovement.create(
                     [{
                         tenantId,
@@ -1448,6 +1460,7 @@ exports.processYield = async (req, res, next) => {
                         afterStock,
                         note: noteFinal,
                         createdBy: userId,
+                        idempotencyKey: cleanKey,
                         sourceType: "yield",
                         sourceId: String(dish._id),
                     }],
@@ -1488,112 +1501,23 @@ exports.processYield = async (req, res, next) => {
 
         return res.json({ ok: true, data: out });
     } catch (e) {
-        // fallback sin transacciones
+        // Stock y movimiento deben confirmarse juntos; no reintentar fuera
+        // de la transaccion cuando MongoDB no ofrece esa garantia.
         const msg = String(e?.message || "");
         const noTxn =
             msg.includes("Transaction numbers are only allowed") ||
             msg.includes("replica set") ||
             msg.includes("not supported");
-
-        if (!noTxn) {
-            const status = e.status || 500;
-            return res.status(status).json({ message: e.message || "Error en yield" });
-        }
-
-        // retry sin session
-        try {
-            const tenantId = req.scope?.tenantId;
-            const clientId = req.scope?.clientId || "default";
-            const userId = req.scope?.userId || null;
-
-            const {
-                itemId,
-                purchasedQty,
-                totalCost,
-                finalQty,
-                steps = [],
-                note = "",            // ✅ AGREGA ESTO
-                allowNegativeStock = false,
-            } = req.body || {};
-            const bought = num(purchasedQty);
-            const final = num(finalQty);
-            const tCost = num(totalCost);
-            const wasteQty = Number((bought - final).toFixed(6));
-            const purchaseUnitCost = bought > 0 ? Number((tCost / bought).toFixed(6)) : 0;
-            const effectiveUnitCost = final > 0 ? Number((tCost / final).toFixed(6)) : 0;
-
-            const dish = await Dish.findOne({
-                _id: itemId,
-                tenantId,
-                clientId,
-                isArchived: { $ne: true },
-                $or: [
-                    { isInventoryItem: true },
-                    { inventoryCategoryId: { $ne: null } },
-                ],
-            }).session(session);
-
-
-            if (!dish) return res.status(404).json({ message: "INVENTORY_ITEM_NOT_FOUND" });
-
-            const beforeStock = num(dish.stockCurrent, 0);
-            const afterStock = Number((beforeStock - wasteQty).toFixed(6));
-            if (!allowNegativeStock && afterStock < 0) return res.status(409).json({ message: "INSUFFICIENT_STOCK_FOR_YIELD" });
-
-            if (wasteQty > 0) {
-                await InventoryMovement.create({
-                    tenantId,
-                    clientId,
-                    itemId: dish._id,
-                    type: "waste",
-                    qty: wasteQty,
-                    qtySigned: -wasteQty,
-                    unitCost: purchaseUnitCost || null,
-                    costAmount: purchaseUnitCost ? Number((wasteQty * purchaseUnitCost).toFixed(2)) : null,
-                    beforeStock,
-                    afterStock,
-                    note: noteFinal,
-                    createdBy: userId,
-                    sourceType: "yield",
-                    sourceId: String(dish._id),
-                });
-            }
-
-            const avgBefore = num(dish.avgCost, 0);
-            const stockBeforeLot = Number((beforeStock - bought).toFixed(6));
-            const denom = stockBeforeLot + final;
-            const avgAfter =
-                denom > 0
-                    ? Number(((stockBeforeLot * avgBefore + tCost) / denom).toFixed(6))
-                    : (effectiveUnitCost || avgBefore);
-
-            dish.stockCurrent = afterStock;
-            dish.lastCost = effectiveUnitCost || dish.lastCost;
-            dish.avgCost = avgAfter || dish.avgCost;
-
-            await dish.save();
-
-            return res.json({
-                ok: true,
-                data: {
-                    itemId: String(dish._id),
-                    beforeStock,
-                    afterStock,
-                    wasteQty,
-                    purchaseUnitCost,
-                    effectiveUnitCost,
-                    avgCost: dish.avgCost,
-                    lastCost: dish.lastCost,
-                },
+        if (noTxn) {
+            return res.status(503).json({
+                message: "INVENTORY_TRANSACTIONS_REQUIRED",
             });
-        } catch (e2) {
-            return res.status(500).json({ message: e2?.message || "Error en yield (no-tx)" });
         }
+        return res.status(e.status || 500).json({ message: e.message || "Error en yield" });
     } finally {
-        session.endSession();
+        if (session) await session.endSession();
     }
 };
-
 
 
 

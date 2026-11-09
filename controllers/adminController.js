@@ -58,307 +58,9 @@ function getEffectivePaymentMethodForReport(o = {}) {
 
     return o?.paymentMethod || "Otros";
 }
-function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, endDate }) {
-    const rawClientId = String(clientId || "default").trim() || "default";
+const { buildLegacyReportFilter, buildCreditReportFilter } = require("../utils/salesReportFilter");
 
-    const rawRegister = registerId ? String(registerId).trim().toUpperCase() : "";
 
-    const normalizeReg =
-        !rawRegister || rawRegister === "__ALL_REGISTERS__" || rawRegister === "ALL"
-            ? ""
-            : rawRegister;
-
-    const clientScope = rawClientId === "default"
-        ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
-        : { clientId: rawClientId };
-
-    let registerScope = {};
-
-    if (normalizeReg) {
-        if (normalizeReg === "MAIN" || normalizeReg === "DEFAULT") {
-            registerScope = {
-                $or: [
-                    { registerId: "MAIN" },
-                    { registerId: "default" },
-                    { registerId: { $exists: false } },
-                    { registerId: null },
-                    { registerId: "" },
-                ],
-            };
-        } else {
-            registerScope = { registerId: normalizeReg };
-        }
-    }
-
-    const paidDateRange =
-        startDate && endDate
-            ? { paidAt: { $gte: startDate, $lte: endDate } }
-            : {};
-
-    const createdDateRange =
-        startDate && endDate
-            ? { createdAt: { $gte: startDate, $lte: endDate } }
-            : {};
-
-    const invoiceDateRange =
-        startDate && endDate
-            ? {
-                $or: [
-                    { invoicedAt: { $gte: startDate, $lte: endDate } },
-                    { createdAt: { $gte: startDate, $lte: endDate } },
-                ],
-            }
-            : {};
-
-    const paidAtMissing = {
-        $or: [
-            { paidAt: { $exists: false } },
-            { paidAt: null },
-            { paidAt: "" },
-        ],
-    };
-
-    const legacyPaymentStatusFilter = {
-        $or: [
-            { paymentStatus: { $exists: false } },
-            { paymentStatus: null },
-            { paymentStatus: "" },
-            { paymentStatus: "Pendiente" },
-        ],
-    };
-
-    return {
-        tenantId,
-
-        ...registerScope,
-
-        $and: [
-            clientScope,
-
-            {
-                isDraft: { $ne: true },
-            },
-
-            {
-                "items.0": { $exists: true },
-            },
-
-            {
-                $or: [
-                    { orderStatus: { $exists: false } },
-                    { orderStatus: { $nin: ["Cancelado", "Canceled", "Cancelled"] } },
-                ],
-            },
-
-            {
-                $or: [
-                    { paymentStatus: { $exists: false } },
-                    { paymentStatus: { $ne: "Anulado" } },
-                ],
-            },
-
-            {
-                $or: [
-                    // Venta moderna pagada: usa paidAt
-                    {
-                        paymentStatus: "Pagado",
-                        ...paidDateRange,
-                    },
-
-                    // Venta pagada vieja sin paidAt: usa invoicedAt o createdAt
-                    {
-                        paymentStatus: "Pagado",
-                        ...paidAtMissing,
-                        ...invoiceDateRange,
-                    },
-
-                    // Legacy: completada pero sin paymentStatus moderno
-                    {
-                        ...legacyPaymentStatusFilter,
-                        orderStatus: "Completado",
-                        ...createdDateRange,
-                    },
-
-                    // Legacy: fiscal solicitada pero sin paymentStatus moderno
-                    {
-                        ...legacyPaymentStatusFilter,
-                        "fiscal.requested": true,
-                        ...createdDateRange,
-                    },
-
-                    // Legacy: factura interna pero sin paymentStatus moderno
-                    {
-                        ...legacyPaymentStatusFilter,
-                        invoiceNumber: { $exists: true, $nin: [null, ""] },
-                        ...createdDateRange,
-                    },
-
-                    {
-                        ...legacyPaymentStatusFilter,
-                        facturaNo: { $exists: true, $nin: [null, ""] },
-                        ...createdDateRange,
-                    },
-
-                    {
-                        ...legacyPaymentStatusFilter,
-                        internalInvoiceNumber: { $exists: true, $nin: [null, ""] },
-                        ...createdDateRange,
-                    },
-                ],
-            },
-        ],
-    };
-}
-function buildCreditReportFilter({
-                                     tenantId,
-                                     clientId,
-                                     registerId,
-                                     startDate,
-                                     endDate,
-                                 }) {
-    const rawClientId =
-        String(clientId || "default").trim() ||
-        "default";
-
-    const rawRegister =
-        registerId
-            ? String(registerId)
-                .trim()
-                .toUpperCase()
-            : "";
-
-    const normalizedRegister =
-        !rawRegister ||
-        rawRegister ===
-        "__ALL_REGISTERS__" ||
-        rawRegister === "ALL"
-            ? ""
-            : rawRegister;
-
-    const clientScope = rawClientId === "default"
-        ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
-        : { clientId: rawClientId };
-
-    let registerScope = {};
-
-    if (normalizedRegister) {
-        if (
-            normalizedRegister === "MAIN" ||
-            normalizedRegister === "DEFAULT"
-        ) {
-            registerScope = {
-                $or: [
-                    { registerId: "MAIN" },
-                    { registerId: "default" },
-                    {
-                        registerId: {
-                            $exists: false,
-                        },
-                    },
-                    { registerId: null },
-                    { registerId: "" },
-                ],
-            };
-        } else {
-            registerScope = {
-                registerId:
-                normalizedRegister,
-            };
-        }
-    }
-
-    const andConditions = [
-        clientScope,
-
-        {
-            isDraft: {
-                $ne: true,
-            },
-        },
-
-        {
-            "items.0": {
-                $exists: true,
-            },
-        },
-
-        {
-            orderStatus: {
-                $nin: [
-                    "Cancelado",
-                    "Canceled",
-                    "Cancelled",
-                ],
-            },
-        },
-
-        {
-            paymentStatus: {
-                $ne: "Anulado",
-            },
-        },
-
-        {
-            paymentMethod: {
-                $regex:
-                    "^(Credito|Crédito|Credit)$",
-                $options: "i",
-            },
-        },
-    ];
-
-    if (startDate && endDate) {
-        andConditions.push({
-            $or: [
-                {
-                    invoicedAt: {
-                        $gte: startDate,
-                        $lte: endDate,
-                    },
-                },
-
-                {
-                    $and: [
-                        {
-                            $or: [
-                                {
-                                    invoicedAt: {
-                                        $exists:
-                                            false,
-                                    },
-                                },
-                                {
-                                    invoicedAt:
-                                        null,
-                                },
-                                {
-                                    invoicedAt:
-                                        "",
-                                },
-                            ],
-                        },
-                        {
-                            createdAt: {
-                                $gte:
-                                startDate,
-                                $lte:
-                                endDate,
-                            },
-                        },
-                    ],
-                },
-            ],
-        });
-    }
-
-    return {
-        tenantId,
-
-        ...registerScope,
-
-        $and: andConditions,
-    };
-}
 // 🔹 Obtener reportes (ventas filtradas + resumen diario)
 exports.getReports = async (req, res) => {
     try {
@@ -987,6 +689,17 @@ exports.updateEmployee = async (req, res) => {
         if (!updatedMembership) {
             return res.status(409).json({ success: false, code: "EMPLOYEE_MEMBERSHIP_CHANGED",
                 message: "La asignación del empleado cambió. Actualiza la lista y vuelve a intentar." });
+        }
+
+        try {
+            req.app?.get?.("io")
+                ?.in?.(`tenant:${req.scope.tenantId}:user:${employee._id}`)
+                ?.disconnectSockets?.(true);
+        } catch (socketError) {
+            console.error(
+                "SOCKET_EMPLOYEE_DISCONNECT_FAILED",
+                socketError?.message
+            );
         }
 
         res.status(200).json({
@@ -2678,27 +2391,7 @@ exports.updateFiscalConfig = async (req, res) => {
                 `tenant:${tenantId}`
             ).emit(
                 "tenant:configUpdated",
-                {
-                    tenantId,
-
-                    localization:
-                    updated.localization,
-
-                    taxIdentity:
-                    updated.taxIdentity,
-
-                    taxConfig:
-                    updated.taxConfig,
-
-                    features:
-                    updated.features,
-
-                    fiscal:
-                    updated.fiscal,
-
-                    business:
-                    updated.business,
-                }
+                { tenantId }
             );
         }
 
@@ -3066,12 +2759,7 @@ exports.uploadTenantLogo = async (req, res) => {
 
         const io = req.app.get("io");
         if (io) {
-            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", {
-                tenantId,
-                features: updated.features,
-                fiscal: updated.fiscal,
-                business: updated.business,
-            });
+            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", { tenantId });
         }
 
         return res.json({
@@ -3138,12 +2826,7 @@ exports.deleteTenantLogo = async (req, res) => {
 
         const io = req.app.get("io");
         if (io) {
-            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", {
-                tenantId,
-                features: updated.features,
-                fiscal: updated.fiscal,
-                business: updated.business,
-            });
+            io.to(`tenant:${tenantId}`).emit("tenant:configUpdated", { tenantId });
         }
 
         return res.json({

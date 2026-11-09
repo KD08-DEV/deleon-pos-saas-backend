@@ -1,5 +1,5 @@
 const router = require("express").Router();
-const { randomUUID } = require("crypto");
+const { getBranchPolicy, createBranch } = require("../services/branchPlanAccess");
 const verifyToken = require("../middlewares/tokenVerification");
 const requireScope = require("../middlewares/scope");
 const requireRole = require("../middlewares/requireRole");
@@ -43,7 +43,8 @@ router.get("/", requireRole("Owner", "Admin", "Cajera", "Camarero", "Cocina"), a
                 branch.ecfConfigurationStage = "preparation_only";
             }
         }
-        return res.json({ success: true, data: branches });
+        const policy = adminLike ? await getBranchPolicy(tenantId) : undefined;
+        return res.json({ success: true, data: branches, policy });
     } catch (e) { next(e); }
 });
 
@@ -51,28 +52,11 @@ router.get("/", requireRole("Owner", "Admin", "Cajera", "Camarero", "Cocina"), a
 router.post("/", requireRole("Owner", "Admin"), async (req, res, next) => {
     try {
         const tenantId = req.scope.tenantId;
-        const tenant = await Tenant.findOne({ tenantId }).select("plan").lean();
-        if (!tenant) return res.status(404).json({ message: "Tenant not found" });
-        const tier = TIERS[String(tenant.plan || "emprendedor").toLowerCase()] || TIERS.emprendedor;
-        if (tier.features.multiClient !== true) return res.status(403).json({ code: "PLAN_MULTI_BRANCH_DENIED" });
-        const maximum = tier.limits.maxClients;
-        const total = 1 + await Client.countDocuments({ tenantId, clientId: { $ne: "default" } });
-        if (maximum != null && total >= maximum) return res.status(403).json({ code: "BRANCH_LIMIT_REACHED" });
-        if (req.body?.menuMode === "shared" || req.body?.shareMenu === true) {
-            return res.status(409).json({ code: "SHARED_MENU_NOT_IMPLEMENTED", message: "Shared menu is not enabled until menu and stock isolation are complete" });
-        }
-        const name = String(req.body?.name || "").trim();
-        if (!name || name.length > 120) return res.status(400).json({ code: "INVALID_BRANCH_NAME" });
-        const clientId = randomUUID();
-        const doc = await Client.create({
-            tenantId, clientId, name, menuMode: "independent", isActive: true,
-            ecf: { enabled: false },
-            address: String(req.body?.address || "").slice(0, 200),
-            phone: String(req.body?.phone || "").slice(0, 40),
-        });
+        const doc = await createBranch(tenantId, req.body);
         return res.status(201).json({ success: true, data: doc });
     } catch (e) {
         if (e.code === 11000) return res.status(409).json({ code: "BRANCH_DUPLICATE" });
+        if (e.status && e.expose) return res.status(e.status).json({ code: e.message });
         next(e);
     }
 });
