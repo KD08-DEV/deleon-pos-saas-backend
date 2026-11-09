@@ -58,307 +58,9 @@ function getEffectivePaymentMethodForReport(o = {}) {
 
     return o?.paymentMethod || "Otros";
 }
-function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, endDate }) {
-    const rawClientId = String(clientId || "default").trim() || "default";
+const { buildLegacyReportFilter, buildCreditReportFilter } = require("../utils/salesReportFilter");
 
-    const rawRegister = registerId ? String(registerId).trim().toUpperCase() : "";
 
-    const normalizeReg =
-        !rawRegister || rawRegister === "__ALL_REGISTERS__" || rawRegister === "ALL"
-            ? ""
-            : rawRegister;
-
-    const clientScope = rawClientId === "default"
-        ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
-        : { clientId: rawClientId };
-
-    let registerScope = {};
-
-    if (normalizeReg) {
-        if (normalizeReg === "MAIN" || normalizeReg === "DEFAULT") {
-            registerScope = {
-                $or: [
-                    { registerId: "MAIN" },
-                    { registerId: "default" },
-                    { registerId: { $exists: false } },
-                    { registerId: null },
-                    { registerId: "" },
-                ],
-            };
-        } else {
-            registerScope = { registerId: normalizeReg };
-        }
-    }
-
-    const paidDateRange =
-        startDate && endDate
-            ? { paidAt: { $gte: startDate, $lte: endDate } }
-            : {};
-
-    const createdDateRange =
-        startDate && endDate
-            ? { createdAt: { $gte: startDate, $lte: endDate } }
-            : {};
-
-    const invoiceDateRange =
-        startDate && endDate
-            ? {
-                $or: [
-                    { invoicedAt: { $gte: startDate, $lte: endDate } },
-                    { createdAt: { $gte: startDate, $lte: endDate } },
-                ],
-            }
-            : {};
-
-    const paidAtMissing = {
-        $or: [
-            { paidAt: { $exists: false } },
-            { paidAt: null },
-            { paidAt: "" },
-        ],
-    };
-
-    const legacyPaymentStatusFilter = {
-        $or: [
-            { paymentStatus: { $exists: false } },
-            { paymentStatus: null },
-            { paymentStatus: "" },
-            { paymentStatus: "Pendiente" },
-        ],
-    };
-
-    return {
-        tenantId,
-
-        ...registerScope,
-
-        $and: [
-            clientScope,
-
-            {
-                isDraft: { $ne: true },
-            },
-
-            {
-                "items.0": { $exists: true },
-            },
-
-            {
-                $or: [
-                    { orderStatus: { $exists: false } },
-                    { orderStatus: { $nin: ["Cancelado", "Canceled", "Cancelled"] } },
-                ],
-            },
-
-            {
-                $or: [
-                    { paymentStatus: { $exists: false } },
-                    { paymentStatus: { $ne: "Anulado" } },
-                ],
-            },
-
-            {
-                $or: [
-                    // Venta moderna pagada: usa paidAt
-                    {
-                        paymentStatus: "Pagado",
-                        ...paidDateRange,
-                    },
-
-                    // Venta pagada vieja sin paidAt: usa invoicedAt o createdAt
-                    {
-                        paymentStatus: "Pagado",
-                        ...paidAtMissing,
-                        ...invoiceDateRange,
-                    },
-
-                    // Legacy: completada pero sin paymentStatus moderno
-                    {
-                        ...legacyPaymentStatusFilter,
-                        orderStatus: "Completado",
-                        ...createdDateRange,
-                    },
-
-                    // Legacy: fiscal solicitada pero sin paymentStatus moderno
-                    {
-                        ...legacyPaymentStatusFilter,
-                        "fiscal.requested": true,
-                        ...createdDateRange,
-                    },
-
-                    // Legacy: factura interna pero sin paymentStatus moderno
-                    {
-                        ...legacyPaymentStatusFilter,
-                        invoiceNumber: { $exists: true, $nin: [null, ""] },
-                        ...createdDateRange,
-                    },
-
-                    {
-                        ...legacyPaymentStatusFilter,
-                        facturaNo: { $exists: true, $nin: [null, ""] },
-                        ...createdDateRange,
-                    },
-
-                    {
-                        ...legacyPaymentStatusFilter,
-                        internalInvoiceNumber: { $exists: true, $nin: [null, ""] },
-                        ...createdDateRange,
-                    },
-                ],
-            },
-        ],
-    };
-}
-function buildCreditReportFilter({
-                                     tenantId,
-                                     clientId,
-                                     registerId,
-                                     startDate,
-                                     endDate,
-                                 }) {
-    const rawClientId =
-        String(clientId || "default").trim() ||
-        "default";
-
-    const rawRegister =
-        registerId
-            ? String(registerId)
-                .trim()
-                .toUpperCase()
-            : "";
-
-    const normalizedRegister =
-        !rawRegister ||
-        rawRegister ===
-        "__ALL_REGISTERS__" ||
-        rawRegister === "ALL"
-            ? ""
-            : rawRegister;
-
-    const clientScope = rawClientId === "default"
-        ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
-        : { clientId: rawClientId };
-
-    let registerScope = {};
-
-    if (normalizedRegister) {
-        if (
-            normalizedRegister === "MAIN" ||
-            normalizedRegister === "DEFAULT"
-        ) {
-            registerScope = {
-                $or: [
-                    { registerId: "MAIN" },
-                    { registerId: "default" },
-                    {
-                        registerId: {
-                            $exists: false,
-                        },
-                    },
-                    { registerId: null },
-                    { registerId: "" },
-                ],
-            };
-        } else {
-            registerScope = {
-                registerId:
-                normalizedRegister,
-            };
-        }
-    }
-
-    const andConditions = [
-        clientScope,
-
-        {
-            isDraft: {
-                $ne: true,
-            },
-        },
-
-        {
-            "items.0": {
-                $exists: true,
-            },
-        },
-
-        {
-            orderStatus: {
-                $nin: [
-                    "Cancelado",
-                    "Canceled",
-                    "Cancelled",
-                ],
-            },
-        },
-
-        {
-            paymentStatus: {
-                $ne: "Anulado",
-            },
-        },
-
-        {
-            paymentMethod: {
-                $regex:
-                    "^(Credito|Crédito|Credit)$",
-                $options: "i",
-            },
-        },
-    ];
-
-    if (startDate && endDate) {
-        andConditions.push({
-            $or: [
-                {
-                    invoicedAt: {
-                        $gte: startDate,
-                        $lte: endDate,
-                    },
-                },
-
-                {
-                    $and: [
-                        {
-                            $or: [
-                                {
-                                    invoicedAt: {
-                                        $exists:
-                                            false,
-                                    },
-                                },
-                                {
-                                    invoicedAt:
-                                        null,
-                                },
-                                {
-                                    invoicedAt:
-                                        "",
-                                },
-                            ],
-                        },
-                        {
-                            createdAt: {
-                                $gte:
-                                startDate,
-                                $lte:
-                                endDate,
-                            },
-                        },
-                    ],
-                },
-            ],
-        });
-    }
-
-    return {
-        tenantId,
-
-        ...registerScope,
-
-        $and: andConditions,
-    };
-}
 // 🔹 Obtener reportes (ventas filtradas + resumen diario)
 exports.getReports = async (req, res) => {
     try {
@@ -755,7 +457,7 @@ exports.updateEmployee = async (req, res) => {
 
         // Verificar que el empleado existe y pertenece al mismo tenant
         const employee = await User.findOne({ _id: id, tenantId: req.user.tenantId });
-
+        
         if (!employee) {
             return res.status(404).json({ success: false, message: "Empleado no encontrado" });
         }
@@ -1013,22 +715,22 @@ exports.updateEmployee = async (req, res) => {
         });
     } catch (error) {
         console.error("❌ Error al actualizar empleado:", error);
-
+        
         // Manejar errores de validación de Mongoose
         if (error.name === "ValidationError") {
             const messages = Object.values(error.errors).map(e => e.message).join(", ");
             return res.status(400).json({ success: false, message: messages });
         }
-
+        
         // Manejar errores de duplicación
         if (error.code === 11000) {
             return res.status(400).json({ success: false, message: "El email ya está en uso" });
         }
 
-        res.status(500).json({
-            success: false,
+        res.status(500).json({ 
+            success: false, 
             message: "Error al actualizar empleado",
-            error: error.message
+            error: error.message 
         });
     }
 };
