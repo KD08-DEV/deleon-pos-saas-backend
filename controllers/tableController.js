@@ -144,7 +144,27 @@ const deleteTable = async (req, res, next) => {
 
 const updateTable = async (req, res, next) => {
     try {
-        const { status, orderId, area } = req.body;
+        const body = req.body;
+
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+            return next(createHttpError(400, "TABLE_BODY_INVALID"));
+        }
+
+        const allowedFields = new Set(["status", "orderId", "area"]);
+
+        const unknownFields = Object.keys(body).filter(
+            key => !allowedFields.has(key)
+        );
+
+        if (unknownFields.length > 0) {
+            return next(createHttpError(400, "TABLE_UNSUPPORTED_FIELDS"));
+        }
+
+        if (!["Disponible", "Ocupada", "Reservada"].includes(body.status)) {
+            return next(createHttpError(400, "TABLE_STATUS_REQUIRED_OR_INVALID"));
+        }
+
+        const { status, orderId, area } = body;
         const { id } = req.params;
         const clientId = req.clientId;
 
@@ -155,7 +175,8 @@ const updateTable = async (req, res, next) => {
         // Evitar vincular una orden ajena, aunque un cliente falsifique el ID.
         if (orderId !== undefined && orderId !== null && orderId !== "" && status !== "Disponible") {
             if (!mongoose.Types.ObjectId.isValid(orderId)) return next(createHttpError(400, "INVALID_ORDER_ID"));
-            const sameBranchOrder = await Order.findOne({ _id: orderId, tenantId: req.tenantId, clientId }).select("_id");
+            const sameBranchOrder = await Order.findOne({ _id: orderId, tenantId: req.tenantId, clientId }).select("_id table tableReleasedAt");
+            if (sameBranchOrder && (sameBranchOrder.tableReleasedAt || String(sameBranchOrder.table) !== String(id))) return next(createHttpError(409, "ORDER_TABLE_RELEASED"));
             if (!sameBranchOrder) return next(createHttpError(403, "ORDER_NOT_IN_SELECTED_BRANCH"));
         }
 
@@ -170,6 +191,7 @@ const updateTable = async (req, res, next) => {
         if (status === "Disponible") {
             const tableBeforeRelease = await Table.findOne({ _id:id, tenantId:req.user.tenantId, clientId });
             if (!tableBeforeRelease) return next(createHttpError(404, "TABLE_NOT_IN_SELECTED_BRANCH"));
+            if (tableBeforeRelease.currentOrder) return next(createHttpError(409, "ORDER_CLOSE_REQUIRED"));
             if (tableBeforeRelease.tableSessionId) {
                 const openSibling = await Order.exists({ tenantId:req.user.tenantId, clientId,
                     table:tableBeforeRelease._id, tableSessionId:tableBeforeRelease.tableSessionId,
@@ -181,7 +203,7 @@ const updateTable = async (req, res, next) => {
             update.currentOrder = null;
 
             const table = await Table.findOneAndUpdate(
-                { _id: id, tenantId: req.user.tenantId, clientId },
+                { _id: id, tenantId: req.user.tenantId, clientId, currentOrder: null },
                 update,
                 { new: true }
             );
@@ -189,8 +211,9 @@ const updateTable = async (req, res, next) => {
             if (!table) return next(createHttpError(404, "TABLE_NOT_IN_SELECTED_BRANCH"));
 
             const io = req.app?.get?.("io");
-            io?.to?.(`tenant:${req.user.tenantId}`)?.emit?.("tenant:tablesUpdated", {
+            io?.to?.(`tenant:${req.user.tenantId}:branch:${clientId}`)?.emit?.("tenant:tablesUpdated", {
                 tenantId: req.user.tenantId,
+                clientId,
                 tableId: String(table?._id || id),
                 orderId: null,
                 status: "Disponible",
@@ -208,7 +231,7 @@ const updateTable = async (req, res, next) => {
         update.currentOrder = orderId || null;
 
         const table = await Table.findOneAndUpdate(
-            { _id: id, tenantId: req.user.tenantId, clientId },
+            { _id: id, tenantId: req.user.tenantId, clientId, currentOrder: { $in: [null, orderId || null] } },
             update,
             { new: true }
         );
@@ -216,8 +239,9 @@ const updateTable = async (req, res, next) => {
         if (!table) return next(createHttpError(404, "TABLE_NOT_IN_SELECTED_BRANCH"));
 
         const io = req.app?.get?.("io");
-        io?.to?.(`tenant:${req.user.tenantId}`)?.emit?.("tenant:tablesUpdated", {
+        io?.to?.(`tenant:${req.user.tenantId}:branch:${clientId}`)?.emit?.("tenant:tablesUpdated", {
             tenantId: req.user.tenantId,
+                clientId,
             tableId: String(table?._id || id),
             orderId: update.currentOrder ? String(update.currentOrder) : null,
             status: nextStatus,

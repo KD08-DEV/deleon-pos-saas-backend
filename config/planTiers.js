@@ -102,7 +102,7 @@ const TIERS = {
             maxWaiters: 9,
             maxDishes: null,
             maxTables: null,
-            maxClients: 1,
+            maxClients: 2,
             maxRegisters: 4,
         },
         features: {
@@ -133,7 +133,7 @@ const TIERS = {
             payroll: false,
             accountsReceivable: true,
             notifications: false,
-            multiClient: false,
+            multiClient: true,
             multiRegister: true,
             offlineMode: true,
         },

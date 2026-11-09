@@ -392,6 +392,7 @@ const orderSchema = new mongoose.Schema(
 
             discount: { type: Number, default: 0 },
             tipEnabled: { type: Boolean, default: true },
+            legalTipEnabled: { type: Boolean, default: true },
 
             // propina (guardamos ambos por compatibilidad)
             tip: { type: Number, default: 0 },
@@ -462,6 +463,7 @@ const orderSchema = new mongoose.Schema(
             printedAt: { type: Date, default: null },
             preInvoice: { type: Boolean, default: false },
         },
+        inventoryPreparedAt: { type: Date, default: null },
         inventoryDeducted: { type: Boolean, default: false },
         inventoryDeductedAt: { type: Date, default: null },
         inventoryRestoredAt: { type: Date, default: null },
@@ -504,6 +506,7 @@ const orderSchema = new mongoose.Schema(
             select: false,
         },
         items: { type: [itemSchema], default: [] },
+        tableReleasedAt: { type: Date, default: null },
         tableSessionId: {type:String,default:null,index:true},
         table: {
             type: mongoose.Schema.Types.ObjectId,

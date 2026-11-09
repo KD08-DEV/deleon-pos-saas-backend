@@ -1,0 +1,2 @@
+# Immutable vendor originals: preserve exact bytes and validate with xsd/manifest.json.
+services/ecf/xsd/originales/*.xsd binary

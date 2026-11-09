@@ -1,3 +1,4 @@
+const { validateCustomization } = require("../services/inventory/validateCustomization");
 const Dish = require("../models/dish");
 const createHttpError = require("http-errors");
 const mongoose = require("mongoose");
@@ -316,6 +317,7 @@ const normalizeCustomizationInput = ({
             }
 
             return {
+                ...(ingredient._id && mongoose.Types.ObjectId.isValid(String(ingredient._id)) ? {_id:ingredient._id} : {}),
                 ingredientDishId: ingredientDishId || null,
                 name,
                 active: ingredient?.active !== false,
@@ -371,6 +373,7 @@ const normalizeCustomizationInput = ({
                     : 5;
 
             return {
+                ...(extra._id && mongoose.Types.ObjectId.isValid(String(extra._id)) ? {_id:extra._id} : {}),
                 extraDishId: extraDishId || null,
                 name,
                 price: Number(price.toFixed(2)),
@@ -662,6 +665,7 @@ exports.addDish = async (req, res, next) => {
                 removableIngredients,
                 extras,
             });
+        await validateCustomization(customization,{tenantId,clientId:req.clientId||"default"});
         const newDish = await Dish.create({
             taxId:
                 isInv
@@ -802,7 +806,7 @@ exports.getDishes = async (req, res, next) => {
             : { clientId };
         const filter = {
             tenantId,
-            ...branchScope,
+            $and: [branchScope],
             isArchived: { $ne: true },
         };
 
@@ -1200,6 +1204,7 @@ exports.updateDish = async (req, res, next) => {
         }
         // Compatibilidad: al editar un plato legacy se normaliza a la sede principal.
         if (!dish.clientId && (req.clientId || "default") === "default") dish.clientId = "default";
+        if(hasCustomizationPayload)await validateCustomization(dish.customization,{tenantId:dish.tenantId,clientId:req.clientId||"default",dishId:dish._id});
         const updated = await dish.save();
 
         res.status(200).json({
@@ -1296,7 +1301,27 @@ exports.updateDishRecipe = async (req, res) => {
             }
         }
 
+        // No guardar recetas con referencias a otros tenant/client o platos sin stock.
+        // El consumo de inventario espera inventoryType=ingredient.
         if (Array.isArray(recipe)) {
+            if (dish.inventoryType === "recipe" && recipe.length === 0) {
+                return res.status(400).json({ success: false, code: "RECIPE_EMPTY", message: "El plato con receta requiere al menos un ingrediente" });
+            }
+            const ids = recipe.map((r) => String(r.ingredientDishId || r.dishId || r.inventoryItemId || ""));
+            if (ids.some((id) => !mongoose.Types.ObjectId.isValid(id))) {
+                return res.status(400).json({ success: false, code: "INVALID_RECIPE_INGREDIENT_ID" });
+            }
+            const ingredients = await Dish.find({
+                _id: { $in: [...new Set(ids)] }, tenantId, clientId: req.clientId || "default",
+                isArchived: { $ne: true },
+                $or: [
+                    { inventoryType: "ingredient" },
+                    { inventoryType: { $exists: false }, isInventoryItem: true },
+                ],
+            }).select("_id").lean();
+            if (ingredients.length !== new Set(ids).size) {
+                return res.status(409).json({ success: false, code: "RECIPE_INGREDIENT_NOT_IN_INVENTORY", message: "Revise los ingredientes: deben existir como inventario de la misma sucursal" });
+            }
             dish.recipe = recipe.map((r) => ({
                 ingredientDishId: r.ingredientDishId || r.dishId || r.inventoryItemId,
                 qty: Number(r.qty),
@@ -1439,6 +1464,8 @@ exports.createIngredient = async (req, res) => {
 
             // Convertirlo a ingrediente/inventario
             dish.isInventoryItem = true;
+            dish.inventoryType = "ingredient";
+            if (!Number.isFinite(Number(dish.stockCurrent))) dish.stockCurrent = 0;
             dish.category = "Inventario";
             dish.price = 0;
             dish.sellMode = sm;
@@ -1493,6 +1520,7 @@ exports.createIngredient = async (req, res) => {
             description: description ? String(description) : "",
             category: "Inventario",
             isInventoryItem: true,
+            inventoryType: "ingredient",
             inventoryCategoryId: invCatId === undefined ? null : invCatId,
             sellMode: sm,
             weightUnit: wu,

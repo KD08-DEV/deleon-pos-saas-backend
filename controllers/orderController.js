@@ -1,3 +1,6 @@
+const { wasPrepared, authorizeInventoryReturn } = require("../services/inventory/returnAuthorization");
+const {serviceChargeAmount,manualTipAmount,allocateCents}=require("../services/reports/chargeAllocation");
+const {canCreateCreditSale}=require("../services/orders/creditSaleAccess");
 const { summarizeLegacyNcf } = require("../services/fiscal/legacyNcfAvailability");
 const createHttpError = require("http-errors");
 const mongoose = require("mongoose");
@@ -52,20 +55,6 @@ const {
 
 function round2(n) {
     return Math.round((Number(n) || 0) * 100) / 100;
-}
-function tenantCanUseAccountsReceivable(tenant) {
-    const plan =
-        normalizePlan(
-            tenant?.plan ||
-            "emprendedor"
-        );
-
-    const features =
-        getPlanFeatures(plan);
-
-    return Boolean(
-        features?.accountsReceivable
-    );
 }
 const ORDER_SOURCES = ["DINE_IN", "TAKEOUT", "PEDIDOSYA", "UBEREATS", "DELIVERY"];
 function normalizeSource(v) {
@@ -612,7 +601,7 @@ async function findActiveProductionPrinter({ tenantId, clientId, category }) {
 
 
 
-// DEPRECATED: Esta función usa InventoryItem que ya no se usa. 
+// DEPRECATED: Esta función usa InventoryItem que ya no se usa.
 // Ahora solo se usa el modelo Dish.
 // async function deductInventoryForOrder(order, userId) {
 //     ... (función deshabilitada porque usa InventoryItem)
@@ -1006,6 +995,7 @@ const previewOrderTaxes = async (
         const serviceChargeResult =
             calculateServiceCharges({
                 tenant,
+                legalTipEnabled: req.body?.legalTipEnabled !== false,
 
                 taxResult:
                 result,
@@ -1312,12 +1302,12 @@ const addOrder = async (req, res, next) => {
         const isCreditSale = normalizedPaymentMethod === "Credito";
         if (
             isCreditSale &&
-            !tenantCanUseAccountsReceivable(tenant)
+            !(await canCreateCreditSale(req,tenant))
         ) {
             return next(
                 createHttpError(
                     403,
-                    "PLAN_FEATURE_ACCOUNTS_RECEIVABLE_NOT_ALLOWED"
+                    "No tienes permiso para realizar nuevas ventas a crédito."
                 )
             );
         }
@@ -1663,6 +1653,7 @@ const addOrder = async (req, res, next) => {
         const serviceChargeResult =
             calculateServiceCharges({
                 tenant,
+                legalTipEnabled: incomingBills.legalTipEnabled !== false,
                 taxResult,
 
                 orderSource:
@@ -1924,6 +1915,8 @@ const addOrder = async (req, res, next) => {
                         discount:
                         discountAmt,
 
+                        legalTipEnabled: incomingBills.legalTipEnabled !== false,
+
                         taxEnabled,
 
                         // Total de todos los impuestos.
@@ -2022,6 +2015,8 @@ const addOrder = async (req, res, next) => {
 
                 discount:
                 discountAmt,
+
+                legalTipEnabled: incomingBills.legalTipEnabled !== false,
 
                 taxEnabled,
 
@@ -2152,6 +2147,14 @@ const addOrder = async (req, res, next) => {
             }
         } catch (e) {
             console.error("INVENTORY SYNC ON ADD ORDER ERROR =>", e);
+            res.set("Cache-Control", "no-store");
+            return res.status(409).json({
+                success: false,
+                code: "ORDER_CREATED_INVENTORY_SYNC_FAILED",
+                orderId: String(order._id),
+                requiresRecovery: true,
+                message: "Orden guardada, inventario sin confirmar. Recuperar la orden antes de reintentar."
+            });
         }
         const autoEcfResult = await autoIssueEcfForOrderIfNeeded({
             tenant,
@@ -2430,6 +2433,7 @@ const deleteOrder = async (req, res, next) => {
                 order.paymentMethod === "Credito"
             );
 
+        if (order.inventoryDeducted || order.inventoryDeductedAt || order.inventoryRestoredAt) return next(createHttpError(409, "INVENTORY_ORDER_USE_AUDITED_CANCEL"));
         if (hasFinancialHistory) {
             return next(
                 createHttpError(
@@ -2440,22 +2444,14 @@ const deleteOrder = async (req, res, next) => {
         }
         await assertCanCancelOrder(req, req.user.tenantId);
 
-        // Si la orden tiene mesa asignada, liberar la mesa
+        // Las ordenes con inventario o historial financiero se cancelan por la ruta auditada.
+        // Solo liberar la mesa si esta orden sigue siendo su ocupante actual.
         if (order.table?._id) {
             await Table.findOneAndUpdate(
-                { _id: order.table._id, tenantId: req.user.tenantId, clientId: req.clientId  }, // 🔐
-                { status: "Disponible", currentOrder: null }
+                { _id: order.table._id, tenantId: req.user.tenantId,
+                  clientId: req.clientId, currentOrder: order._id },
+                { $set: { status: "Disponible", currentOrder: null, tableSessionId: null } }
             );
-        }
-
-        if (order.inventoryDeducted === true) {
-            try {
-                await restoreInventoryForOrder(order._id, {
-                    userId: req.user?._id || null,
-                });
-            } catch (e) {
-                console.error("INVENTORY RESTORE BEFORE DELETE ERROR =>", e);
-            }
         }
         await Order.deleteOne({ _id: id, tenantId: req.user.tenantId, clientId: req.clientId  });
 
@@ -2884,12 +2880,13 @@ async function syncInventoryForOrderTiming({
                                                isInvoiceAction,
                                                userId,
                                                session = null,
+                                               returnAuthorization = {},
                                            }) {
     const normalizedStatus = normalizeOrderStatus(orderStatus);
 
     if (normalizedStatus === "Cancelado") {
         const restored = await restoreInventoryForOrder(orderId, {
-            userId: userId || null, session,
+            userId: userId || null, session, returnAuthorization,
         });
 
         return {
@@ -2996,6 +2993,12 @@ const updateOrder = async (req, res, next) => {
 // IMPORTANTE: current debe existir antes de leer current.items, current.paymentMethod, etc.
         const current = await Order.findOne(orderScope);
         if (!current) return next(createHttpError(404, "Order not found!"));
+        await require("../services/orders/tableOrderAccess").assertActiveTableOrder({
+            order: current, Table, tenantId, clientId, incoming: req.body || {},
+        });
+        // Reject a stale write if release/move committed after the initial read.
+        const writeOrderScope = { ...orderScope, ...(current.updatedAt ? { updatedAt: current.updatedAt } : {}) };
+
 
         // Validar la mesa ANTES de modificar la orden o reservar NCF/e-NCF.
         if (Object.prototype.hasOwnProperty.call(req.body || {}, "table") &&
@@ -3038,12 +3041,12 @@ const updateOrder = async (req, res, next) => {
         const isCreditSale = normalizedIncomingPaymentMethod === "Credito";
         if (
             isCreditSale &&
-            !tenantCanUseAccountsReceivable(tenant)
+            !(await canCreateCreditSale(req,tenant))
         ) {
             return next(
                 createHttpError(
                     403,
-                    "PLAN_FEATURE_ACCOUNTS_RECEIVABLE_NOT_ALLOWED"
+                    "No tienes permiso para realizar nuevas ventas a crédito."
                 )
             );
         }
@@ -3176,6 +3179,7 @@ const updateOrder = async (req, res, next) => {
 
         if (isCancellingOrder) {
             await assertCanCancelOrder(req, tenantId);
+            if(current.inventoryDeducted)await authorizeInventoryReturn(current,{userId:req.user?._id,confirmed:req.body.inventoryReturnConfirmed});
         }
 
         const isReopeningCancelledOrder =
@@ -3793,6 +3797,7 @@ const updateOrder = async (req, res, next) => {
         const serviceChargeResult =
             calculateServiceCharges({
                 tenant,
+                legalTipEnabled: (incomingBills.legalTipEnabled ?? current.bills?.legalTipEnabled) !== false,
                 taxResult,
 
                 orderSource:
@@ -3901,6 +3906,8 @@ const updateOrder = async (req, res, next) => {
 
             discount,
 
+            legalTipEnabled: (incomingBills.legalTipEnabled ?? current.bills?.legalTipEnabled) !== false,
+
             taxEnabled,
 
             tax,
@@ -3968,11 +3975,15 @@ const updateOrder = async (req, res, next) => {
             ) &&
             !hasFinancialHistory
         ) {
+            if (current.inventoryDeducted === true) {
+                return next(createHttpError(409, "AUTO_DELETE_REQUIRES_INVENTORY_RESTORE"));
+            }
             if (current.table) {
                 const tableId = current.table?._id ? current.table._id : current.table;
                 await Table.findOneAndUpdate(
                     {
                         _id: tableId,
+                        currentOrder: current._id,
                         tenantId,
                         ...(clientId === "default"
                 ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
@@ -3982,7 +3993,7 @@ const updateOrder = async (req, res, next) => {
                 );
             }
 
-            await Order.deleteOne(orderScope);
+            await Order.deleteOne(writeOrderScope);
 
             return res.status(200).json({
                 success: true,
@@ -4087,7 +4098,7 @@ const updateOrder = async (req, res, next) => {
         // No se recalculan pagos, partidas ni impuestos en cambios de estado pagados.
         const paidStatusOnly = current.paymentStatus === "Pagado" && !isInvoiceAction &&
             Object.keys(req.body || {}).every(key => [
-                "orderStatus", "statusHistory", "lastStatusChangeAt", "registerId"
+                "orderStatus", "statusHistory", "lastStatusChangeAt", "registerId", "inventoryReturnConfirmed"
             ].includes(key));
         if (paidStatusOnly &&
             Object.prototype.hasOwnProperty.call(req.body || {}, "registerId") &&
@@ -4102,11 +4113,13 @@ const updateOrder = async (req, res, next) => {
         }
         const mustSyncInventory = incomingStatus === "Cancelado" ||
             shouldDeductInventoryNow({ tenant, orderStatus: incomingStatus, isInvoiceAction });
+        if(wasPrepared(current))safeUpdate.inventoryPreparedAt=current.inventoryPreparedAt||new Date();
         await persistOrderWithInventory({
-            mongoose, Order, orderScope, safeUpdate, mustSyncInventory,
+            mongoose, Order, orderScope: writeOrderScope, safeUpdate, mustSyncInventory,
             syncInventory: ({ session, orderId }) => syncInventoryForOrderTiming({
                 orderId, tenant, orderStatus: incomingStatus, isInvoiceAction,
                 userId: req.user?._id || null, session,
+                returnAuthorization: {userId:req.user?._id,confirmed:req.body.inventoryReturnConfirmed},
             }),
         });
         let order = await Order.findOne(orderScope)
@@ -4125,6 +4138,7 @@ const updateOrder = async (req, res, next) => {
             await Table.findOneAndUpdate(
                 {
                     _id: tableId,
+                    currentOrder: current._id,
                     tenantId,
                     ...(clientId === "default"
                 ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
@@ -4290,6 +4304,7 @@ const updateOrder = async (req, res, next) => {
             await Table.findOneAndUpdate(
                 {
                     _id: tableId,
+                    currentOrder: current._id,
                     tenantId,
                     ...(clientId === "default"
                 ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
@@ -4297,50 +4312,6 @@ const updateOrder = async (req, res, next) => {
                 },
                 { status: "Disponible", currentOrder: null }
             );
-        }
-
-        // ✅ Manejar cambio/asignación de mesa (libera anterior y ocupa nueva)
-        if (req.body.table) {
-            const incomingStatusNow = incomingStatus; // ya lo tienes calculado arriba
-            const nextTableId = String(req.body.table);
-
-            if (!mongoose.Types.ObjectId.isValid(nextTableId)) {
-                return next(createHttpError(400, "INVALID_TABLE_ID"));
-            }
-
-            const prevTableId = current.table
-                ? (current.table?._id ? String(current.table._id) : String(current.table))
-                : null;
-
-            // Si cambió la mesa, libera la anterior
-            if (prevTableId && prevTableId !== nextTableId) {
-                await Table.findOneAndUpdate(
-                    {
-                        _id: prevTableId,
-                        tenantId,
-                        ...(clientId === "default"
-                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
-                : { clientId }),
-                    },
-                    { status: "Disponible", currentOrder: null }
-                );
-            }
-            // Ocupa/Reserva la nueva mesa (según si la orden tiene items)
-            if (incomingStatusNow !== "Cancelado") {
-                const nextStatus = safeUpdate.isDraft ? "Reservada" : "Ocupada";
-
-                await Table.findOneAndUpdate(
-                    {
-                        _id: nextTableId,
-                        tenantId,
-                        ...(clientId === "default"
-                ? { $or: [{ clientId: "default" }, { clientId: { $exists: false } }, { clientId: null }, { clientId: "" }] }
-                : { clientId }),
-                    },
-                    { status: nextStatus, currentOrder: id }
-                );
-            }
-
         }
 
         const autoEcfResult = await autoIssueEcfForOrderIfNeeded({
@@ -4694,6 +4665,7 @@ const getSalesByProductReport = async (req, res) => {
             // Esto debe ir ANTES del $unwind porque $map necesita que items sea un array.
             {
                 $addFields: {
+                    _itemPrices: {$map:{input:{$ifNull:["$items",[]]},as:"it",in:{$ifNull:["$$it.price",0]}}},
                     _orderItemsSubtotal: {
                         $sum: {
                             $map: {
@@ -4712,7 +4684,7 @@ const getSalesByProductReport = async (req, res) => {
                 },
             },
 
-            { $unwind: "$items" },
+            { $unwind: {path:"$items",includeArrayIndex:"_itemIndex"} },
 
             ...(Object.keys(itemMatch).length ? [{ $match: itemMatch }] : []),
             {
@@ -4930,18 +4902,8 @@ const getSalesByProductReport = async (req, res) => {
                         ]
                     },
 
-                    _tip: {
-                        $multiply: [
-                            {
-                                $ifNull: [
-                                    "$bills.tip",
-                                    0
-                                ]
-                            },
-
-                            "$_lineRatio"
-                        ]
-                    },
+                    _tip: allocateCents(serviceChargeAmount),
+                    _manualTip: allocateCents(manualTipAmount),
 
                     _deliveryFeeShare: {
                         $multiply: [
@@ -5019,6 +4981,7 @@ const getSalesByProductReport = async (req, res) => {
                         $add: [
                             "$_lineGrossRevenue",
                             "$_tip",
+                            "$_manualTip",
                             "$_deliveryFeeShare",
                         ],
                     },
@@ -5029,6 +4992,7 @@ const getSalesByProductReport = async (req, res) => {
                 $group: {
                     orders: { $addToSet: "$_id" },
                     _id: {
+                        category: "$_cat",
                         presentation: "$_pres",
                         product: "$_prod",
                         paymentMethod: "$_pay",
@@ -5057,6 +5021,7 @@ const getSalesByProductReport = async (req, res) => {
                     costTotal: { $sum: "$_costTotal" },
                     taxTotal: { $sum: "$_tax" },
                     tipTotal: { $sum: "$_tip" },
+                    manualTipTotal: { $sum: "$_manualTip" },
                     deliveryFeeTotal: { $sum: "$_deliveryFeeShare" },
                 },
             },
@@ -5132,6 +5097,7 @@ const getSalesByProductReport = async (req, res) => {
                     profitPct: { $round: ["$profitPct", 2] },
                     taxTotal: { $round: ["$taxTotal", 2] },
                     tipTotal: { $round: ["$tipTotal", 2] },
+                    manualTipTotal: { $round: ["$manualTipTotal", 2] },
                     deliveryFeeTotal: { $round: ["$deliveryFeeTotal", 2] },
                 },
             },
@@ -5139,6 +5105,10 @@ const getSalesByProductReport = async (req, res) => {
             { $sort: { category: 1, presentation: 1, product: 1, paymentMethod: 1 } },
         ]);
 
+        const [chargeReconciliation={serviceChargeTotal:0,manualTipTotal:0,unallocatedServiceCharge:0,unallocatedManualTip:0}]=await Order.aggregate([
+            {$match:match},{$project:{charges:serviceChargeAmount,manual:manualTipAmount,subtotal:{$sum:{$map:{input:{$ifNull:['$items',[]]},as:'it',in:{$ifNull:['$$it.price',0]}}}}}},
+            {$group:{_id:null,serviceChargeTotal:{$sum:'$charges'},manualTipTotal:{$sum:'$manual'},unallocatedServiceCharge:{$sum:{$cond:[{$lte:['$subtotal',0]},'$charges',0]}},unallocatedManualTip:{$sum:{$cond:[{$lte:['$subtotal',0]},'$manual',0]}}}}
+        ]);
         return res.json({
             success: true,
             data: rows,
@@ -5146,6 +5116,8 @@ const getSalesByProductReport = async (req, res) => {
                 from: start.toISOString(),
                 to: end.toISOString(),
                 totalRows: rows.length,
+                chargeAllocation:"ORIGINAL_ITEM_SUBTOTAL_CUMULATIVE_CENTS",
+                chargeReconciliation,
             },
         });
     } catch (err) {
@@ -5300,6 +5272,7 @@ const sendOrderToProduction = async (req, res, next) => {
 
                     const nextPrintedQty = Number(target.printedQty || 0) + Number(pendingQty || 0);
                     target.printedQty = Number(nextPrintedQty.toFixed(3));
+                    order.inventoryPreparedAt = order.inventoryPreparedAt || new Date();
                 }
 
                 printed.push({

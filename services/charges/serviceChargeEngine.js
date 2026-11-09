@@ -95,6 +95,7 @@ function calculateServiceCharges({
                                      tenant,
                                      taxResult,
                                      orderSource = "DINE_IN",
+                                     legalTipEnabled = true,
                                  }) {
     const config =
         getServiceChargeConfig(
@@ -136,6 +137,7 @@ function calculateServiceCharges({
         const charge of
         config.charges
         ) {
+        if (charge.code === "LEGAL_TIP" && legalTipEnabled === false) continue;
         if (
             charge.active !==
             true

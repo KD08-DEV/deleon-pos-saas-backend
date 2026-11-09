@@ -34,6 +34,11 @@ const {
     previewOrderTaxes,
 } = require("../controllers/orderController");
 
+router.get('/credit-access',verifyToken,tenantMiddleware,async(req,res,next)=>{try{
+ const tenant=await require('../models/tenantModel').findOne({tenantId:req.tenantId}).select('plan').lean();
+ const {canCreateCreditSale}=require('../services/orders/creditSaleAccess');
+ res.json({canCreateCredit:!!tenant&&await canCreateCreditSale(req,tenant)});
+}catch(error){next(error);}});
 // Historial completo (no depende del filtro diario del reporte de ventas).
 router.get("/report/popular-dishes-all-time", verifyToken, tenantMiddleware, getAllTimePopularDishes);
 

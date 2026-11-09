@@ -3,11 +3,12 @@ const mongoose = require("mongoose");
 
 const ExpenseCategory = require("../models/expenseCategoryModel");
 const Expense = require("../models/expenseModel");
+const { writeCategory, withCategoryLock } = require("../services/expenseCategoryService");
 const Supplier = require("../models/supplierModel");
 
 const getScope = (req) => {
-    const tenantId = req.user?.tenantId || req.scope?.tenantId || req.headers["x-tenant-id"];
-    const clientId = req.headers["x-client-id"] || req.scope?.clientId || req.clientId || "default";
+    const tenantId = req.scope?.tenantId || req.user?.tenantId || req.headers["x-tenant-id"];
+    const clientId = req.scope?.clientId || req.headers["x-client-id"] || req.clientId || "default";
     const userId = req.user?._id || null;
     return { tenantId, clientId, userId };
 };
@@ -42,14 +43,7 @@ exports.createExpenseCategory = async (req, res, next) => {
         const name = cleanStr(req.body?.name);
         if (!name) return next(createHttpError(400, "NAME_REQUIRED"));
 
-        const doc = await ExpenseCategory.create({
-            tenantId,
-            clientId,
-            name,
-            description: cleanStr(req.body?.description),
-            status: req.body?.status || "active",
-            systemKey: req.body?.systemKey || null,
-        });
+        const doc = await writeCategory({ tenantId, clientId, body: req.body });
 
         return res.status(201).json({ success: true, data: doc });
     } catch (e) {
@@ -66,16 +60,8 @@ exports.updateExpenseCategory = async (req, res, next) => {
         const { id } = req.params;
         if (!mongoose.Types.ObjectId.isValid(id)) return next(createHttpError(400, "INVALID_ID"));
 
-        const patch = {};
-        if (req.body?.name != null) patch.name = cleanStr(req.body.name);
-        if (req.body?.description != null) patch.description = cleanStr(req.body.description);
-        if (req.body?.status != null) patch.status = req.body.status;
+        const doc = await writeCategory({ tenantId, clientId, id, body: req.body });
 
-        const doc = await ExpenseCategory.findOneAndUpdate({ _id: id, tenantId, clientId }, patch, {
-            new: true,
-        });
-
-        if (!doc) return next(createHttpError(404, "CATEGORY_NOT_FOUND"));
         return res.json({ success: true, data: doc });
     } catch (e) {
         if (e?.code === 11000) return next(createHttpError(400, "CATEGORY_ALREADY_EXISTS"));
@@ -90,11 +76,12 @@ exports.deleteExpenseCategory = async (req, res, next) => {
         if (!tenantId) return next(createHttpError(400, "MISSING_TENANT_ID"));
         if (!mongoose.Types.ObjectId.isValid(id)) return next(createHttpError(400, "INVALID_ID"));
 
-        const used = await Expense.findOne({ tenantId, clientId, categoryId: id }).select("_id").lean();
-        if (used) return next(createHttpError(409, "CATEGORY_IN_USE"));
-
-        const deleted = await ExpenseCategory.findOneAndDelete({ _id: id, tenantId, clientId });
-        if (!deleted) return next(createHttpError(404, "CATEGORY_NOT_FOUND"));
+        await withCategoryLock({ tenantId, clientId, id }, async (category, session) => {
+            if (category.systemKey) throw createHttpError(409, "SYSTEM_CATEGORY_PROTECTED");
+            const used = await Expense.exists({ tenantId, clientId, categoryId: id }).session(session);
+            if (used) throw createHttpError(409, "CATEGORY_IN_USE");
+            await ExpenseCategory.deleteOne({ _id: id, tenantId, clientId }, { session });
+        });
 
         return res.json({ success: true });
     } catch (e) {
@@ -154,6 +141,7 @@ exports.createExpense = async (req, res, next) => {
 
         const cat = await ExpenseCategory.findOne({ _id: categoryId, tenantId, clientId }).lean();
         if (!cat) return next(createHttpError(404, "CATEGORY_NOT_FOUND"));
+        if (cat.status === "inactive") return next(createHttpError(409, "CATEGORY_INACTIVE"));
 
         let supplierId = req.body?.supplierId || null;
         if (supplierId) {
@@ -162,7 +150,9 @@ exports.createExpense = async (req, res, next) => {
             if (!s) return next(createHttpError(404, "SUPPLIER_NOT_FOUND"));
         }
 
-        const doc = await Expense.create({
+        const doc = await withCategoryLock({ tenantId, clientId, id: categoryId }, async (category, session) => {
+            if (category.status === "inactive") throw createHttpError(409, "CATEGORY_INACTIVE");
+            const [doc] = await Expense.create([{
             tenantId,
             clientId,
             dateYMD,
@@ -180,6 +170,8 @@ exports.createExpense = async (req, res, next) => {
                 paidAt: req.body?.payable?.paidAt || null,
             },
             createdBy: userId,
+                    }], { session });
+            return doc;
         });
 
         return res.status(201).json({ success: true, data: doc });
@@ -211,6 +203,7 @@ exports.updateExpense = async (req, res, next) => {
             if (!mongoose.Types.ObjectId.isValid(req.body.categoryId)) return next(createHttpError(400, "CATEGORY_INVALID"));
             const cat = await ExpenseCategory.findOne({ _id: req.body.categoryId, tenantId, clientId }).lean();
             if (!cat) return next(createHttpError(404, "CATEGORY_NOT_FOUND"));
+            if (cat.status === "inactive" && String(doc.categoryId) !== String(cat._id)) return next(createHttpError(409, "CATEGORY_INACTIVE"));
             doc.categoryId = req.body.categoryId;
         }
 
@@ -238,7 +231,11 @@ exports.updateExpense = async (req, res, next) => {
             if (p.paidAt !== undefined) doc.payable.paidAt = p.paidAt || null;
         }
 
-        await doc.save();
+        const previous = await Expense.findOne({ _id: id, tenantId, clientId }).select("categoryId").lean();
+        await withCategoryLock({ tenantId, clientId, id: doc.categoryId }, async (category, session) => {
+            if (category.status === "inactive" && String(previous?.categoryId) !== String(category._id)) throw createHttpError(409, "CATEGORY_INACTIVE");
+            await doc.save({ session });
+        });
         return res.json({ success: true, data: doc });
     } catch (e) {
         next(e);
