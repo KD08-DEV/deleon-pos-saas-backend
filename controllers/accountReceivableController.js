@@ -319,7 +319,10 @@ async function getReceivableSummary(req, res, next) {
 }
 
 async function addReceivablePayment(req, res, next) {
+    let paymentSession;
     try {
+        paymentSession = await mongoose.startSession();
+        paymentSession.startTransaction();
         const { tenantId, clientId, userId } = getScope(req);
 
         if (!tenantId) return next(createHttpError(400, "MISSING_TENANT_ID"));
@@ -335,7 +338,7 @@ async function addReceivablePayment(req, res, next) {
             _id: id,
             tenantId,
             clientId,
-        });
+        }).session(paymentSession);
 
         if (!doc) return next(createHttpError(404, "RECEIVABLE_NOT_FOUND"));
         if (doc.status === "void") return next(createHttpError(409, "RECEIVABLE_VOIDED"));
@@ -412,7 +415,7 @@ async function addReceivablePayment(req, res, next) {
         doc.status = doc.balance <= 0 ? "paid" : "partial";
         doc.closedAt = doc.status === "paid" ? paidAt : null;
 
-        await doc.save();
+        await doc.save({session:paymentSession});
 
         await Order.updateOne(
             {
@@ -432,8 +435,10 @@ async function addReceivablePayment(req, res, next) {
                         }
                         : {}),
                 },
-            }
+            },
+            { session: paymentSession }
         );
+        await paymentSession.commitTransaction();
 
         const fresh = await AccountReceivable.findById(doc._id)
             .populate("customerId", "name phone address")
@@ -446,6 +451,11 @@ async function addReceivablePayment(req, res, next) {
         });
     } catch (error) {
         return next(error);
+    } finally {
+        if (paymentSession) {
+            if (paymentSession.inTransaction()) await paymentSession.abortTransaction();
+            await paymentSession.endSession();
+        }
     }
 }
 

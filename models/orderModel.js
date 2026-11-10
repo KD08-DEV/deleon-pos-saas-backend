@@ -528,6 +528,7 @@ const orderSchema = new mongoose.Schema(
             default: "Efectivo",
         },
 
+        settledFromCredit: { type: Boolean, default: false, index: true },
         creditStatus: {
             type: String,
             enum: ["none", "pending", "partial", "paid"],

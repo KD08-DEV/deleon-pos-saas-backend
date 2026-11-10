@@ -74,6 +74,7 @@ function buildLegacyReportFilter({ tenantId, clientId, registerId, startDate, en
         ...registerScope,
 
         $and: [
+            { settledFromCredit: { $ne: true } },
             clientScope,
 
             {
@@ -240,11 +241,10 @@ function buildCreditReportFilter({
         },
 
         {
-            paymentMethod: {
-                $regex:
-                    "^(Credito|Crédito|Credit)$",
-                $options: "i",
-            },
+            $or: [
+                { settledFromCredit: true },
+                { paymentMethod: { $regex: "^(Credito|Crédito|Credit)$", $options: "i" } },
+            ],
         },
     ];
 
