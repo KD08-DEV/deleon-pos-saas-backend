@@ -313,6 +313,8 @@ router.get("/:id/correction/history", verifyToken, tenantMiddleware, requireCorr
     require("../controllers/orderCorrectionController").getOrderCorrectionHistory);
 router.post("/:id/correction/preview", verifyToken, tenantMiddleware, requireCorrectionAccess, previewNormalOrderCorrection);
 router.patch("/:id/correction", verifyToken, tenantMiddleware, requireCorrectionAccess, correctNormalOrder);
+router.patch("/:id/payment-method/correction", verifyToken, tenantMiddleware, requireCorrectionAccess,
+    require("../controllers/orderCorrectionController").correctOrdinaryPaymentMethod);
 // Compatibilidad con Bill.jsx: admite cambios ANTES del cobro.
 // Los pagos ya confirmados deben corregirse mediante la ruta auditada.
 async function guardLegacyPaymentMethod(req, res, next) {

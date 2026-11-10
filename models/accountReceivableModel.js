@@ -90,7 +90,7 @@ const accountReceivableSchema = new mongoose.Schema(
         },
         voidReason: { type: String, default: "", trim: true },
     },
-    { timestamps: true }
+    { timestamps: true, optimisticConcurrency: true }
 );
 
 accountReceivableSchema.index(

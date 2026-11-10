@@ -32,7 +32,9 @@ async function getOrderAndTenant(req,session){
   if(!order)throw bad("ORDER_NOT_FOUND",404);
   if(!tenant)throw bad("TENANT_NOT_FOUND",404);
   if(order.orderStatus==="Cancelado"||order.paymentStatus==="Anulado")throw bad("ORDER_CANCELLED",409);
-  if(fiscalLocked(order)||order.paymentMethod==="Credito"||order.creditStatus&&order.creditStatus!=="none")throw bad("FISCAL_OR_CREDIT_ORDER_LOCKED",409);
+  const creditConversion=req.paymentMethodOnly===true && ((order.paymentMethod==="Credito" && !order.settledFromCredit) || req.body.paymentMethod==="Credito");
+  const fiscalOrder=creditConversion?{...order.toObject(),accountReceivableId:null}:order;
+  if(fiscalLocked(fiscalOrder)||(!creditConversion&&(order.paymentMethod==="Credito"||order.creditStatus&&order.creditStatus!=="none")))throw bad("FISCAL_OR_CREDIT_ORDER_LOCKED",409);
   const eq=ElectronicTaxDocument.exists({tenantId:req.tenantId,orderId:order._id});
   if(await(session?eq.session(session):eq))throw bad("ECF_DOCUMENT_EXISTS",409);
   return {order,tenant};
@@ -55,6 +57,17 @@ function normalizeAddon(add, dish, originalLine){
 }
 async function buildCandidate(req,order,tenant,session){
   const p=req.body||{};
+  if(req.paymentMethodOnly === true){
+    const method=p.paymentMethod;
+    const simpleMethods=["Efectivo","Tarjeta","Transferencia","Otros","Credito"];
+    if(!simpleMethods.includes(method)||!(simpleMethods.includes(order.paymentMethod)||order.paymentMethod==="Credito"))throw bad("PAYMENT_METHOD_REQUIRES_FULL_CORRECTION",409);
+    if(method===order.paymentMethod)throw bad("NO_CHANGES",409);
+    const original=order.toObject();
+    const total=money(original.bills?.totalWithTax,"TOTAL");
+    return {method,note:original.orderNote||"",delta:0,previousTotal:total,newTotal:total,
+      calculated:{items:original.items,bills:original.bills},itemsChanged:false,inventoryChanged:false,
+      changed:["paymentMethod"],previousBills:original.bills,nextBills:original.bills};
+  }
   const legalKeys=["items","bills","paymentMethod","orderNote","reason","expectedUpdatedAt","settlement","inventoryReturnConfirmed"];
   if(Object.keys(p).some(k=>!legalKeys.includes(k)))throw bad("UNSUPPORTED_CORRECTION_FIELD");
   const method=p.paymentMethod??order.paymentMethod;
@@ -199,7 +212,7 @@ async function correctNormalOrder(req,res,next){
       const c=await buildCandidate(req,order,tenant,session);
       const paid=order.paymentStatus==="Pagado";
       await assertCorrectionInventoryState(req,order,c,session);
-      const cashSession=await lookupOriginalCashSession(order,req,session);
+      let cashSession=await lookupOriginalCashSession(order,req,session);
       let settlement=null;
       if(paid&&(Math.abs(c.delta)>=0.01||c.changed.includes("paymentMethod"))){
         const s=req.body?.settlement||{};
@@ -213,19 +226,24 @@ async function correctNormalOrder(req,res,next){
       const correctionCode=`COR-${new mongoose.Types.ObjectId().toString().slice(-12).toUpperCase()}`;
       if(settlement)settlement.reference=correctionCode;
       lastCorrectionCode=correctionCode;
+      const creditResult=req.paymentMethodOnly && c.method==="Credito"
+        ? await require("../services/orders/convertPaymentToCredit")({req,order,tenant,session,correctionCode})
+        : req.paymentMethodOnly && order.paymentMethod==="Credito"
+          ? await require("../services/orders/settleCreditPayment")({req,order,tenant,session,method:c.method,correctionCode}) : null;
+      if(creditResult){settlement=creditResult.settlement;cashSession=creditResult.cashSession||cashSession;}
       const previous=order.toObject();
       const inventoryChange=c.inventoryChanged?await reconcileInventory(req,order,c.normalized,session):{costDelta:0};
       const audit={correctionCode,at:new Date(),by:req.user._id,reason,changed:c.changed,previousPaymentMethod:order.paymentMethod,nextPaymentMethod:c.method,previousNote:order.orderNote||"",nextNote:c.note,previousTotal:c.previousTotal,nextTotal:c.newTotal,previousItems:c.itemsChanged?previous.items:[],nextItems:c.itemsChanged?c.calculated.items:[],previousBills:previous.bills,nextBills:c.calculated.bills,settlement};
       const now=new Date();
-      const changed=await Order.findOneAndUpdate({...owns(req,order._id),updatedAt:order.updatedAt},{$set:{...(wasPrepared(order)?{inventoryPreparedAt:order.inventoryPreparedAt||new Date()}:{}),items:c.calculated.items,bills:c.calculated.bills,paymentMethod:c.method,orderNote:c.note,commissionAmount:c.calculated.commissionAmount,netTotal:c.calculated.netTotal,cogsTotal:round(Number(order.cogsTotal||0)+inventoryChange.costDelta),invoiceUrl:"",invoicePath:""},$push:{correctionHistory:audit}},{new:true,runValidators:true,session}).select("-correctionHistory");
+      const changed=await Order.findOneAndUpdate({...owns(req,order._id),updatedAt:order.updatedAt},{$set:req.paymentMethodOnly ? {paymentMethod:c.method,invoiceUrl:"",invoicePath:"",...(creditResult?.patch||{})} : {...(wasPrepared(order)?{inventoryPreparedAt:order.inventoryPreparedAt||new Date()}:{}),items:c.calculated.items,bills:c.calculated.bills,paymentMethod:c.method,orderNote:c.note,commissionAmount:c.calculated.commissionAmount,netTotal:c.calculated.netTotal,cogsTotal:round(Number(order.cogsTotal||0)+inventoryChange.costDelta),invoiceUrl:"",invoicePath:""},$push:{correctionHistory:audit}},{new:true,runValidators:true,session}).select("-correctionHistory");
       if(!changed)throw bad("ORDER_CHANGED_RELOAD",409);
-      if(sessionIsOpen(cashSession)&&settlement){
+      if(sessionIsOpen(cashSession)&&settlement&&!creditResult){
         cashSession.movements.push({type:"PAYMENT_CORRECTION",amount:c.delta,by:req.user._id,at:now,note:`Order ${order._id}: ${settlement.direction} ${settlement.amount} (${settlement.reference})`});
         await cashSession.save({session});
       }
       // Una venta histórica corregida no toca el cierre de la caja original.
       // Queda en el libro de ajustes para revisión y conciliación posterior.
-      if (paid && (Math.abs(c.delta)>=0.01 || c.changed.includes("paymentMethod"))) {
+      if ((paid || creditResult) && (Math.abs(c.delta)>=0.01 || c.changed.includes("paymentMethod"))) {
         await OrderCorrectionAdjustment.create([{
           tenantId:req.tenantId, clientId:req.clientId, orderId:order._id,
           correctionCode,originalCashSessionId:cashSession?._id||null,
@@ -238,7 +256,7 @@ async function correctNormalOrder(req,res,next){
       }
       saved=changed;
     });
-    // Notification failures do not negate an already committed correction.
+    // A notification failure cannot turn a committed correction into an HTTP failure.
     try { req.app?.get?.("io")?.to(`tenant:${req.tenantId}:branch:${req.clientId}`)?.emit("tenant:orderUpdated",{tenantId:req.tenantId,clientId:req.clientId,orderId:String(saved._id)}); }
     catch (error) { console.error("CORRECTION_SOCKET_NOTIFICATION_FAILED", error.message); }
     res.set("Cache-Control","no-store");return res.json({success:true,data:saved,invoiceNeedsRegeneration:true,correctionCode:lastCorrectionCode});
@@ -399,4 +417,13 @@ async function listOrderCorrectionHistory(req, res, next) {
     } });
   } catch (error) { next(error); }
 }
-module.exports={listOrderCorrectionHistory,getOrderCorrectionHistory,correctNormalOrder,previewNormalOrderCorrection,getCorrectionCatalog,listFinancialCorrections,fiscalLocked,NON_CREDIT_METHODS};
+async function correctOrdinaryPaymentMethod(req,res,next){
+  const body=req.body||{};
+  if(Object.keys(body).some(key=>!["paymentMethod","expectedUpdatedAt","creditPaymentConfirmed","creditConversionConfirmed","registerId"].includes(key)))
+    return res.status(400).json({success:false,code:"UNSUPPORTED_PAYMENT_FIELD"});
+  req.paymentMethodOnly=true;
+  req.body={...body,reason:"Cambio de método de pago al refacturar factura no electrónica",
+    settlement:{direction:"reclassified",amount:0,confirmed:true}};
+  return correctNormalOrder(req,res,next);
+}
+module.exports={correctOrdinaryPaymentMethod,listOrderCorrectionHistory,getOrderCorrectionHistory,correctNormalOrder,previewNormalOrderCorrection,getCorrectionCatalog,listFinancialCorrections,fiscalLocked,NON_CREDIT_METHODS};
