@@ -113,6 +113,7 @@ function buildLegacyCashOrdersFilter({ tenantId, clientId, registerId, start, en
     };
 
     const baseFilter = {
+        settledFromCredit: { $ne: true },
         tenantId,
         clientId,
         registerId,
@@ -1221,7 +1222,7 @@ const adjustCashSessionClosing = async (req, res, next) => {
 
         const dateYMD = getDateFromReq(req);
         const registerId = getRegisterIdFromWriteReq(req);
-        
+
         const session = await CashSession.findOne({ tenantId, clientId, dateYMD, registerId });
         if (!session) return next(createHttpError(404, "SESSION_NOT_FOUND"));
         if (session.status !== "CLOSED") return next(createHttpError(409, "SESSION_NOT_CLOSED"));

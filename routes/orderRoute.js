@@ -8,7 +8,7 @@ const { signStoredInvoice } = require("../utils/invoiceStorageAccess");
 const verifyToken = require("../middlewares/tokenVerification");
 const requirePermission = require("../middlewares/requirePermission");
 const { getAllTimePopularDishes } = require("../controllers/popularDishesController");
-const { correctNormalOrder, previewNormalOrderCorrection, getCorrectionCatalog, listFinancialCorrections, fiscalLocked } = require("../controllers/orderCorrectionController");
+const { correctNormalOrder, previewNormalOrderCorrection, getCorrectionCatalog, listFinancialCorrections } = require("../controllers/orderCorrectionController");
 const ElectronicTaxDocument = require("../models/electronicTaxDocumentModel");
 const { tenantMiddleware } = require("../middlewares/tenantMiddleware");
 const requireDominicanFiscal = require("../middlewares/requireDominicanFiscal");
@@ -244,10 +244,16 @@ async function protectIssuedElectronicOrder(req, res, next) {
 async function guardPaidOrderFinancialChanges(req,res,next){
     try{
         if(!mongoose.isValidObjectId(req.params.id))return res.status(404).json({success:false,code:"ORDER_NOT_FOUND"});
-        const current=await Order.findOne(orderScopeQuery(req,req.params.id)).select("paymentStatus").lean();
+        const current=await Order.findOne(orderScopeQuery(req,req.params.id)).select("paymentStatus accountReceivableId").lean();
         if(!current)return res.status(404).json({success:false,code:"ORDER_NOT_FOUND"});
-        if(current.paymentStatus==="Pagado"&&["items","bills","paymentMethod","orderNote"].some(k=>Object.prototype.hasOwnProperty.call(req.body||{},k))){
+        const financialKeys=["items","bills","paymentMethod","orderNote"].some(k=>Object.prototype.hasOwnProperty.call(req.body||{},k));
+        if(current.paymentStatus==="Pagado"&&financialKeys){
             return res.status(409).json({success:false,code:"USE_AUDITED_ORDER_CORRECTION"});
+        }
+        // Venta a crédito ya facturada: la cuenta por cobrar existe por el total original.
+        // Cambiar platos/total/método aquí la descuadraría; el cobro va por /payment-method/correction.
+        if(current.accountReceivableId&&financialKeys){
+            return res.status(409).json({success:false,code:"CREDIT_ORDER_USE_RECEIVABLE_FLOW"});
         }
         next();
     }catch(error){next(error);}
@@ -313,6 +319,8 @@ router.get("/:id/correction/history", verifyToken, tenantMiddleware, requireCorr
     require("../controllers/orderCorrectionController").getOrderCorrectionHistory);
 router.post("/:id/correction/preview", verifyToken, tenantMiddleware, requireCorrectionAccess, previewNormalOrderCorrection);
 router.patch("/:id/correction", verifyToken, tenantMiddleware, requireCorrectionAccess, correctNormalOrder);
+router.patch("/:id/payment-method/correction", verifyToken, tenantMiddleware, requireCorrectionAccess,
+    require("../controllers/orderCorrectionController").correctOrdinaryPaymentMethod);
 // Compatibilidad con Bill.jsx: admite cambios ANTES del cobro.
 // Los pagos ya confirmados deben corregirse mediante la ruta auditada.
 async function guardLegacyPaymentMethod(req, res, next) {
@@ -320,7 +328,12 @@ async function guardLegacyPaymentMethod(req, res, next) {
         if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ success: false, code: "ORDER_NOT_FOUND" });
         const order = await Order.findOne(orderScopeQuery(req, req.params.id)).lean();
         if (!order) return res.status(404).json({ success: false, code: "ORDER_NOT_FOUND" });
-        if (fiscalLocked(order) || order.paymentMethod === "Credito" || order.accountReceivableId) {
+        // Orden abierta: solo bloquear si ya tiene un comprobante emitido o cuenta por cobrar.
+        // La intención e-CF (ecfDocumentType) de una mesa sin facturar no impide cambiar el método.
+        const issuedNumber = String(order?.fiscal?.ncfNumber || order?.ncfNumber || "");
+        const issuedFiscalDocument = Boolean(order?.eNCF || order?.ecf?.eNCF || order?.ecf?.exists ||
+            (issuedNumber && !/^B0[12]\d+$/.test(issuedNumber)));
+        if (issuedFiscalDocument || order.paymentMethod === "Credito" || order.accountReceivableId) {
             return res.status(409).json({ success: false, code: "FISCAL_OR_CREDIT_ORDER_LOCKED" });
         }
         const ecf = await ElectronicTaxDocument.exists({ tenantId: req.tenantId, clientId: req.clientId, orderId: order._id });

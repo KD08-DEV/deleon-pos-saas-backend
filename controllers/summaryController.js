@@ -40,7 +40,7 @@ exports.getFinanceSummary = async (req, res, next) => {
         const cashMatch = buildLegacyReportFilter(criteria);
         cashMatch.$and.push({ paymentMethod: { $not: /^(Credito|Crédito|Credit)$/i } });
         const orderMatch = { $or: [cashMatch, buildCreditReportFilter(criteria)] };
-        const isCredit = { $regexMatch: { input: { $ifNull: ["$paymentMethod", ""] }, regex: "^(Credito|Crédito|Credit)$", options: "i" } };
+        const isCredit = { $or: [{ $eq: ["$settledFromCredit", true] }, { $regexMatch: { input: { $ifNull: ["$paymentMethod", ""] }, regex: "^(Credito|Crédito|Credit)$", options: "i" } }] };
 
         const salesAgg = await Order.aggregate([
             { $match: orderMatch },
