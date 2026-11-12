@@ -1957,8 +1957,19 @@ const addOrder = async (req, res, next) => {
 
                         deliveryFee,
 
+                        // El snapshot fiscal exige los mismos cargos que se guardarán.
+                        serviceChargeTotal:
+                        serviceChargeResult.addedTotal,
+
+                        serviceChargeBreakdown:
+                        serviceChargeResult.breakdown,
+
                         totalWithTax,
                     },
+
+                    // FIX ECF_ITEMS_REQUIRED: validar con las líneas reales de la orden.
+                    items:
+                    taxedItems,
 
                     fiscal:
                     fiscalPayload,
@@ -2102,7 +2113,44 @@ const addOrder = async (req, res, next) => {
             ...(req.user?._id ? { user: req.user._id } : {}),
         };
 
-        const order = await Order.create(payload);
+        // FIX ORDER_CREATED_INVENTORY_SYNC_FAILED: crear la orden y descontar inventario
+        // en UNA sola transacción. Si el inventario falla, la orden NO queda guardada,
+        // la mesa no se ocupa y el cajero puede reintentar sin duplicar órdenes.
+        const mustSyncInventoryOnCreate = shouldDeductInventoryNow({
+            tenant, orderStatus: finalOrderStatus, isInvoiceAction,
+        });
+        let order = null;
+        if (mustSyncInventoryOnCreate) {
+            const session = await mongoose.startSession();
+            try {
+                await session.withTransaction(async () => {
+                    const [created] = await Order.create([payload], { session });
+                    await syncInventoryForOrderTiming({
+                        orderId: created._id,
+                        tenant,
+                        orderStatus: finalOrderStatus,
+                        isInvoiceAction,
+                        userId: req.user?._id || null,
+                        session,
+                    });
+                    order = created;
+                }, {
+                    readConcern: { level: "snapshot" },
+                    writeConcern: { w: "majority" },
+                });
+            } catch (e) {
+                console.error("INVENTORY SYNC ON ADD ORDER ERROR =>", e);
+                return next(createHttpError(
+                    e?.statusCode || e?.status || 409,
+                    e?.message || "INVENTORY_SYNC_FAILED"
+                ));
+            } finally {
+                await session.endSession();
+            }
+            order = (await Order.findById(order._id)) || order;
+        } else {
+            order = await Order.create(payload);
+        }
 
 // Si la orden se creó con mesa y ya tiene items, marcar mesa ocupada
         if (tableRef && Array.isArray(payload.items) && payload.items.length > 0) {
@@ -2131,31 +2179,8 @@ const addOrder = async (req, res, next) => {
             );
         }
 
+        // El inventario ya quedó confirmado dentro de la transacción de creación.
         let responseOrder = order;
-
-        try {
-            const invResult = await syncInventoryForOrderTiming({
-                orderId: order._id,
-                tenant,
-                orderStatus: finalOrderStatus,
-                isInvoiceAction,
-                userId: req.user?._id || null,
-            });
-
-            if (["deduct", "restore"].includes(invResult?.action)) {
-                responseOrder = await Order.findById(order._id) || order;
-            }
-        } catch (e) {
-            console.error("INVENTORY SYNC ON ADD ORDER ERROR =>", e);
-            res.set("Cache-Control", "no-store");
-            return res.status(409).json({
-                success: false,
-                code: "ORDER_CREATED_INVENTORY_SYNC_FAILED",
-                orderId: String(order._id),
-                requiresRecovery: true,
-                message: "Orden guardada, inventario sin confirmar. Recuperar la orden antes de reintentar."
-            });
-        }
         const autoEcfResult = await autoIssueEcfForOrderIfNeeded({
             tenant,
             tenantId,
