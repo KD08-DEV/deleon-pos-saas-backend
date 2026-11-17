@@ -120,7 +120,7 @@ async function getExtraStockLines({ soldDish, line, soldAmount, tenantId, client
         if (!extraDish) throw createHttpError(409, "EXTRA_DISH_NOT_FOUND_IN_BRANCH");
         if (shouldUseRecipe(extraDish)) {
             if (!Array.isArray(extraDish.recipe) || extraDish.recipe.length === 0) {
-                throw createHttpError(409, "EXTRA_RECIPE_EMPTY");
+                throw createHttpError(409, `EXTRA_RECIPE_EMPTY: el extra "${extraDish.name || "sin nombre"}" está configurado con receta pero no tiene ingredientes. Agrega sus ingredientes o cámbialo a "Sin inventario" en Menú.`);
             }
             for (const ing of extraDish.recipe || []) {
                 const ingId = ing?.ingredientDishId || ing?.dishId || ing?.inventoryItemId;
@@ -280,7 +280,7 @@ async function deductInventoryForOrder(orderId, opts = {}) {
 // Si es none => no descuenta nada.
                 if (shouldUseRecipe(soldDish)) {
                     if (!Array.isArray(soldDish.recipe) || soldDish.recipe.length === 0) {
-                        throw createHttpError(409, "RECIPE_EMPTY");
+                        throw createHttpError(409, `RECIPE_EMPTY: el producto "${soldDish.name || "sin nombre"}" está configurado con receta pero no tiene ingredientes. Agrega sus ingredientes o cámbialo a "Sin inventario" o "Directo" en Menú.`);
                     }
                     for (const ing of customizedRecipe(soldDish, line)) {
                         const ingId = ing?.ingredientDishId || ing?.dishId || ing?.inventoryItemId;
