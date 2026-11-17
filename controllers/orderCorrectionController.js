@@ -161,8 +161,19 @@ async function stockDemandForLines(req,lines,session){
   }
   return desired;
 }
+// Una orden cobrada cuyos platos no consumían inventario queda con inventoryDeducted=false
+// porque el descuento no generó movimientos. Ese estado es verificable (consumo cero):
+// sin movimientos previos y sin demanda de inventario en sus platos originales.
+async function inventoryBaselineIsZero(req,order,session){
+  if(order.paymentStatus!=="Pagado"||order.inventoryDeducted)return false;
+  const prior=await InventoryMovement.find({tenantId:req.tenantId,clientId:req.clientId,sourceId:String(order._id),sourceType:{$in:["order","order_correction"]}}).select("_id").lean().session(session);
+  if((prior||[]).length)return false;
+  const before=await stockDemandForLines(req,order.items||[],session);
+  return [...before.values()].every(v=>Math.abs(Number(v)||0)<0.0000001);
+}
 async function assertCorrectionInventoryState(req,order,c,session){
   if(order.paymentStatus!=="Pagado"||!c.inventoryChanged||order.inventoryDeducted)return;
+  if(await inventoryBaselineIsZero(req,order,session))return;
   const before=await stockDemandForLines(req,order.items||[],session);
   const after=await stockDemandForLines(req,c.normalized,session);
   for(const id of new Set([...before.keys(),...after.keys()])){
@@ -170,7 +181,8 @@ async function assertCorrectionInventoryState(req,order,c,session){
   }
 }
 async function reconcileInventory(req,order,lines,session){
-  if(!order.inventoryDeducted)return {movements:0,costDelta:0};
+  const fromZero=!order.inventoryDeducted&&await inventoryBaselineIsZero(req,order,session);
+  if(!order.inventoryDeducted&&!fromZero)return {movements:0,costDelta:0};
   const prevMov=await InventoryMovement.find({tenantId:req.tenantId,clientId:req.clientId,sourceId:String(order._id),sourceType:{$in:["order","order_correction"]}}).session(session).lean();
   const prior=sumMap(prevMov.filter(m=>(m.sourceType==="order"&&m.type==="sale")||m.sourceType==="order_correction"));
   const desired=await stockDemandForLines(req,lines,session);
@@ -189,7 +201,7 @@ async function reconcileInventory(req,order,lines,session){
     await InventoryMovement.create([{tenantId:req.tenantId,clientId:req.clientId,itemId:inv._id,type:"adjust",qty:Math.abs(change),qtySigned:-change,unitCost,costAmount:round(Math.abs(change)*unitCost),beforeStock:before,afterStock:after,note:`Correction order ${order._id}${change<0&&wasPrepared(order)?"; devolución física confirmada por administrador":""}`,createdBy:req.user._id,sourceType:"order_correction",sourceId:String(order._id)}],{session});
     movements++;
   }
-  return {movements,costDelta};
+  return {movements,costDelta,markDeducted:fromZero&&movements>0};
 }
 async function previewNormalOrderCorrection(req,res,next){try{
   const {order,tenant}=await getOrderAndTenant(req,null);const c=await buildCandidate(req,order,tenant,null);
@@ -235,7 +247,7 @@ async function correctNormalOrder(req,res,next){
       const inventoryChange=c.inventoryChanged?await reconcileInventory(req,order,c.normalized,session):{costDelta:0};
       const audit={correctionCode,at:new Date(),by:req.user._id,reason,changed:c.changed,previousPaymentMethod:order.paymentMethod,nextPaymentMethod:c.method,previousNote:order.orderNote||"",nextNote:c.note,previousTotal:c.previousTotal,nextTotal:c.newTotal,previousItems:c.itemsChanged?previous.items:[],nextItems:c.itemsChanged?c.calculated.items:[],previousBills:previous.bills,nextBills:c.calculated.bills,settlement};
       const now=new Date();
-      const changed=await Order.findOneAndUpdate({...owns(req,order._id),updatedAt:order.updatedAt},{$set:req.paymentMethodOnly ? {paymentMethod:c.method,invoiceUrl:"",invoicePath:"",...(creditResult?.patch||{})} : {...(wasPrepared(order)?{inventoryPreparedAt:order.inventoryPreparedAt||new Date()}:{}),items:c.calculated.items,bills:c.calculated.bills,paymentMethod:c.method,orderNote:c.note,commissionAmount:c.calculated.commissionAmount,netTotal:c.calculated.netTotal,cogsTotal:round(Number(order.cogsTotal||0)+inventoryChange.costDelta),invoiceUrl:"",invoicePath:""},$push:{correctionHistory:audit}},{new:true,runValidators:true,session}).select("-correctionHistory");
+      const changed=await Order.findOneAndUpdate({...owns(req,order._id),updatedAt:order.updatedAt},{$set:req.paymentMethodOnly ? {paymentMethod:c.method,invoiceUrl:"",invoicePath:"",...(creditResult?.patch||{})} : {...(wasPrepared(order)?{inventoryPreparedAt:order.inventoryPreparedAt||new Date()}:{}),items:c.calculated.items,bills:c.calculated.bills,paymentMethod:c.method,orderNote:c.note,commissionAmount:c.calculated.commissionAmount,netTotal:c.calculated.netTotal,cogsTotal:round(Number(order.cogsTotal||0)+inventoryChange.costDelta),...(inventoryChange.markDeducted?{inventoryDeducted:true,inventoryDeductedAt:now}:{}),invoiceUrl:"",invoicePath:""},$push:{correctionHistory:audit}},{new:true,runValidators:true,session}).select("-correctionHistory");
       if(!changed)throw bad("ORDER_CHANGED_RELOAD",409);
       if(sessionIsOpen(cashSession)&&settlement&&!creditResult){
         cashSession.movements.push({type:"PAYMENT_CORRECTION",amount:c.delta,by:req.user._id,at:now,note:`Order ${order._id}: ${settlement.direction} ${settlement.amount} (${settlement.reference})`});

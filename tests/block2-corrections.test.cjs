@@ -19,12 +19,12 @@ function fixture(repo,opts={}){
   mongoose:{isValidObjectId:v=>/^[a-f\d]{24}$/i.test(v),Types:{ObjectId:class{toString(){return D;}}},async startSession(){if(opts.sessionFailure)throw Error('SESSION_UNAVAILABLE');return session;}},
   '../models/orderModel':{findOne(filter){return q(filter.tenantId===order.tenantId&&(!filter.clientId||filter.clientId===order.clientId)?qOrder():null);},findOneAndUpdate(filter,update){assert.equal(filter.updatedAt,order.updatedAt);assert.ok(Number.isFinite(update.$set.cogsTotal ?? order.cogsTotal),'cogsTotal must stay finite');stats.writes++;stats.audits.push(update.$push.correctionHistory);Object.assign(order,update.$set,{updatedAt:'2026-11-04T12:01:00Z'});return q(order);}},
   '../models/tenantModel':{findOne(){return q(tenant);}},
-  '../models/dish':{find(){return q([dish]);},findOne(filter){assert.ok(filter.$and,'stock filter must preserve branch clause');assert.equal(filter.$and[0].tenantId,'T');assert.ok(filter.$and[0].$or.some(x=>x.clientId==='default'));return q(inventory);}},
+  '../models/dish':{find(){return q(opts.trackDish?[dish,{_id:opts.trackDish,name:'Jugo QA',price:50,taxId:'itbis',customization:{extras:[]}}]:[dish]);},findOne(filter){assert.ok(filter.$and,'stock filter must preserve branch clause');assert.equal(filter.$and[0].tenantId,'T');assert.ok(filter.$and[0].$or.some(x=>x.clientId==='default'));return q(inventory);}},
   '../models/inventoryMovementModel':{find(){return q(movements);},async create(rows){movements.push(...rows);}},
   '../models/electronicTaxDocumentModel':{exists(){return q(opts.ecf||false);}},
   '../models/cashSessionModel':{},'../models/orderCorrectionAdjustmentModel':{async create(rows){stats.adjustment=rows;}},
   '../services/orders/orderCorrectionCalculator':calculator,
-  '../services/inventory/deductInventoryForOrder':{getExtraStockLines:async()=>[],shouldUseRecipe:()=>false,shouldTrackDirectStock:()=>Boolean(opts.inventory)},
+  '../services/inventory/deductInventoryForOrder':{getExtraStockLines:async()=>[],shouldUseRecipe:()=>false,shouldTrackDirectStock:d=>Boolean(opts.inventory)||Boolean(opts.trackDish&&String(d?._id)===opts.trackDish)},
  };
  function qOrder(){return order;}
  const mod={exports:{}};
@@ -35,6 +35,7 @@ function fixture(repo,opts={}){
  return {order,tenant,dish,stats,req,invoke,calculator,inventory,movements,hooks:mod.exports.testHooks};
 }
 for(const repo of [path.resolve(__dirname,'..')]){
+ test(repo+': paid order without inventory consumption accepts a new tracked product and deducts it',async()=>{const J='507f1f77bcf86cd799439099';const f=fixture(repo,{paid:true,trackDish:J});f.movements.length=0;f.order.inventoryDeducted=false;f.req.body.items=[{...f.order.items[0],baseUnitPrice:100},{lineId:'NEW',dishId:J,name:'Jugo QA',quantity:1,baseUnitPrice:50,addons:[],modifiers:[]}];f.req.body.settlement={direction:'collected',amount:0,confirmed:true};const pv=await f.invoke(true);assert.equal(pv.statusCode,200,JSON.stringify(pv.body));f.req.body.settlement.amount=Math.abs(pv.body.data.delta);const r=await f.invoke();assert.equal(r.statusCode,200,JSON.stringify(r.body));assert.equal(f.movements.filter(m=>m.sourceType==='order_correction').length,1);assert.equal(f.movements.find(m=>m.sourceType==='order_correction').qtySigned,-1);});
  test(repo+': unpaid item correction preserves finite cost, audit and scope',async()=>{const f=fixture(repo);const r=await f.invoke();assert.equal(r.statusCode,200,JSON.stringify(r.body));assert.equal(f.order.cogsTotal,9);assert.equal(f.stats.audits.length,1);assert.equal(f.order.bills.totalWithTax,256);assert.deepEqual(f.stats.events,['tenant:T:branch:default']);});
  test(repo+': modifiers-only correction is recorded and requires kitchen reprint',async()=>{const f=fixture(repo);f.order.items[0].printedQty=1;f.req.body.items=[{...f.order.items[0],modifiers:[{name:'Sin cebolla'}]}];const r=await f.invoke();assert.equal(r.statusCode,200,JSON.stringify(r.body));assert.ok(f.stats.audits[0].changed.includes('items'));assert.equal(f.order.items[0].printedQty,0);});
  test(repo+': preview distinguishes legal charge and optional manual tip',async()=>{const f=fixture(repo);f.req.body.bills={discount:20,tipEnabled:true,tipAmount:15};const r=await f.invoke(true);assert.equal(r.statusCode,200);assert.equal(r.body.data.bills.tax,32.4);assert.equal(r.body.data.bills.serviceChargeTotal,18);assert.equal(r.body.data.bills.tipAmount,15);assert.equal(r.body.data.newTotal,245.4);assert.equal(f.stats.writes,0);});
