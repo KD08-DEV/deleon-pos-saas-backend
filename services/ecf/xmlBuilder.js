@@ -420,7 +420,7 @@ function buildEcfQrUrl({
 
     return `${baseUrl}?${params.toString()}`;
 }
-function buildLegalTipTotalsXml(tip = 0) {
+function buildLegalTipTotalsXml(tip = 0, rate = 10) {
     const amount = Number(tip || 0);
 
     if (amount <= 0) {
@@ -432,6 +432,7 @@ function buildLegalTipTotalsXml(tip = 0) {
             <ImpuestosAdicionales>
                 <ImpuestoAdicional>
                     <TipoImpuesto>001</TipoImpuesto>
+                    <TasaImpuestoAdicional>${money(Number(rate) > 0 ? rate : 10)}</TasaImpuestoAdicional>
                     <OtrosImpuestosAdicionales>${money(amount)}</OtrosImpuestosAdicionales>
                 </ImpuestoAdicional>
             </ImpuestosAdicionales>`;
@@ -496,7 +497,7 @@ function generateEcfXml({
             ${totals.tax > 0 ? `<TotalITBIS>${money(totals.tax)}</TotalITBIS>` : ""}
             ${totals.itbis18 > 0 ? `<TotalITBIS1>${money(totals.itbis18)}</TotalITBIS1>` : ""}
             ${totals.itbis16 > 0 ? `<TotalITBIS2>${money(totals.itbis16)}</TotalITBIS2>` : ""}
-            ${buildLegalTipTotalsXml(totals.tip)}
+            ${buildLegalTipTotalsXml(totals.tip, totals.tipRate)}
             <MontoTotal>${money(totals.total)}</MontoTotal>
         </Totales>
     </Encabezado>
