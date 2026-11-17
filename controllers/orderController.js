@@ -1957,8 +1957,19 @@ const addOrder = async (req, res, next) => {
 
                         deliveryFee,
 
+                        // El snapshot fiscal exige los mismos cargos que se guardarán.
+                        serviceChargeTotal:
+                        serviceChargeResult.addedTotal,
+
+                        serviceChargeBreakdown:
+                        serviceChargeResult.breakdown,
+
                         totalWithTax,
                     },
+
+                    // FIX ECF_ITEMS_REQUIRED: validar con las líneas reales de la orden.
+                    items:
+                    taxedItems,
 
                     fiscal:
                     fiscalPayload,
@@ -2102,7 +2113,50 @@ const addOrder = async (req, res, next) => {
             ...(req.user?._id ? { user: req.user._id } : {}),
         };
 
-        const order = await Order.create(payload);
+        // FIX ORDER_CREATED_INVENTORY_SYNC_FAILED: crear la orden y descontar inventario
+        // en UNA sola transacción. Si el inventario falla, la orden NO queda guardada,
+        // la mesa no se ocupa y el cajero puede reintentar sin duplicar órdenes.
+        const mustSyncInventoryOnCreate = shouldDeductInventoryNow({
+            tenant, orderStatus: finalOrderStatus, isInvoiceAction,
+        });
+        let order = null;
+        if (mustSyncInventoryOnCreate) {
+            const session = await mongoose.startSession();
+            try {
+                await session.withTransaction(async () => {
+                    const [created] = await Order.create([payload], { session });
+                    await syncInventoryForOrderTiming({
+                        orderId: created._id,
+                        tenant,
+                        orderStatus: finalOrderStatus,
+                        isInvoiceAction,
+                        userId: req.user?._id || null,
+                        session,
+                    });
+                    order = created;
+                }, {
+                    readConcern: { level: "snapshot" },
+                    writeConcern: { w: "majority" },
+                });
+            } catch (e) {
+                console.error("INVENTORY SYNC ON ADD ORDER ERROR =>", e);
+                await releaseUnusedOrderSequences({
+                    tenantId,
+                    fiscalPayload,
+                    internalInvoice: assignedInternalInvoice,
+                    operation: assignedOperation,
+                });
+                return next(createHttpError(
+                    e?.statusCode || e?.status || 409,
+                    e?.message || "INVENTORY_SYNC_FAILED"
+                ));
+            } finally {
+                await session.endSession();
+            }
+            order = (await Order.findById(order._id)) || order;
+        } else {
+            order = await Order.create(payload);
+        }
 
 // Si la orden se creó con mesa y ya tiene items, marcar mesa ocupada
         if (tableRef && Array.isArray(payload.items) && payload.items.length > 0) {
@@ -2131,31 +2185,8 @@ const addOrder = async (req, res, next) => {
             );
         }
 
+        // El inventario ya quedó confirmado dentro de la transacción de creación.
         let responseOrder = order;
-
-        try {
-            const invResult = await syncInventoryForOrderTiming({
-                orderId: order._id,
-                tenant,
-                orderStatus: finalOrderStatus,
-                isInvoiceAction,
-                userId: req.user?._id || null,
-            });
-
-            if (["deduct", "restore"].includes(invResult?.action)) {
-                responseOrder = await Order.findById(order._id) || order;
-            }
-        } catch (e) {
-            console.error("INVENTORY SYNC ON ADD ORDER ERROR =>", e);
-            res.set("Cache-Control", "no-store");
-            return res.status(409).json({
-                success: false,
-                code: "ORDER_CREATED_INVENTORY_SYNC_FAILED",
-                orderId: String(order._id),
-                requiresRecovery: true,
-                message: "Orden guardada, inventario sin confirmar. Recuperar la orden antes de reintentar."
-            });
-        }
         const autoEcfResult = await autoIssueEcfForOrderIfNeeded({
             tenant,
             tenantId,
@@ -2216,7 +2247,9 @@ const addOrder = async (req, res, next) => {
         });
     } catch (error) {
         console.error("[addOrder] error:", error?.message);
-        return next(createHttpError(500, "ADD_ORDER_FAILED"));
+        // Errores de negocio (p. ej. rango NCF agotado) deben llegar con su mensaje real.
+        const status = Number(error?.statusCode || error?.status || 500);
+        return next(status >= 400 && status < 500 ? error : createHttpError(500, "ADD_ORDER_FAILED"));
     }
 };
 
@@ -2603,6 +2636,35 @@ async function allocateOperationSeq({ tenantId }) {
         operationSeq: assigned,
         operationNumber: String(assigned).padStart(8, "0"),
     };
+}
+
+// Si la orden no llegó a guardarse, devuelve los números que se tomaron para ella
+// (NCF, factura interna y operación). Solo retrocede si nadie tomó otro número
+// después; así no quedan huecos en la secuencia NCF por un intento fallido.
+async function releaseUnusedOrderSequences({ tenantId, fiscalPayload, internalInvoice, operation }) {
+    const tasks = [];
+    const ncfNumber = String(fiscalPayload?.ncfNumber || "");
+    const ncfType = String(fiscalPayload?.ncfType || "").toUpperCase();
+    const ncfSeq = Number(ncfNumber.slice(3));
+    if (/^B0[12]\d{8}$/.test(ncfNumber) && ncfNumber.startsWith(ncfType) && ncfSeq > 0) {
+        const path = `fiscal.ncfConfig.${ncfType}.current`;
+        tasks.push(Tenant.updateOne({ tenantId, [path]: ncfSeq + 1 }, { $inc: { [path]: -1 } }));
+    }
+    if (Number(internalInvoice?.internalSeq) > 0) {
+        tasks.push(Tenant.updateOne(
+            { tenantId, "fiscal.nextInvoiceNumber": Number(internalInvoice.internalSeq) + 1 },
+            { $inc: { "fiscal.nextInvoiceNumber": -1 } }
+        ));
+    }
+    if (Number(operation?.operationSeq) > 0) {
+        tasks.push(Tenant.updateOne(
+            { tenantId, "counters.nextOrderNumber": Number(operation.operationSeq) + 1 },
+            { $inc: { "counters.nextOrderNumber": -1 } }
+        ));
+    }
+    const results = await Promise.allSettled(tasks);
+    results.filter(r => r.status === "rejected")
+        .forEach(r => console.error("[RELEASE_ORDER_SEQUENCES_FAILED]", r.reason?.message || r.reason));
 }
 
 function getExistingInternalInvoiceNumber(order = {}) {
@@ -4114,14 +4176,28 @@ const updateOrder = async (req, res, next) => {
         const mustSyncInventory = incomingStatus === "Cancelado" ||
             shouldDeductInventoryNow({ tenant, orderStatus: incomingStatus, isInvoiceAction });
         if(wasPrepared(current))safeUpdate.inventoryPreparedAt=current.inventoryPreparedAt||new Date();
-        await persistOrderWithInventory({
-            mongoose, Order, orderScope: writeOrderScope, safeUpdate, mustSyncInventory,
-            syncInventory: ({ session, orderId }) => syncInventoryForOrderTiming({
-                orderId, tenant, orderStatus: incomingStatus, isInvoiceAction,
-                userId: req.user?._id || null, session,
-                returnAuthorization: {userId:req.user?._id,confirmed:req.body.inventoryReturnConfirmed},
-            }),
-        });
+        try {
+            await persistOrderWithInventory({
+                mongoose, Order, orderScope: writeOrderScope, safeUpdate, mustSyncInventory,
+                syncInventory: ({ session, orderId }) => syncInventoryForOrderTiming({
+                    orderId, tenant, orderStatus: incomingStatus, isInvoiceAction,
+                    userId: req.user?._id || null, session,
+                    returnAuthorization: {userId:req.user?._id,confirmed:req.body.inventoryReturnConfirmed},
+                }),
+            });
+        } catch (persistError) {
+            // La orden no cambió (p. ej. sin existencia): devolver los números tomados
+            // en este intento para no dejar huecos de NCF / factura / operación.
+            const currentHadNcf = Boolean(current?.fiscal?.ncfNumber || current?.ncfNumber);
+            const currentHadInvoice = Boolean(getExistingInternalInvoiceNumber(current));
+            await releaseUnusedOrderSequences({
+                tenantId,
+                fiscalPayload: currentHadNcf ? null : safeUpdate?.fiscal,
+                internalInvoice: currentHadInvoice ? null : safeUpdate?.fiscal,
+                operation: assignedOperation,
+            });
+            throw persistError;
+        }
         let order = await Order.findOne(orderScope)
             .populate("table", "tableNo status")
             .populate("user", "name email role");
