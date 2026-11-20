@@ -1,4 +1,6 @@
 const Order = require("../models/orderModel");
+const ElectronicTaxDocument = require("../models/electronicTaxDocumentModel");
+const { PRINTABLE_STATUSES } = require("../services/ecf/orderInvoiceEcfView");
 const User = require("../models/userModel");
 const Payment = require("../models/paymentModel");
 const Membership = require("../models/membershipModel");
@@ -373,6 +375,32 @@ exports.getReports = async (req, res) => {
             groupedByDate[date] += Number(o.bills?.totalWithTax) || 0;
         });
 
+        // e-NCF emitido de cada orden (vive en el documento electrónico, no en la orden),
+        // para mostrar y exportar el número de comprobante E31/E32 en reportes.
+        const reportOrderIds = [...orders, ...creditOrders].map((o) => o._id).filter(Boolean);
+        const ecfByOrder = new Map();
+        if (reportOrderIds.length) {
+            const ecfDocs = await ElectronicTaxDocument.find({
+                tenantId: String(tenantId),
+                orderId: { $in: reportOrderIds },
+                sourceDocumentType: "ORDER",
+                "ecf.documentType": { $in: ["31", "32"] },
+                "ecf.status": { $in: PRINTABLE_STATUSES },
+            }).select("orderId ecf.eNCF ecf.documentType ecf.status").lean();
+            for (const doc of ecfDocs) {
+                if (doc?.ecf?.eNCF) {
+                    ecfByOrder.set(String(doc.orderId), {
+                        exists: true, eNCF: doc.ecf.eNCF, documentType: doc.ecf.documentType, status: doc.ecf.status,
+                    });
+                }
+            }
+        }
+        const withEcf = (order) => {
+            const plain = typeof order?.toJSON === "function" ? order.toJSON() : order;
+            const ecf = ecfByOrder.get(String(plain?._id));
+            return ecf ? { ...plain, ecf } : plain;
+        };
+
         res.status(200).json({
             success: true,
 
@@ -391,11 +419,11 @@ exports.getReports = async (req, res) => {
 
             // Dinero cobrado
             data:
-            orders,
+            orders.map(withEcf),
 
             // Ventas realizadas a crédito
             creditData:
-            creditOrders,
+            creditOrders.map(withEcf),
         });
     } catch (error) {
         console.error("❌ Error al obtener reportes:", error);
