@@ -32,17 +32,32 @@ function getFiscalSnapshot(order = {}) {
     const subtotal = amount(bills.subtotal, "bills.subtotal");
     const discount = amount(bills.discount, "bills.discount");
     const tax = amount(bills.tax, "bills.tax");
-    const tip = amount(bills.tipAmount || bills.tip, "bills.tipAmount");
+    const manualTip = amount(bills.tipAmount || bills.tip, "bills.tipAmount");
     const deliveryFee = amount(bills.deliveryFee, "bills.deliveryFee");
     const deliveryTax = amount(bills.deliveryTaxAmount, "bills.deliveryTaxAmount");
     const serviceCharge = amount(bills.serviceChargeTotal, "bills.serviceChargeTotal");
     const storedTotal = amount(bills.totalWithTax, "bills.totalWithTax");
 
-    // Recargos de servicio configurables requieren mapeo DGII específico,
-    // no deben desaparecer ni convertirse silenciosamente en propina legal.
-    if (serviceCharge > 0) {
-        throw fiscalError("ECF_SERVICE_CHARGE_MAPPING_REQUIRED", { serviceCharge });
+    // La propina legal (Ley 16-92) se guarda como cargo de servicio con código LEGAL_TIP
+    // y tiene mapeo DGII propio: Impuesto Adicional 001 "Propina Legal".
+    // Cualquier otro recargo configurable sigue requiriendo un mapeo específico.
+    const breakdown = Array.isArray(bills.serviceChargeBreakdown) ? bills.serviceChargeBreakdown : [];
+    const legalTipCharge = round2(breakdown
+        .filter((c) => String(c?.code || "").trim().toUpperCase() === "LEGAL_TIP")
+        .reduce((s, c) => s + amount(c?.amount, "bills.serviceChargeBreakdown.amount"), 0));
+    if (legalTipCharge > serviceCharge + 0.011) {
+        throw fiscalError("ECF_SERVICE_CHARGE_BREAKDOWN_MISMATCH", { serviceCharge, legalTipCharge });
     }
+    const otherServiceCharge = round2(serviceCharge - legalTipCharge);
+    if (otherServiceCharge > 0.011) {
+        throw fiscalError("ECF_SERVICE_CHARGE_MAPPING_REQUIRED", { serviceCharge: otherServiceCharge });
+    }
+    const tip = round2(manualTip + legalTipCharge);
+    // Tasa del impuesto adicional 001 (Propina Legal): la configurada en el cargo, 10% por ley.
+    const legalTipRates = breakdown
+        .filter((c) => String(c?.code || "").trim().toUpperCase() === "LEGAL_TIP" && Number(c?.ratePercent) > 0)
+        .map((c) => Number(c.ratePercent));
+    const tipRate = legalTipRates.length ? legalTipRates[0] : 10;
     if (discount > subtotal) throw fiscalError("ECF_DISCOUNT_EXCEEDS_SUBTOTAL");
 
     const lines = [];
@@ -143,7 +158,8 @@ function getFiscalSnapshot(order = {}) {
         throw fiscalError("ECF_DELIVERY_TAX_WITHOUT_FEE");
     }
 
-    const expectedTotal = round2(subtotal - discount + tax + tip + deliveryFee + serviceCharge);
+    // La propina legal ya está incluida en tip (no se suma dos veces como cargo de servicio).
+    const expectedTotal = round2(subtotal - discount + tax + tip + deliveryFee);
     if (!close(expectedTotal, storedTotal)) {
         throw fiscalError("ECF_ORDER_TOTAL_MISMATCH", { expectedTotal, storedTotal });
     }
@@ -158,7 +174,7 @@ function getFiscalSnapshot(order = {}) {
         throw fiscalError("ECF_FISCAL_BREAKDOWN_MISMATCH");
     }
     return {
-        lines, subtotal, discount, tax, tip, deliveryFee, deliveryTax,
+        lines, subtotal, discount, tax, tip, tipRate, deliveryFee, deliveryTax,
         total: storedTotal, taxable18, taxable16, exempt, itbis18, itbis16,
     };
 }
